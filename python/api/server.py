@@ -139,6 +139,7 @@ async def _stream_with_usage_raw(
     model_name: str,
     input_price: float | None = None,
     output_price: float | None = None,
+    is_coding_mode: bool = False,
 ) -> AsyncIterator[bytes]:
     """Forward raw provider stream while extracting usage. Records usage when done."""
     total_in = 0
@@ -166,6 +167,17 @@ async def _stream_with_usage_raw(
                     output_cost=cost["output_cost"],
                     model=model_name,
                 )
+                # Increment coding session stats
+                if is_coding_mode and user_id:
+                    try:
+                        from db.database import increment_coding_session_stats
+                        await increment_coding_session_stats(
+                            user_id, total_in, total_out,
+                            cost["input_cost"], cost["output_cost"],
+                            model_name,
+                        )
+                    except Exception:
+                        logger.exception("Failed to increment coding session stats")
         except Exception:
             logger.exception("Failed to record streaming usage")
 
@@ -179,6 +191,7 @@ async def _stream_with_usage_transform(
     model_name: str,
     input_price: float | None = None,
     output_price: float | None = None,
+    is_coding_mode: bool = False,
 ) -> AsyncIterator[bytes]:
     """Forward provider stream through a transform while extracting usage from raw chunks.
 
@@ -218,6 +231,17 @@ async def _stream_with_usage_transform(
                     output_cost=cost["output_cost"],
                     model=model_name,
                 )
+                # Increment coding session stats
+                if is_coding_mode and user_id:
+                    try:
+                        from db.database import increment_coding_session_stats
+                        await increment_coding_session_stats(
+                            user_id, total_in, total_out,
+                            cost["input_cost"], cost["output_cost"],
+                            model_name,
+                        )
+                    except Exception:
+                        logger.exception("Failed to increment coding session stats")
         except Exception:
             logger.exception("Failed to record streaming usage")
 
@@ -283,6 +307,92 @@ async def _lookup_model_db(model_name: str) -> tuple[str, str, dict[str, Any], f
     return None
 
 
+async def _resolve_model_full(model_name: str) -> tuple[str, str, dict[str, Any], float | None, float | None]:
+    """Resolve model with fallback from DB → static registry.
+
+    Returns (provider_type, provider_id, config, input_price, output_price).
+    Raises ValueError if model not found.
+    """
+    resolved = await _lookup_model_db(model_name)
+    if resolved:
+        return resolved
+    provider_type, provider_id, provider_config = _resolve_model(model_name)
+    return provider_type, provider_id, provider_config, None, None
+
+
+async def _try_model_request(
+    model_name: str,
+    body: dict[str, Any],
+    provider_module: Any,
+    provider_config: dict[str, Any],
+) -> Any:
+    """Try a single model request. Returns result or raises the exception."""
+    # Build a body with the requested model
+    req_body = {**body, "model": model_name}
+    return await provider_module.chat_completion(req_body, provider_config)
+
+
+async def _dispatch_with_fallback(
+    model_name: str,
+    body: dict[str, Any],
+    request: Request,
+    endpoint_type: str = "chat",
+) -> tuple[Any, str, str, str, dict[str, Any], float | None, float | None]:
+    """Dispatch a request. If model is 'coding-mode', uses the user's fallback chain.
+
+    - model_name == 'coding-mode': resolve first fallback model, try each on error
+    - model_name != 'coding-mode': direct call, no fallback
+
+    Returns:
+        (result, actual_model, provider_type, provider_id, provider_config, input_price, output_price)
+    """
+    is_coding_mode = (model_name == "coding-mode")
+
+    if is_coding_mode:
+        # Resolve the user's fallback chain
+        api_key_id = getattr(request.state, "api_key_id", None)
+        if not api_key_id:
+            raise ValueError("coding-mode requires an API key")
+
+        from db.database import get_active_coding_for_api_key
+        coding_config = await get_active_coding_for_api_key(api_key_id)
+        if not coding_config or not coding_config.get("fallback_list"):
+            raise ValueError(
+                "coding-mode 未設定：請先使用 /set_coding 設定 Fallback 模型鏈"
+            )
+
+        fallback_models = coding_config["fallback_list"]
+        max_retries = coding_config.get("max_retries", 3)
+        last_error: Exception | None = None
+
+        for fb_model in fallback_models:
+            try:
+                fb_type, fb_id, fb_config, fb_in_price, fb_out_price = await _resolve_model_full(fb_model)
+                fb_module = PROVIDER_MODULES.get(fb_type)
+                if fb_module is None:
+                    continue
+
+                fb_body = {**body, "model": fb_model}
+                logger.info("Coding mode: trying model %s", fb_model)
+                result = await fb_module.chat_completion(fb_body, fb_config)
+                return result, fb_model, fb_type, fb_id, fb_config, fb_in_price, fb_out_price
+            except Exception as fb_exc:
+                logger.warning("Coding mode model %s failed: %s", fb_model, fb_exc)
+                last_error = fb_exc
+
+        raise last_error or ValueError("coding-mode: all fallback models failed")
+
+    else:
+        # Normal request — direct call, no fallback
+        provider_type, provider_id, provider_config, input_price, output_price = await _resolve_model_full(model_name)
+        provider_module = PROVIDER_MODULES.get(provider_type)
+        if provider_module is None:
+            raise ValueError(f"Unknown provider type: {provider_type}")
+
+        result = await provider_module.chat_completion(body, provider_config)
+        return result, model_name, provider_type, provider_id, provider_config, input_price, output_price
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -294,11 +404,20 @@ async def health():
 
 @app.get("/v1/models")
 async def list_models(request: Request):
-    """List all available models aggregated from enabled providers (cached)."""
+    """List all available models aggregated from enabled providers (cached).
+    Always includes 'coding-mode' virtual model."""
     from db.database import get_provider_cache
 
     cache = get_provider_cache()
     models: list[dict[str, Any]] = []
+
+    # Always include the coding-mode virtual model
+    models.append({
+        "id": "coding-mode",
+        "object": "model",
+        "created": int(time.time()),
+        "owned_by": "system",
+    })
 
     for model_name, cached in cache.items():
         models.append({
@@ -334,42 +453,29 @@ async def chat_completions(request: Request):
             content={"error": {"message": "model is required", "type": "invalid_request_error"}},
         )
 
-    # 2. Resolve model -> provider
+    original_model = model_name  # remember for coding-mode detection
+
+    # 2. Resolve model -> provider with fallback support
     input_price: float | None = None
     output_price: float | None = None
     try:
-        # Try DB lookup first, fall back to static registry
-        resolved = await _lookup_model_db(model_name)
-        if resolved:
-            provider_type, provider_id, provider_config, input_price, output_price = resolved
-        else:
-            provider_type, provider_id, provider_config = _resolve_model(model_name)
+        result, model_name, provider_type, provider_id, provider_config, input_price, output_price = \
+            await _dispatch_with_fallback(model_name, body, request)
     except ValueError as exc:
         return JSONResponse(
             status_code=400,
             content={"error": {"message": str(exc), "type": "invalid_request_error"}},
         )
-
-    # 3. Route to provider adapter
-    provider_module = PROVIDER_MODULES.get(provider_type)
-    if provider_module is None:
-        return JSONResponse(
-            status_code=500,
-            content={"error": {"message": f"Unknown provider type: {provider_type}", "type": "server_error"}},
-        )
-
-    is_stream = body.get("stream", False)
-
-    try:
-        result = await provider_module.chat_completion(body, provider_config)
     except Exception as exc:
-        logger.exception("Provider %s error for model %s", provider_type, model_name)
+        logger.exception("All providers failed for model %s", model_name)
         return JSONResponse(
             status_code=502,
             content={"error": {"message": str(exc), "type": "upstream_error"}},
         )
 
-    # 4. Handle streaming vs non-streaming
+    # 3. Handle streaming vs non-streaming
+    is_coding = original_model == "coding-mode"
+    is_stream = body.get("stream", False)
     if is_stream and isinstance(result, AsyncIterator):
         wrapped = _stream_with_usage_raw(
             result,
@@ -379,6 +485,7 @@ async def chat_completions(request: Request):
             model_name=model_name,
             input_price=input_price,
             output_price=output_price,
+            is_coding_mode=is_coding,
         )
         return StreamingResponse(
             wrapped,
@@ -409,6 +516,17 @@ async def chat_completions(request: Request):
                     output_cost=cost["output_cost"],
                     model=model_name,
                 )
+                # Increment coding session stats
+                if is_coding and user_id:
+                    try:
+                        from db.database import increment_coding_session_stats
+                        await increment_coding_session_stats(
+                            user_id, usage["input_tokens"], usage["output_tokens"],
+                            cost["input_cost"], cost["output_cost"],
+                            model_name,
+                        )
+                    except Exception:
+                        logger.exception("Failed to increment coding session stats")
         except Exception:
             logger.exception("Failed to record usage")
 
@@ -441,6 +559,8 @@ async def responses_endpoint(request: Request):
             content={"error": {"message": "model is required", "type": "invalid_request_error"}},
         )
 
+    original_model = model_name  # remember for coding-mode detection
+
     input_data = body.get("input")
     if input_data is None:
         return JSONResponse(
@@ -448,34 +568,11 @@ async def responses_endpoint(request: Request):
             content={"error": {"message": "input is required", "type": "invalid_request_error"}},
         )
 
-    # 2. Resolve model -> provider
-    input_price: float | None = None
-    output_price: float | None = None
-    try:
-        resolved = await _lookup_model_db(model_name)
-        if resolved:
-            provider_type, provider_id, provider_config, input_price, output_price = resolved
-        else:
-            provider_type, provider_id, provider_config = _resolve_model(model_name)
-    except ValueError as exc:
-        return JSONResponse(
-            status_code=400,
-            content={"error": {"message": str(exc), "type": "invalid_request_error"}},
-        )
-
-    # 3. Route to provider adapter
-    provider_module = PROVIDER_MODULES.get(provider_type)
-    if provider_module is None:
-        return JSONResponse(
-            status_code=500,
-            content={"error": {"message": f"Unknown provider type: {provider_type}", "type": "server_error"}},
-        )
-
-    # 4. Convert Responses input → Chat Completions messages
+    # 2. Convert Responses input → Chat Completions messages
     instructions = body.get("instructions")
     messages = convert_responses_input_to_messages(input_data, instructions)
 
-    # 5. Build Chat Completions request
+    # 3. Build Chat Completions request
     chat_body: dict[str, Any] = {
         "model": model_name,
         "messages": messages,
@@ -503,16 +600,26 @@ async def responses_endpoint(request: Request):
 
     is_stream = chat_body.get("stream", False)
 
+    # 4. Resolve model -> provider with fallback support
+    input_price: float | None = None
+    output_price: float | None = None
     try:
-        result = await provider_module.chat_completion(chat_body, provider_config)
+        result, model_name, provider_type, provider_id, provider_config, input_price, output_price = \
+            await _dispatch_with_fallback(model_name, chat_body, request)
+    except ValueError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={"error": {"message": str(exc), "type": "invalid_request_error"}},
+        )
     except Exception as exc:
-        logger.exception("Provider %s error for model %s", provider_type, model_name)
+        logger.exception("All providers failed for model %s", model_name)
         return JSONResponse(
             status_code=502,
             content={"error": {"message": str(exc), "type": "upstream_error"}},
         )
 
     # 6. Handle streaming: convert Chat Completions SSE → Responses API SSE
+    is_coding = original_model == "coding-mode"
     if is_stream and isinstance(result, AsyncIterator):
         wrapped = _stream_with_usage_transform(
             result,
@@ -529,6 +636,7 @@ async def responses_endpoint(request: Request):
             model_name=model_name,
             input_price=input_price,
             output_price=output_price,
+            is_coding_mode=is_coding,
         )
         return StreamingResponse(
             wrapped,
@@ -569,6 +677,17 @@ async def responses_endpoint(request: Request):
                     output_cost=cost["output_cost"],
                     model=model_name,
                 )
+                # Increment coding session stats
+                if is_coding and user_id:
+                    try:
+                        from db.database import increment_coding_session_stats
+                        await increment_coding_session_stats(
+                            user_id, usage["input_tokens"], usage["output_tokens"],
+                            cost["input_cost"], cost["output_cost"],
+                            model_name,
+                        )
+                    except Exception:
+                        logger.exception("Failed to increment coding session stats")
         except Exception:
             logger.exception("Failed to record usage")
 
@@ -608,6 +727,8 @@ async def anthropic_messages_endpoint(request: Request):
             content={"type": "error", "error": {"type": "invalid_request_error", "message": "model is required"}},
         )
 
+    original_model = model_name  # remember for coding-mode detection
+
     messages = body.get("messages")
     if not messages or not isinstance(messages, list) or len(messages) == 0:
         return JSONResponse(
@@ -615,29 +736,7 @@ async def anthropic_messages_endpoint(request: Request):
             content={"type": "error", "error": {"type": "invalid_request_error", "message": "messages: must be a non-empty array"}},
         )
 
-    # 3. Resolve model → provider
-    input_price: float | None = None
-    output_price: float | None = None
-    try:
-        resolved = await _lookup_model_db(model_name)
-        if resolved:
-            provider_type, provider_id, provider_config, input_price, output_price = resolved
-        else:
-            provider_type, provider_id, provider_config = _resolve_model(model_name)
-    except ValueError as exc:
-        return JSONResponse(
-            status_code=400,
-            content={"type": "error", "error": {"type": "invalid_request_error", "message": str(exc)}},
-        )
-
-    provider_fn = PROVIDER_MODULES.get(provider_type)
-    if not provider_fn:
-        return JSONResponse(
-            status_code=500,
-            content={"type": "error", "error": {"type": "server_error", "message": f"Unknown provider type: {provider_type}"}},
-        )
-
-    # 4. Convert Anthropic Messages API → OpenAI Chat Completions format
+    # 3. Convert Anthropic Messages API → OpenAI Chat Completions format
     chat_body = convert_anthropic_input_to_messages(body)
 
     if not chat_body.get("messages"):
@@ -648,17 +747,26 @@ async def anthropic_messages_endpoint(request: Request):
 
     is_stream = chat_body.get("stream", False)
 
-    # 5. Call provider
+    # 4. Resolve model -> provider with fallback support
+    input_price: float | None = None
+    output_price: float | None = None
     try:
-        result = await provider_fn(chat_body, provider_config)
+        result, model_name, provider_type, provider_id, provider_config, input_price, output_price = \
+            await _dispatch_with_fallback(model_name, chat_body, request)
+    except ValueError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={"type": "error", "error": {"type": "invalid_request_error", "message": str(exc)}},
+        )
     except Exception as exc:
-        logger.exception("Provider %s error for model %s", provider_type, model_name)
+        logger.exception("All providers failed for model %s", model_name)
         return JSONResponse(
             status_code=502,
             content={"type": "error", "error": {"type": "api_error", "message": str(exc)}},
         )
 
     # 6. Streaming: convert OpenAI SSE → Anthropic SSE
+    is_coding = original_model == "coding-mode"
     if is_stream and hasattr(result, "__aiter__"):
         wrapped = _stream_with_usage_transform(
             result,
@@ -669,6 +777,7 @@ async def anthropic_messages_endpoint(request: Request):
             model_name=model_name,
             input_price=input_price,
             output_price=output_price,
+            is_coding_mode=is_coding,
         )
         return StreamingResponse(
             wrapped,
@@ -702,6 +811,17 @@ async def anthropic_messages_endpoint(request: Request):
                     output_cost=cost["output_cost"],
                     model=model_name,
                 )
+                # Increment coding session stats
+                if is_coding and user_id:
+                    try:
+                        from db.database import increment_coding_session_stats
+                        await increment_coding_session_stats(
+                            user_id, usage["input_tokens"], usage["output_tokens"],
+                            cost["input_cost"], cost["output_cost"],
+                            model_name,
+                        )
+                    except Exception:
+                        logger.exception("Failed to increment coding session stats")
         except Exception:
             logger.exception("Failed to record usage")
 

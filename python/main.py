@@ -57,6 +57,8 @@ def main():
             BotCommand("key_add", "新增 API Key"),
             BotCommand("key_del", "刪除 API Key"),
             BotCommand("usage", "查詢 Token 用量"),
+            BotCommand("start_coding", "開啟/關閉 Coding 模式"),
+            BotCommand("set_coding", "設定 Coding 模式（Fallback 模型鏈）"),
         ]
         admin_commands = [
             BotCommand("add", "新增提供商"),

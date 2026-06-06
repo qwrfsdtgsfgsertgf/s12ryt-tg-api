@@ -50,6 +50,8 @@ async function setBotCommands(bot: MyBot): Promise<void> {
     { command: "key_add", description: "新增 API Key" },
     { command: "key_del", description: "刪除 API Key" },
     { command: "usage", description: "查詢 Token 用量" },
+    { command: "start_coding", description: "開啟/關閉 Coding 模式" },
+    { command: "set_coding", description: "設定 Coding 模式（Fallback 模型鏈）" },
   ];
 
   // 管理員指令

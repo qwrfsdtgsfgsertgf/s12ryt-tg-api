@@ -70,6 +70,25 @@ CREATE TABLE IF NOT EXISTS model_prices (
 );
 """
 
+CREATE_TABLE_CODING_CONFIGS = """
+CREATE TABLE IF NOT EXISTS coding_configs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    is_active INTEGER DEFAULT 0,
+    fallback_models TEXT DEFAULT '',
+    max_retries INTEGER DEFAULT 3,
+    session_input_tokens INTEGER DEFAULT 0,
+    session_output_tokens INTEGER DEFAULT 0,
+    session_input_cost REAL DEFAULT 0.0,
+    session_output_cost REAL DEFAULT 0.0,
+    session_requests INTEGER DEFAULT 0,
+    session_model_counts TEXT DEFAULT '{}',
+    created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT DEFAULT (datetime('now')),
+    UNIQUE(user_id)
+);
+"""
+
 ALL_TABLES = [
     CREATE_TABLE_PROVIDERS,
     CREATE_TABLE_USERS,
@@ -77,4 +96,5 @@ ALL_TABLES = [
     CREATE_TABLE_USAGE,
     CREATE_TABLE_SETTINGS,
     CREATE_TABLE_MODEL_PRICES,
+    CREATE_TABLE_CODING_CONFIGS,
 ]

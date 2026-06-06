@@ -291,6 +291,23 @@ async def init_db() -> None:
         await db.execute("PRAGMA foreign_keys = ON")
         for table_sql in ALL_TABLES:
             await db.execute(table_sql)
+
+        # Migration: add session stats columns to coding_configs (idempotent)
+        session_columns = [
+            "session_input_tokens INTEGER DEFAULT 0",
+            "session_output_tokens INTEGER DEFAULT 0",
+            "session_input_cost REAL DEFAULT 0.0",
+            "session_output_cost REAL DEFAULT 0.0",
+            "session_requests INTEGER DEFAULT 0",
+            "session_model_counts TEXT DEFAULT '{}'",
+        ]
+        for col_def in session_columns:
+            col_name = col_def.split()[0]
+            try:
+                await db.execute(f"ALTER TABLE coding_configs ADD COLUMN {col_def}")
+            except aiosqlite.OperationalError:
+                pass  # Column already exists
+
         await db.commit()
 
     # Rebuild provider cache and start usage flush timer
@@ -761,3 +778,180 @@ async def delete_model_prices_by_provider(provider_id: int) -> None:
         await db.execute("DELETE FROM model_prices WHERE provider_id = ?", (provider_id,))
         await db.commit()
     invalidate_provider_cache()
+
+
+# ============================================================
+# Coding mode configuration
+# ============================================================
+
+async def get_coding_config(user_id: int) -> dict | None:
+    """Get coding mode config for a user. Returns dict or None."""
+    async with await get_connection() as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM coding_configs WHERE user_id = ?", (user_id,)
+        )
+        row = await cursor.fetchone()
+        if row:
+            return dict(row)
+    return None
+
+
+async def get_coding_config_by_tg_id(tg_user_id: int) -> dict | None:
+    """Get coding mode config by Telegram user ID."""
+    user = await get_user_by_tg_id(tg_user_id)
+    if not user:
+        return None
+    return await get_coding_config(user["id"])
+
+
+async def set_coding_config(
+    user_id: int,
+    is_active: int | None = None,
+    fallback_models: str | None = None,
+    max_retries: int | None = None,
+) -> dict:
+    """Create or update coding config for a user. Returns the updated config."""
+    async with await get_connection() as db:
+        # Check if exists
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT id FROM coding_configs WHERE user_id = ?", (user_id,)
+        )
+        existing = await cursor.fetchone()
+
+        if existing:
+            # Update
+            sets: list[str] = []
+            params: list[Any] = []
+            if is_active is not None:
+                sets.append("is_active = ?")
+                params.append(is_active)
+            if fallback_models is not None:
+                sets.append("fallback_models = ?")
+                params.append(fallback_models)
+            if max_retries is not None:
+                sets.append("max_retries = ?")
+                params.append(max_retries)
+            if sets:
+                sets.append("updated_at = datetime('now')")
+                params.append(user_id)
+                await db.execute(
+                    f"UPDATE coding_configs SET {', '.join(sets)} WHERE user_id = ?",
+                    params,
+                )
+                await db.commit()
+        else:
+            # Insert
+            await db.execute(
+                """INSERT INTO coding_configs (user_id, is_active, fallback_models, max_retries)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    is_active = excluded.is_active,
+                    fallback_models = excluded.fallback_models,
+                    max_retries = excluded.max_retries,
+                    updated_at = datetime('now')
+                """,
+                (
+                    user_id,
+                    is_active if is_active is not None else 0,
+                    fallback_models if fallback_models is not None else "",
+                    max_retries if max_retries is not None else 3,
+                ),
+            )
+            await db.commit()
+
+        # Return updated config
+        cursor = await db.execute(
+            "SELECT * FROM coding_configs WHERE user_id = ?", (user_id,)
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else {}
+
+
+async def get_active_coding_for_api_key(api_key_id: int) -> dict | None:
+    """Given an api_key_id, return the user's active coding config (if any).
+
+    Used by the API server to check if the request should use fallback logic.
+    """
+    async with await get_connection() as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """
+            SELECT cc.* FROM coding_configs cc
+            JOIN api_keys ak ON ak.user_id = cc.user_id
+            WHERE ak.id = ? AND cc.is_active = 1
+            """,
+            (api_key_id,),
+        )
+        row = await cursor.fetchone()
+        if row:
+            config = dict(row)
+            # Parse fallback_models into a list
+            if config.get("fallback_models"):
+                config["fallback_list"] = [m.strip() for m in config["fallback_models"].split(",") if m.strip()]
+            else:
+                config["fallback_list"] = []
+            return config
+    return None
+
+
+async def increment_coding_session_stats(
+    user_id: int,
+    input_tokens: int,
+    output_tokens: int,
+    input_cost: float,
+    output_cost: float,
+    actual_model: str,
+) -> None:
+    """Increment coding mode session stats after a successful coding-mode request."""
+    import json
+    async with await get_connection() as db:
+        # Read current model counts
+        row = await db.execute_fetchall(
+            "SELECT session_model_counts FROM coding_configs WHERE user_id = ?",
+            (user_id,),
+        )
+        counts: dict = {}
+        if row and row[0]["session_model_counts"]:
+            try:
+                counts = json.loads(row[0]["session_model_counts"])
+            except (json.JSONDecodeError, TypeError):
+                counts = {}
+        counts[actual_model] = counts.get(actual_model, 0) + 1
+
+        await db.execute(
+            """
+            UPDATE coding_configs SET
+                session_input_tokens = session_input_tokens + ?,
+                session_output_tokens = session_output_tokens + ?,
+                session_input_cost = session_input_cost + ?,
+                session_output_cost = session_output_cost + ?,
+                session_requests = session_requests + 1,
+                session_model_counts = ?,
+                updated_at = datetime('now')
+            WHERE user_id = ?
+            """,
+            (input_tokens, output_tokens, input_cost, output_cost, json.dumps(counts), user_id),
+        )
+        await db.commit()
+
+
+async def reset_coding_session_stats(user_id: int) -> None:
+    """Reset coding mode session stats to zero (called when coding mode is activated)."""
+    async with await get_connection() as db:
+        await db.execute(
+            """
+            UPDATE coding_configs SET
+                session_input_tokens = 0,
+                session_output_tokens = 0,
+                session_input_cost = 0.0,
+                session_output_cost = 0.0,
+                session_requests = 0,
+                session_model_counts = '{}',
+                updated_at = datetime('now')
+            WHERE user_id = ?
+            """,
+            (user_id,),
+        )
+        await db.commit()

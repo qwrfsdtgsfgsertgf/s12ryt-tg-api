@@ -14,6 +14,10 @@ import {
   deleteApiKey,
   getUsageByUser,
   getSetting,
+  getCodingConfigByTgId,
+  setCodingConfig,
+  resetCodingSessionStats,
+  getAllCachedModelNames,
 } from "../../db/database.js";
 import { isTrustedUser } from "../filters.js";
 
@@ -194,6 +198,172 @@ async function keyDelConversation(
 }
 
 // ========================
+// /start-coding - Toggle coding mode
+// ========================
+
+async function handleStartCoding(ctx: MyContext): Promise<void> {
+  const tgId = ctx.from!.id;
+  const user = getUserByTgId(tgId);
+  if (!user) {
+    await ctx.reply("❌ 您尚未註冊，請先使用 /key 創建 API key。");
+    return;
+  }
+
+  const config = getCodingConfigByTgId(tgId);
+  if (config && config.is_active === 1) {
+    // Capture stats before deactivating
+    const sIn = config.session_input_tokens || 0;
+    const sOut = config.session_output_tokens || 0;
+    const sInCost = config.session_input_cost || 0;
+    const sOutCost = config.session_output_cost || 0;
+    const sReqs = config.session_requests || 0;
+
+    setCodingConfig(user.id, { isActive: 0 });
+
+    if (sReqs > 0) {
+      const totalCost = sInCost + sOutCost;
+      // Build per-model breakdown
+      let modelBreakdown = "";
+      const modelCounts: Record<string, number> = config.session_model_counts
+        ? JSON.parse(config.session_model_counts)
+        : {};
+      const modelEntries = Object.entries(modelCounts);
+      if (modelEntries.length > 0) {
+        modelBreakdown = "\n\n📋 模型調用統計：\n" +
+          modelEntries.map(([m, c]) => `   ${m}: ${c} 次`).join("\n");
+      }
+      await ctx.reply(
+        `🔴 Coding 模式已關閉。\n\n` +
+        `📊 本次 Coding Session 統計：\n` +
+        `   調用次數：${sReqs}\n` +
+        `   輸入 Token：${sIn.toLocaleString()}\n` +
+        `   輸出 Token：${sOut.toLocaleString()}\n` +
+        `   輸入費用：$${sInCost.toFixed(6)}\n` +
+        `   輸出費用：$${sOutCost.toFixed(6)}\n` +
+        `   總費用：$${totalCost.toFixed(6)}` +
+        modelBreakdown
+      );
+    } else {
+      await ctx.reply("🔴 Coding 模式已關閉。\n\n📊 本次 Session 無請求記錄。");
+    }
+  } else {
+    if (config && config.fallback_models) {
+      setCodingConfig(user.id, { isActive: 1 });
+      resetCodingSessionStats(user.id);
+      const list = config.fallback_list.map((m, i) => `   ${i + 1}. ${m}`).join("\n");
+      await ctx.reply(
+        `🟢 Coding 模式已開啟！\n\n📋 當前 Fallback 模型鏈：\n${list}\n\n最大重試次數：${config.max_retries}`
+      );
+    } else {
+      setCodingConfig(user.id, { isActive: 1 });
+      await ctx.reply(
+        "🟢 Coding 模式已開啟，但尚未設定 Fallback 模型。\n請使用 /set_coding 設定 Fallback 模型鏈。"
+      );
+    }
+  }
+}
+
+// ========================
+// /set-coding 多輪對話
+// ========================
+
+async function setCodingConversation(
+  conversation: MyConversation,
+  ctx: MyContext
+): Promise<void> {
+  const tgId = ctx.from!.id;
+  const user = getUserByTgId(tgId);
+  if (!user) {
+    await ctx.reply("❌ 您尚未註冊，請先使用 /key 創建 API key。");
+    return;
+  }
+
+  // Show current config + available models
+  const config = getCodingConfigByTgId(tgId);
+  const availableModels = getAllCachedModelNames();
+
+  if (config && config.fallback_models) {
+    await ctx.reply(
+      `📋 當前 Coding 模式設定：\n` +
+      `   Fallback 模型：${config.fallback_models}\n` +
+      `   最大重試次數：${config.max_retries}\n` +
+      `   狀態：${config.is_active ? "🟢 開啟" : "🔴 關閉"}\n\n` +
+      "請輸入新的 Fallback 模型鏈（用逗號分隔，按順序排列）：\n" +
+      "例如：claude-4-sonnet,gpt-4o,deepseek-v3\n\n" +
+      "或輸入 skip 保持不變："
+    );
+  } else {
+    const modelList = availableModels.slice(0, 30).map((m) => `   ${m}`).join("\n");
+    const suffix = availableModels.length > 30 ? `\n   ...還有 ${availableModels.length - 30} 個` : "";
+    await ctx.reply(
+      "🔧 設定 Coding 模式 — Fallback 模型鏈\n\n" +
+      "當主模型報錯時，會按順序嘗試以下模型：\n\n" +
+      `📦 可用模型：\n${modelList}${suffix}\n\n` +
+      "請輸入 Fallback 模型鏈（用逗號分隔，按優先順序排列）：\n" +
+      "例如：claude-4-sonnet,gpt-4o,deepseek-v3"
+    );
+  }
+
+  // Wait for fallback models input
+  const fallbackResp = await conversation.wait();
+  const fallbackText = fallbackResp.msg?.text?.trim().toLowerCase() ?? "";
+
+  let fallbackModels: string | undefined;
+
+  if (fallbackText !== "skip") {
+    // Validate models exist
+    const allModels = new Set(getAllCachedModelNames());
+    const models = fallbackText.split(",").map((m: string) => m.trim()).filter(Boolean);
+    const invalid = models.filter((m: string) => !allModels.has(m));
+
+    if (invalid.length > 0) {
+      await fallbackResp.reply(
+        `❌ 以下模型不存在：${invalid.join(", ")}\n\n請重新使用 /set-coding 設定。`
+      );
+      return;
+    }
+    fallbackModels = models.join(",");
+  }
+
+  // Ask for max retries
+  await (fallbackResp ?? ctx).reply("請輸入最大重試次數（1-10），或輸入 skip 保持預設（3）：");
+
+  const retriesResp = await conversation.wait();
+  const retriesText = retriesResp.msg?.text?.trim().toLowerCase() ?? "";
+
+  let maxRetries = 3;
+  if (retriesText !== "skip") {
+    const parsed = parseInt(retriesText, 10);
+    if (isNaN(parsed) || parsed < 1 || parsed > 10) {
+      await retriesResp.reply("❌ 請輸入 1-10 之間的數字。已取消設定。");
+      return;
+    }
+    maxRetries = parsed;
+  }
+
+  // Get current config to preserve fallback_models if skipped
+  const currentConfig = getCodingConfigByTgId(tgId);
+  const finalFallback = fallbackModels ?? (currentConfig?.fallback_models ?? "");
+
+  setCodingConfig(user.id, {
+    isActive: 1,
+    fallbackModels: finalFallback,
+    maxRetries,
+  });
+
+  const finalList = finalFallback.split(",").map((m: string) => m.trim()).filter(Boolean);
+  const listText = finalList.map((m: string, i: number) => `   ${i + 1}. ${m}`).join("\n");
+
+  await retriesResp.reply(
+    "✅ Coding 模式設定完成！\n\n" +
+    `📋 Fallback 模型鏈：\n${listText}\n\n` +
+    `最大重試次數：${maxRetries}\n` +
+    "狀態：🟢 已開啟\n\n" +
+    "使用 /start-coding 可以開關 Coding 模式。"
+  );
+}
+
+// ========================
 // 輔助函式
 // ========================
 
@@ -220,8 +390,8 @@ function maskKey(key: string): string {
  */
 export function registerUserHandlers(bot: Bot<MyContext>): void {
   // Note: conversations() plugin is installed in index.ts (only once)
-  // Register key-del conversation
   bot.use(createConversation(keyDelConversation, "keyDel"));
+  bot.use(createConversation(setCodingConversation, "setCoding"));
 
   // /start
   bot.command("start", async (ctx) => {
@@ -257,5 +427,17 @@ export function registerUserHandlers(bot: Bot<MyContext>): void {
   bot.command("key_del", async (ctx) => {
     if (!isTrustedUser(ctx)) return;
     await ctx.conversation.enter("keyDel");
+  });
+
+  // /start-coding - toggle coding mode
+  bot.command("start_coding", async (ctx) => {
+    if (!isTrustedUser(ctx)) return;
+    await handleStartCoding(ctx);
+  });
+
+  // /set-coding → 進入對話
+  bot.command("set_coding", async (ctx) => {
+    if (!isTrustedUser(ctx)) return;
+    await ctx.conversation.enter("setCoding");
   });
 }

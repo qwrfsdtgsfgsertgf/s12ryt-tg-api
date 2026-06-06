@@ -180,20 +180,23 @@ async function addConversation(
 
     if (hasAnyPricing) {
       await ctx.reply(
-        `📋 從 models.dev 獲取到以下定價：\n\n${pricingLines.join("\n")}\n\n` +
-        `1️⃣ 使用以上定價\n2️⃣ 全部手動輸入\n3️⃣ 跳過\n\n請選擇 1/2/3：`
+        `📋 從 models.dev 獲取到以下定價（每 1M tokens）：\n\n${pricingLines.join("\n")}\n\n` +
+        `1️⃣ 使用 models.dev 的定價\n` +
+        `2️⃣ 為所有模型手動設定統一定價\n` +
+        `3️⃣ 逐個設定每個模型的定價\n` +
+        `4️⃣ 跳過\n\n請選擇 1/2/3/4：`
       );
 
       ctx = await conversation.wait();
-      const priceChoice = ctx.msg?.text?.trim() ?? "1";
+      const priceChoice = ctx.msg?.text?.trim() ?? "4";
 
       if (priceChoice === "2") {
         // Manual: ask for a uniform price for all models
-        await ctx.reply('請輸入統一定價（格式：input_price,output_price）：\n例如：2.5,10（每 1M tokens）');
+        await ctx.reply("請輸入統一定價（格式：輸入價格,輸出價格，每 1M tokens）：");
         ctx = await conversation.wait();
         const manualPricing = ctx.msg?.text?.trim() ?? "";
         const parts = manualPricing.split(",");
-        if (parts.length === 2) {
+        if (parts.length >= 2) {
           const inp = parseFloat(parts[0].trim());
           const out = parseFloat(parts[1].trim());
           if (!isNaN(inp) && !isNaN(out)) {
@@ -204,6 +207,46 @@ async function addConversation(
           }
         }
       } else if (priceChoice === "3") {
+        // Per-model manual pricing — iterate
+        const manualEntries: Array<{ model: string; input_price: number; output_price: number }> = [];
+        for (const modelId of modelList) {
+          await ctx.reply(
+            `📌 模型「${modelId}」\n` +
+            "請輸入定價（格式：輸入價格,輸出價格，每 1M tokens）\n" +
+            "或輸入 skip 跳過此模型："
+          );
+          ctx = await conversation.wait();
+          const modelInput = ctx.msg?.text?.trim() ?? "";
+          if (modelInput.toLowerCase() === "skip") continue;
+          const mParts = modelInput.split(",");
+          if (mParts.length >= 2) {
+            const mInp = parseFloat(mParts[0].trim());
+            const mOut = parseFloat(mParts[1].trim());
+            if (!isNaN(mInp) && !isNaN(mOut)) {
+              manualEntries.push({ model: modelId, input_price: mInp, output_price: mOut });
+            } else {
+              await ctx.reply(`❌ 格式錯誤，跳過「${modelId}」。`);
+            }
+          } else {
+            await ctx.reply(`❌ 格式錯誤，跳過「${modelId}」。`);
+          }
+        }
+        // Merge manual entries into modelPricingEntries
+        const entryMap = new Map(manualEntries.map((e) => [e.model, e]));
+        for (const mpe of modelPricingEntries) {
+          const me = entryMap.get(mpe.model);
+          if (me) {
+            mpe.input_price = me.input_price;
+            mpe.output_price = me.output_price;
+          }
+        }
+        if (manualEntries.length > 0) {
+          const savedLines = manualEntries.map((e) => `   ${e.model}：$${e.input_price}/$${e.output_price}`).join("\n");
+          await ctx.reply(`✅ 已設定 ${manualEntries.length} 個模型的定價：\n${savedLines}`);
+        } else {
+          await ctx.reply("未設定任何定價。");
+        }
+      } else if (priceChoice === "4") {
         // Skip — clear all pricing
         for (const entry of modelPricingEntries) {
           entry.input_price = null;
@@ -212,25 +255,38 @@ async function addConversation(
       }
       // priceChoice === "1" → keep the fetched per-model pricing
     } else {
-      // No pricing found for any model
-      await ctx.reply(
-        "⚠️ 未從 models.dev 獲取到任何定價。\n" +
-        '請輸入統一定價（格式：input_price,output_price），或輸入 "skip" 跳過：\n' +
-        "例如：2.5,10（每 1M tokens）"
-      );
-      ctx = await conversation.wait();
-      const manualPricing = ctx.msg?.text?.trim() ?? "";
-      if (manualPricing.toLowerCase() !== "skip") {
-        const parts = manualPricing.split(",");
-        if (parts.length === 2) {
-          const inp = parseFloat(parts[0].trim());
-          const out = parseFloat(parts[1].trim());
-          if (!isNaN(inp) && !isNaN(out)) {
-            for (const entry of modelPricingEntries) {
-              entry.input_price = inp;
-              entry.output_price = out;
-            }
+      // No pricing found for any model — per-model manual mode
+      const manualEntries: Array<{ model: string; input_price: number; output_price: number }> = [];
+      for (const modelId of modelList) {
+        await ctx.reply(
+          `⚠️ 未從 models.dev 獲取到任何定價。\n\n` +
+          `📌 模型「${modelId}」\n` +
+          "請輸入定價（格式：輸入價格,輸出價格，每 1M tokens）\n" +
+          "或輸入 skip 跳過此模型："
+        );
+        ctx = await conversation.wait();
+        const modelInput = ctx.msg?.text?.trim() ?? "";
+        if (modelInput.toLowerCase() === "skip") continue;
+        const mParts = modelInput.split(",");
+        if (mParts.length >= 2) {
+          const mInp = parseFloat(mParts[0].trim());
+          const mOut = parseFloat(mParts[1].trim());
+          if (!isNaN(mInp) && !isNaN(mOut)) {
+            manualEntries.push({ model: modelId, input_price: mInp, output_price: mOut });
+          } else {
+            await ctx.reply(`❌ 格式錯誤，跳過「${modelId}」。`);
           }
+        } else {
+          await ctx.reply(`❌ 格式錯誤，跳過「${modelId}」。`);
+        }
+      }
+      // Merge manual entries
+      const entryMap = new Map(manualEntries.map((e) => [e.model, e]));
+      for (const mpe of modelPricingEntries) {
+        const me = entryMap.get(mpe.model);
+        if (me) {
+          mpe.input_price = me.input_price;
+          mpe.output_price = me.output_price;
         }
       }
     }
@@ -458,46 +514,125 @@ async function editConversation(
     }
 
     // ── Auto-fetch pricing from models.dev after model selection ──
+    // Same format as edit_field → pricing: 4 options with DB comparison
     const newModelList = String(processedValue).split(",").map((m) => m.trim()).filter(Boolean);
     if (newModelList.length > 0) {
       await ctx.reply("🔍 正在從 models.dev 獲取每個新模型的定價...");
       const pricingMap = await fetchModelsPricing(newModelList);
 
-      // Build per-model pricing
+      // Show current DB model prices for comparison
+      const dbPrices = getModelPricesByProvider(provider.id);
+      const dbPriceMap = new Map(dbPrices.map((p) => [p.model, p]));
+
       const pricingEntries: Array<{ model: string; input_price: number | null; output_price: number | null }> = [];
-      const pricingLines: string[] = [];
+      const lines: string[] = [];
       let hasAnyPricing = false;
 
       for (const modelId of newModelList) {
-        const p = pricingMap.get(modelId);
-        if (p && (p.input !== null || p.output !== null)) {
-          pricingEntries.push({ model: modelId, input_price: p.input, output_price: p.output });
-          pricingLines.push(`   ${modelId}：輸入 $${p.input ?? "—"} / 輸出 $${p.output ?? "—"}`);
+        const devP = pricingMap.get(modelId);
+        const dbP = dbPriceMap.get(modelId);
+        const currentInput = dbP?.input_price ?? "—";
+        const currentOutput = dbP?.output_price ?? "—";
+
+        if (devP && (devP.input !== null || devP.output !== null)) {
+          lines.push(
+            `${modelId}：\n` +
+            `   models.dev：輸入 $${devP.input ?? "—"} / 輸出 $${devP.output ?? "—"}\n` +
+            `   當前資料庫：輸入 $${currentInput} / 輸出 $${currentOutput}`
+          );
+          pricingEntries.push({ model: modelId, input_price: devP.input, output_price: devP.output });
           hasAnyPricing = true;
         } else {
-          pricingEntries.push({ model: modelId, input_price: null, output_price: null });
-          pricingLines.push(`   ${modelId}：未找到定價`);
+          lines.push(
+            `${modelId}：未找到 models.dev 定價（當前：輸入 $${currentInput} / 輸出 $${currentOutput}）`
+          );
         }
       }
 
       if (hasAnyPricing) {
         await ctx.reply(
-          `📋 從 models.dev 獲取到以下定價（每 1M tokens）：\n\n${pricingLines.join("\n")}\n\n` +
-          `是否同時更新這些模型的定價？\n1️⃣ 是，使用以上定價\n2️⃣ 否，只更新模型`
+          `📋 模型定價對比（每 1M tokens）：\n\n${lines.join("\n\n")}\n\n` +
+          `1️⃣ 使用 models.dev 的定價更新全部\n` +
+          `2️⃣ 為所有模型手動設定統一定價\n` +
+          `3️⃣ 逐個設定每個模型的定價\n` +
+          `4️⃣ 只更新模型，不動定價\n\n請選擇 1/2/3/4：`
         );
 
         ctx = await conversation.wait();
-        const priceChoice = ctx.msg?.text?.trim() ?? "2";
+        const priceChoice = ctx.msg?.text?.trim() ?? "4";
 
         if (priceChoice === "1") {
+          // Update models + models.dev pricing
+          updateProvider(provider.id, { models: String(processedValue) });
           try {
-            batchUpsertModelPrices(provider.id, pricingEntries);
-            const updated = pricingEntries.filter((e) => e.input_price !== null || e.output_price !== null);
-            await ctx.reply(`✅ 已更新 ${updated.length} 個模型的定價。`);
+            const validEntries = pricingEntries.filter((e) => e.input_price !== null || e.output_price !== null);
+            batchUpsertModelPrices(provider.id, validEntries);
+            await ctx.reply(`✅ 已更新模型和 ${validEntries.length} 個模型的定價。`);
           } catch (err) {
             await ctx.reply(`⚠️ 定價更新失敗：${(err as Error).message}`);
           }
+          return;
+        } else if (priceChoice === "2") {
+          // Uniform manual pricing
+          updateProvider(provider.id, { models: String(processedValue) });
+          await ctx.reply("請輸入統一定價（格式：輸入價格,輸出價格，每 1M tokens）：");
+          ctx = await conversation.wait();
+          const manualPricing = ctx.msg?.text?.trim() ?? "";
+          const parts = manualPricing.split(",");
+          if (parts.length >= 2) {
+            const inp = parseFloat(parts[0].trim());
+            const out = parseFloat(parts[1].trim());
+            if (!isNaN(inp) && !isNaN(out)) {
+              const uniformEntries = newModelList.map((m) => ({ model: m, input_price: inp, output_price: out }));
+              try {
+                batchUpsertModelPrices(provider.id, uniformEntries);
+                await ctx.reply(`✅ 已為 ${newModelList.length} 個模型設定統一定價：$${inp}/$${out}（每 1M tokens）`);
+              } catch (err) {
+                await ctx.reply(`❌ 更新失敗：${(err as Error).message}`);
+              }
+            }
+          }
+          return;
+        } else if (priceChoice === "3") {
+          // Per-model manual pricing
+          updateProvider(provider.id, { models: String(processedValue) });
+          const manualEntries: Array<{ model: string; input_price: number; output_price: number }> = [];
+          for (const modelId of newModelList) {
+            await ctx.reply(
+              `📌 模型「${modelId}」\n` +
+              "請輸入定價（格式：輸入價格,輸出價格，每 1M tokens）\n" +
+              "或輸入 skip 跳過此模型："
+            );
+            ctx = await conversation.wait();
+            const modelInput = ctx.msg?.text?.trim() ?? "";
+            if (modelInput.toLowerCase() === "skip") continue;
+            const mParts = modelInput.split(",");
+            if (mParts.length >= 2) {
+              const mInp = parseFloat(mParts[0].trim());
+              const mOut = parseFloat(mParts[1].trim());
+              if (!isNaN(mInp) && !isNaN(mOut)) {
+                manualEntries.push({ model: modelId, input_price: mInp, output_price: mOut });
+              } else {
+                await ctx.reply(`❌ 格式錯誤，跳過「${modelId}」。`);
+              }
+            } else {
+              await ctx.reply(`❌ 格式錯誤，跳過「${modelId}」。`);
+            }
+          }
+          if (manualEntries.length > 0) {
+            try {
+              batchUpsertModelPrices(provider.id, manualEntries);
+              const savedLines = manualEntries.map((e) => `   ${e.model}：$${e.input_price}/$${e.output_price}`).join("\n");
+              await ctx.reply(`✅ 已設定 ${manualEntries.length} 個模型的定價：\n${savedLines}`);
+            } catch (err) {
+              await ctx.reply(`❌ 更新失敗：${(err as Error).message}`);
+            }
+          } else {
+            await ctx.reply("未設定任何定價。");
+          }
+          return;
         }
+        // priceChoice === "4" or other → only update models, fall through
       } else {
         await ctx.reply("⚠️ 未從 models.dev 獲取到這些模型的定價，定價保持不變。");
       }

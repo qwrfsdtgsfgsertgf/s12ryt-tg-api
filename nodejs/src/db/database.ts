@@ -138,6 +138,44 @@ function createTables(db: SqlJsDatabase): void {
     );
   `);
 
+  db.run(`
+    CREATE TABLE IF NOT EXISTS coding_configs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      is_active INTEGER DEFAULT 0,
+      fallback_models TEXT DEFAULT '',
+      max_retries INTEGER DEFAULT 3,
+      session_input_tokens INTEGER DEFAULT 0,
+      session_output_tokens INTEGER DEFAULT 0,
+      session_input_cost REAL DEFAULT 0.0,
+      session_output_cost REAL DEFAULT 0.0,
+      session_requests INTEGER DEFAULT 0,
+      session_model_counts TEXT DEFAULT '{}',
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+      UNIQUE(user_id)
+    );
+  `);
+
+  // Migration: add session stats columns to coding_configs (idempotent)
+  const sessionColumns = [
+    "session_input_tokens INTEGER DEFAULT 0",
+    "session_output_tokens INTEGER DEFAULT 0",
+    "session_input_cost REAL DEFAULT 0.0",
+    "session_output_cost REAL DEFAULT 0.0",
+    "session_requests INTEGER DEFAULT 0",
+    "session_model_counts TEXT DEFAULT '{}'",
+  ];
+  for (const col of sessionColumns) {
+    const colName = col.split(" ")[0];
+    try {
+      db.run(`ALTER TABLE coding_configs ADD COLUMN ${col}`);
+    } catch {
+      // Column already exists — ignore
+    }
+  }
+
   saveDb();
 }
 
@@ -305,6 +343,13 @@ export function rebuildProviderCache(): void {
  */
 export function lookupModelCached(modelName: string): CachedProvider | undefined {
   return providerCache.get(modelName);
+}
+
+/**
+ * Get all model names from the provider cache.
+ */
+export function getAllCachedModelNames(): string[] {
+  return Array.from(providerCache.keys()).sort();
 }
 
 /**
@@ -904,4 +949,176 @@ export function cleanupModelPrices(providerId: number, currentModels: string[]):
 export function deleteModelPricesByProvider(providerId: number): void {
   runSql("DELETE FROM model_prices WHERE provider_id = ?", [providerId]);
   invalidateProviderCache();
+}
+
+// ---------------------------------------------------------------------------
+// Coding mode configuration
+// ---------------------------------------------------------------------------
+
+export interface CodingConfig {
+  id: number;
+  user_id: number;
+  is_active: number;
+  fallback_models: string;
+  max_retries: number;
+  fallback_list: string[];
+  session_input_tokens: number;
+  session_output_tokens: number;
+  session_input_cost: number;
+  session_output_cost: number;
+  session_requests: number;
+  session_model_counts: string;
+}
+
+/**
+ * Get coding config for a user by internal user_id.
+ */
+export function getCodingConfig(userId: number): CodingConfig | null {
+  const row = queryOne("SELECT * FROM coding_configs WHERE user_id = ?", [userId]) as Record<string, unknown> | undefined;
+  if (!row) return null;
+  const config = row as Record<string, SqlValue>;
+  return {
+    id: config.id as number,
+    user_id: config.user_id as number,
+    is_active: config.is_active as number,
+    fallback_models: (config.fallback_models as string) || "",
+    max_retries: (config.max_retries as number) || 3,
+    fallback_list: ((config.fallback_models as string) || "").split(",").map((m: string) => m.trim()).filter(Boolean),
+    session_input_tokens: (config.session_input_tokens as number) || 0,
+    session_output_tokens: (config.session_output_tokens as number) || 0,
+    session_input_cost: (config.session_input_cost as number) || 0,
+    session_output_cost: (config.session_output_cost as number) || 0,
+    session_requests: (config.session_requests as number) || 0,
+    session_model_counts: (config.session_model_counts as string) || "{}",
+  };
+}
+
+/**
+ * Get coding config by Telegram user ID.
+ */
+export function getCodingConfigByTgId(tgUserId: number): CodingConfig | null {
+  const user = getUserByTgId(tgUserId);
+  if (!user) return null;
+  return getCodingConfig(user.id);
+}
+
+/**
+ * Set (upsert) coding config for a user.
+ */
+export function setCodingConfig(
+  userId: number,
+  opts: { isActive?: number; fallbackModels?: string; maxRetries?: number }
+): CodingConfig | null {
+  const existing = queryOne("SELECT id FROM coding_configs WHERE user_id = ?", [userId]);
+
+  if (existing) {
+    const sets: string[] = [];
+    const params: SqlValue[] = [];
+    if (opts.isActive !== undefined) { sets.push("is_active = ?"); params.push(opts.isActive); }
+    if (opts.fallbackModels !== undefined) { sets.push("fallback_models = ?"); params.push(opts.fallbackModels); }
+    if (opts.maxRetries !== undefined) { sets.push("max_retries = ?"); params.push(opts.maxRetries); }
+    if (sets.length > 0) {
+      sets.push("updated_at = datetime('now')");
+      params.push(userId);
+      runSql(`UPDATE coding_configs SET ${sets.join(", ")} WHERE user_id = ?`, params);
+    }
+  } else {
+    runSql(
+      `INSERT INTO coding_configs (user_id, is_active, fallback_models, max_retries)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(user_id) DO UPDATE SET
+         is_active = excluded.is_active,
+         fallback_models = excluded.fallback_models,
+         max_retries = excluded.max_retries,
+         updated_at = datetime('now')`,
+      [
+        userId,
+        opts.isActive ?? 0,
+        opts.fallbackModels ?? "",
+        opts.maxRetries ?? 3,
+      ]
+    );
+  }
+
+  return getCodingConfig(userId);
+}
+
+/**
+ * Given an api_key_id, return the user's active coding config (if any).
+ * Used by the API server to check fallback logic.
+ */
+export function getActiveCodingForApiKey(apiKeyId: number): CodingConfig | null {
+  const row = queryOne(
+    `SELECT cc.* FROM coding_configs cc
+     JOIN api_keys ak ON ak.user_id = cc.user_id
+     WHERE ak.id = ? AND cc.is_active = 1`,
+    [apiKeyId]
+  ) as Record<string, unknown> | undefined;
+  if (!row) return null;
+  const config = row as Record<string, SqlValue>;
+  return {
+    id: config.id as number,
+    user_id: config.user_id as number,
+    is_active: config.is_active as number,
+    fallback_models: (config.fallback_models as string) || "",
+    max_retries: (config.max_retries as number) || 3,
+    fallback_list: ((config.fallback_models as string) || "").split(",").map((m: string) => m.trim()).filter(Boolean),
+    session_input_tokens: (config.session_input_tokens as number) || 0,
+    session_output_tokens: (config.session_output_tokens as number) || 0,
+    session_input_cost: (config.session_input_cost as number) || 0,
+    session_output_cost: (config.session_output_cost as number) || 0,
+    session_requests: (config.session_requests as number) || 0,
+    session_model_counts: (config.session_model_counts as string) || "{}",
+  };
+}
+
+/**
+ * Increment coding mode session stats after a successful coding-mode request.
+ */
+export function incrementCodingSessionStats(
+  userId: number,
+  inputTokens: number,
+  outputTokens: number,
+  inputCost: number,
+  outputCost: number,
+  actualModel: string,
+): void {
+  // Read current model counts, update, write back
+  const row = queryOne(`SELECT session_model_counts FROM coding_configs WHERE user_id = ?`, [userId]);
+  let counts: Record<string, number> = {};
+  try {
+    counts = row?.session_model_counts ? JSON.parse(row.session_model_counts as string) : {};
+  } catch { counts = {}; }
+  counts[actualModel] = (counts[actualModel] || 0) + 1;
+
+  runSql(
+    `UPDATE coding_configs SET
+       session_input_tokens = session_input_tokens + ?,
+       session_output_tokens = session_output_tokens + ?,
+       session_input_cost = session_input_cost + ?,
+       session_output_cost = session_output_cost + ?,
+       session_requests = session_requests + 1,
+       session_model_counts = ?,
+       updated_at = datetime('now')
+     WHERE user_id = ?`,
+    [inputTokens, outputTokens, inputCost, outputCost, JSON.stringify(counts), userId]
+  );
+}
+
+/**
+ * Reset coding mode session stats to zero (called when coding mode is activated).
+ */
+export function resetCodingSessionStats(userId: number): void {
+  runSql(
+    `UPDATE coding_configs SET
+       session_input_tokens = 0,
+       session_output_tokens = 0,
+       session_input_cost = 0.0,
+       session_output_cost = 0.0,
+       session_requests = 0,
+       session_model_counts = '{}',
+       updated_at = datetime('now')
+     WHERE user_id = ?`,
+    [userId]
+  );
 }

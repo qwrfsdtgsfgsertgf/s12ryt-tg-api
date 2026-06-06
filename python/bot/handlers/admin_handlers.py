@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
     ADD_PROVIDER_MODELS_MANUAL,
     ADD_PROVIDER_PRICE_CONFIRM,
     ADD_PROVIDER_PRICE_MANUAL,
+    ADD_PROVIDER_PRICE_PER_MODEL,
     EDIT_PROVIDER_SELECT,
     EDIT_PROVIDER_FIELD,
     EDIT_PROVIDER_VALUE,
@@ -205,48 +206,69 @@ async def _auto_fetch_pricing(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if has_any:
         await update.message.reply_text(
-            f"📋 從 models.dev 獲取到以下定價：\n\n" + "\n".join(lines) + "\n\n"
-            "1️⃣ 使用以上定價\n"
-            "2️⃣ 全部手動輸入統一定價\n"
-            "3️⃣ 跳過\n\n"
-            "請選擇 1/2/3："
+            f"📋 從 models.dev 獲取到以下定價（每 1M tokens）：\n\n" + "\n".join(lines) + "\n\n"
+            "1️⃣ 使用 models.dev 的定價\n"
+            "2️⃣ 為所有模型手動設定統一定價\n"
+            "3️⃣ 逐個設定每個模型的定價\n"
+            "4️⃣ 跳過\n\n"
+            "請選擇 1/2/3/4："
         )
         return ADD_PROVIDER_PRICE_CONFIRM
     else:
+        # No models.dev pricing found — enter per-model manual mode
+        context.user_data["add_per_model_queue"] = model_list[:]
+        context.user_data["add_per_model_entries"] = []
+        first_model = model_list[0]
         await update.message.reply_text(
-            "⚠️ 未從 models.dev 獲取到任何定價。\n"
-            '請輸入統一定價（格式: 輸入價格,輸出價格），或輸入 "skip" 跳過：\n'
-            "如: 2.5,10（每 1M tokens）"
+            "⚠️ 未從 models.dev 獲取到任何定價。\n\n"
+            f"開始逐個設定模型定價。\n\n"
+            f"📌 模型「{first_model}」\n"
+            "請輸入定價（格式：輸入價格,輸出價格，每 1M tokens）\n"
+            "或輸入 skip 跳過此模型："
         )
-        return ADD_PROVIDER_PRICE_MANUAL
+        return ADD_PROVIDER_PRICE_PER_MODEL
 
 
 async def add_price_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Process pricing confirmation choice."""
     text = update.message.text.strip()
     model_pricing_entries = context.user_data.get("model_pricing_entries", [])
+    model_list = [m.strip() for m in context.user_data["new_provider"].get("models", "").split(",") if m.strip()]
 
     if text == "1":
         # Use fetched per-model pricing as-is
         pass
     elif text == "2":
-        await update.message.reply_text("請輸入統一定價（格式: 輸入價格,輸出價格，每 1M tokens）：")
-        context.user_data["model_pricing_entries"] = model_pricing_entries  # keep for later
+        # Manual uniform pricing for all models
+        await update.message.reply_text("請輸入統一定價（格式：輸入價格,輸出價格，每 1M tokens）：")
+        context.user_data["model_pricing_entries"] = model_pricing_entries
         return ADD_PROVIDER_PRICE_MANUAL
     elif text == "3":
+        # Per-model manual pricing — start iterating
+        context.user_data["add_per_model_queue"] = model_list[:]
+        context.user_data["add_per_model_entries"] = []
+        first_model = model_list[0]
+        await update.message.reply_text(
+            f"📌 開始逐個設定模型定價。\n\n"
+            f"模型「{first_model}」\n"
+            "請輸入定價（格式：輸入價格,輸出價格，每 1M tokens）\n"
+            "或輸入 skip 跳過此模型："
+        )
+        return ADD_PROVIDER_PRICE_PER_MODEL
+    elif text == "4":
         # Skip — clear all pricing
         for entry in model_pricing_entries:
             entry["input_price"] = None
             entry["output_price"] = None
     else:
-        await update.message.reply_text("❌ 無效的選擇，請輸入 1/2/3：")
+        await update.message.reply_text("❌ 無效的選擇，請輸入 1/2/3/4：")
         return ADD_PROVIDER_PRICE_CONFIRM
 
     return await _save_provider(update, context, model_pricing_entries)
 
 
 async def add_price_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Receive manual pricing and save."""
+    """Receive manual uniform pricing and save."""
     text = update.message.text.strip().lower()
     model_pricing_entries = context.user_data.get("model_pricing_entries", [])
 
@@ -260,10 +282,73 @@ async def add_price_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 entry["input_price"] = input_price
                 entry["output_price"] = output_price
         except (ValueError, IndexError):
-            await update.message.reply_text("❌ 格式錯誤，請使用: 輸入價格,輸出價格")
+            await update.message.reply_text("❌ 格式錯誤，請使用：輸入價格,輸出價格")
             return ADD_PROVIDER_PRICE_MANUAL
 
     return await _save_provider(update, context, model_pricing_entries)
+
+
+async def add_price_per_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle per-model manual pricing iteration for /add flow."""
+    text = update.message.text.strip()
+    queue: list = context.user_data.get("add_per_model_queue", [])
+    entries: list = context.user_data.get("add_per_model_entries", [])
+
+    # Process current model's input
+    current_model = queue.pop(0) if queue else None
+
+    if current_model and text.lower() != "skip":
+        try:
+            parts = text.split(",")
+            input_price = float(parts[0])
+            output_price = float(parts[1]) if len(parts) > 1 else 0.0
+            entries.append({
+                "model": current_model,
+                "input_price": input_price,
+                "output_price": output_price,
+            })
+        except (ValueError, IndexError):
+            # Put model back and re-ask
+            queue.insert(0, current_model)
+            await update.message.reply_text(
+                f"❌ 格式錯誤。請輸入格式：輸入價格,輸出價格\n"
+                f"或輸入 skip 跳過「{current_model}」："
+            )
+            return ADD_PROVIDER_PRICE_PER_MODEL
+
+    # Ask for next model or finish
+    if queue:
+        next_model = queue[0]
+        await update.message.reply_text(
+            f"📌 模型「{next_model}」\n"
+            "請輸入定價（格式：輸入價格,輸出價格，每 1M tokens）\n"
+            "或輸入 skip 跳過此模型："
+        )
+        return ADD_PROVIDER_PRICE_PER_MODEL
+    else:
+        # All done — merge entries into model_pricing_entries and save
+        model_pricing_entries = context.user_data.get("model_pricing_entries", [])
+        entry_map = {e["model"]: e for e in entries}
+        for mpe in model_pricing_entries:
+            if mpe["model"] in entry_map:
+                mpe["input_price"] = entry_map[mpe["model"]]["input_price"]
+                mpe["output_price"] = entry_map[mpe["model"]]["output_price"]
+
+        context.user_data.pop("add_per_model_queue", None)
+        context.user_data.pop("add_per_model_entries", None)
+
+        if entries:
+            lines = "\n".join(
+                f"   {e['model']}：${e['input_price']}/${e['output_price']}"
+                for e in entries
+            )
+            await update.message.reply_text(
+                f"✅ 已設定 {len(entries)} 個模型的定價：\n{lines}"
+            )
+        else:
+            await update.message.reply_text("未設定任何定價。")
+
+        return await _save_provider(update, context, model_pricing_entries)
 
 
 async def _save_provider(
@@ -595,44 +680,8 @@ async def edit_models_select(update: Update, context: ContextTypes.DEFAULT_TYPE)
     context.user_data.pop("fetched_models", None)
     context.user_data["pending_models"] = models_value
 
-    # Auto-fetch per-model pricing from models.dev
-    model_list = [m.strip() for m in models_value.split(",") if m.strip()]
-    if model_list:
-        await update.message.reply_text("🔍 正在從 models.dev 獲取每個新模型的定價...")
-        pricing_map = await fetch_models_pricing(model_list)
-
-        pricing_entries: list[dict] = []
-        pricing_lines: list[str] = []
-        has_any = False
-
-        for model_id in model_list:
-            p = pricing_map.get(model_id)
-            if p and (p.get("input") is not None or p.get("output") is not None):
-                pricing_entries.append({
-                    "model": model_id,
-                    "input_price": p.get("input"),
-                    "output_price": p.get("output"),
-                })
-                pricing_lines.append(f"   {model_id}：輸入 ${p.get('input') or '—'} / 輸出 ${p.get('output') or '—'}")
-                has_any = True
-            else:
-                pricing_entries.append({"model": model_id, "input_price": None, "output_price": None})
-                pricing_lines.append(f"   {model_id}：未找到定價")
-
-        if has_any:
-            context.user_data["edit_model_pricing_entries"] = pricing_entries
-            await update.message.reply_text(
-                "📋 從 models.dev 獲取到以下定價（每 1M tokens）：\n\n"
-                + "\n".join(pricing_lines) + "\n\n"
-                "是否同時更新這些模型的定價？\n"
-                "1️⃣ 是，使用以上定價\n"
-                "2️⃣ 否，只更新模型"
-            )
-            return EDIT_PROVIDER_MODELS_PRICE_CONFIRM
-        else:
-            await update.message.reply_text("⚠️ 未從 models.dev 獲取到這些模型的定價，定價保持不變。")
-
-    return await _do_edit_update(update, context, models_value)
+    # Show per-model pricing with same format as edit_field → pricing
+    return await _show_edit_models_pricing(update, context, models_value)
 
 
 async def edit_models_manual(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -640,63 +689,96 @@ async def edit_models_manual(update: Update, context: ContextTypes.DEFAULT_TYPE)
     models_value = update.message.text.strip()
     context.user_data["pending_models"] = models_value
 
-    # Auto-fetch per-model pricing from models.dev
+    return await _show_edit_models_pricing(update, context, models_value)
+
+
+async def _show_edit_models_pricing(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, models_value: str
+) -> int:
+    """Shared logic: fetch models.dev pricing for new models, show comparison with 4 options.
+
+    Used by both edit_models_select and edit_models_manual.
+    """
+    from db.database import get_model_prices_by_provider
     model_list = [m.strip() for m in models_value.split(",") if m.strip()]
-    if model_list:
-        await update.message.reply_text("🔍 正在從 models.dev 獲取每個新模型的定價...")
-        pricing_map = await fetch_models_pricing(model_list)
+    provider = context.user_data.get("editing_provider", {})
+    provider_id = provider.get("id")
 
-        pricing_entries: list[dict] = []
-        pricing_lines: list[str] = []
-        has_any = False
+    if not model_list:
+        return await _do_edit_update(update, context, models_value)
 
-        for model_id in model_list:
-            p = pricing_map.get(model_id)
-            if p and (p.get("input") is not None or p.get("output") is not None):
-                pricing_entries.append({
-                    "model": model_id,
-                    "input_price": p.get("input"),
-                    "output_price": p.get("output"),
-                })
-                pricing_lines.append(f"   {model_id}：輸入 ${p.get('input') or '—'} / 輸出 ${p.get('output') or '—'}")
-                has_any = True
-            else:
-                pricing_entries.append({"model": model_id, "input_price": None, "output_price": None})
-                pricing_lines.append(f"   {model_id}：未找到定價")
+    await update.message.reply_text("🔍 正在從 models.dev 獲取每個新模型的定價...")
+    pricing_map = await fetch_models_pricing(model_list)
 
-        if has_any:
-            context.user_data["edit_model_pricing_entries"] = pricing_entries
-            await update.message.reply_text(
-                "📋 從 models.dev 獲取到以下定價（每 1M tokens）：\n\n"
-                + "\n".join(pricing_lines) + "\n\n"
-                "是否同時更新這些模型的定價？\n"
-                "1️⃣ 是，使用以上定價\n"
-                "2️⃣ 否，只更新模型"
+    # Get current DB model prices
+    db_prices = await get_model_prices_by_provider(provider_id)
+    db_price_map = {p["model"]: p for p in db_prices}
+
+    pricing_entries: list[dict] = []
+    lines: list[str] = []
+    has_any = False
+
+    for model_id in model_list:
+        dev_p = pricing_map.get(model_id)
+        db_p = db_price_map.get(model_id)
+        current_input = db_p.get("input_price") if db_p else "—"
+        current_output = db_p.get("output_price") if db_p else "—"
+
+        if dev_p and (dev_p.get("input") is not None or dev_p.get("output") is not None):
+            lines.append(
+                f"{model_id}：\n"
+                f"   models.dev：輸入 ${dev_p.get('input') or '—'} / 輸出 ${dev_p.get('output') or '—'}\n"
+                f"   當前資料庫：輸入 ${current_input} / 輸出 ${current_output}"
             )
-            return EDIT_PROVIDER_MODELS_PRICE_CONFIRM
+            pricing_entries.append({
+                "model": model_id,
+                "input_price": dev_p.get("input"),
+                "output_price": dev_p.get("output"),
+            })
+            has_any = True
         else:
-            await update.message.reply_text("⚠️ 未從 models.dev 獲取到這些模型的定價，定價保持不變。")
+            pricing_entries.append({"model": model_id, "input_price": None, "output_price": None})
+            lines.append(
+                f"{model_id}：未找到 models.dev 定價（當前：輸入 ${current_input} / 輸出 ${current_output}）"
+            )
 
-    return await _do_edit_update(update, context, models_value)
+    context.user_data["edit_pricing_entries"] = pricing_entries
+    context.user_data["edit_pricing_models"] = model_list
+
+    if has_any:
+        await update.message.reply_text(
+            "📋 模型定價對比（每 1M tokens）：\n\n"
+            + "\n\n".join(lines)
+            + "\n\n1️⃣ 使用 models.dev 的定價更新全部\n"
+            "2️⃣ 為所有模型手動設定統一定價\n"
+            "3️⃣ 逐個設定每個模型的定價\n"
+            "4️⃣ 只更新模型，不動定價\n\n"
+            "請選擇 1/2/3/4："
+        )
+        return EDIT_PROVIDER_MODELS_PRICE_CONFIRM
+    else:
+        await update.message.reply_text("⚠️ 未從 models.dev 獲取到這些模型的定價，定價保持不變。")
+        return await _do_edit_update(update, context, models_value)
 
 
 async def edit_models_price_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Process per-model pricing confirmation after model change."""
+    """Process pricing confirmation after model change — 4 options matching edit_price_modelsdev."""
     from db.database import batch_upsert_model_prices
     text = update.message.text.strip()
-    pricing_entries = context.user_data.pop("edit_model_pricing_entries", [])
+    pricing_entries = context.user_data.pop("edit_pricing_entries", [])
+    current_models = context.user_data.pop("edit_pricing_models", [])
     models_value = context.user_data.pop("pending_models", "")
     provider = context.user_data.get("editing_provider", {})
     provider_id = provider.get("id")
 
     if text == "1":
-        # Update models and per-model pricing
+        # Use models.dev pricing — update models + pricing
         await database.update_provider(provider_id, models=models_value)
-        if pricing_entries:
-            await batch_upsert_model_prices(provider_id, pricing_entries)
-            updated = [e for e in pricing_entries if e.get("input_price") is not None or e.get("output_price") is not None]
+        valid_entries = [e for e in pricing_entries if e.get("input_price") is not None or e.get("output_price") is not None]
+        if valid_entries:
+            await batch_upsert_model_prices(provider_id, valid_entries)
             await update.message.reply_text(
-                f"✅ 已更新模型和 {len(updated)} 個模型的定價。\n"
+                f"✅ 已更新模型和 {len(valid_entries)} 個模型的定價。\n"
                 f"   模型：{models_value}"
             )
         else:
@@ -704,8 +786,29 @@ async def edit_models_price_confirm(update: Update, context: ContextTypes.DEFAUL
         context.user_data.pop("editing_provider", None)
         context.user_data.pop("edit_field", None)
         return ConversationHandler.END
+    elif text == "2":
+        # Manual uniform pricing — update models first, then ask for price
+        await database.update_provider(provider_id, models=models_value)
+        context.user_data["editing_provider"] = await database.get_provider_by_id(provider_id)
+        context.user_data["edit_pricing_models"] = current_models
+        await update.message.reply_text("請輸入統一定價（格式：輸入價格,輸出價格，每 1M tokens）：")
+        return EDIT_PROVIDER_PRICE_MANUAL
+    elif text == "3":
+        # Per-model manual pricing — update models first, then iterate
+        await database.update_provider(provider_id, models=models_value)
+        context.user_data["editing_provider"] = await database.get_provider_by_id(provider_id)
+        context.user_data["per_model_queue"] = current_models[:]
+        context.user_data["per_model_entries"] = []
+        first_model = current_models[0]
+        await update.message.reply_text(
+            f"📌 開始逐個設定模型定價。\n\n"
+            f"模型「{first_model}」\n"
+            "請輸入定價（格式：輸入價格,輸出價格，每 1M tokens）\n"
+            "或輸入 skip 跳過此模型："
+        )
+        return EDIT_PROVIDER_PRICE_PER_MODEL
     else:
-        # Only update models
+        # text == "4" or any other — only update models
         return await _do_edit_update(update, context, models_value)
 
 
@@ -1202,6 +1305,7 @@ def register_admin_handlers(app):
             ADD_PROVIDER_MODELS_MANUAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_models_manual)],
             ADD_PROVIDER_PRICE_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_price_confirm)],
             ADD_PROVIDER_PRICE_MANUAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_price_manual)],
+            ADD_PROVIDER_PRICE_PER_MODEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_price_per_model)],
         },
         fallbacks=[CommandHandler("cancel", cancel_conversation)],
     )

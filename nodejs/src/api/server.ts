@@ -24,7 +24,7 @@ import {
   convertChatCompletionToAnthropic,
   streamAnthropicApi,
 } from "./anthropic_out.js";
-import { getProviders, lookupModelCached, rebuildProviderCache, onProviderCacheRebuild, type Provider } from "../db/database.js";
+import { getProviders, lookupModelCached, rebuildProviderCache, onProviderCacheRebuild, type Provider, getActiveCodingForApiKey, incrementCodingSessionStats } from "../db/database.js";
 
 // ---------------------------------------------------------------------------
 // App setup
@@ -109,6 +109,90 @@ function lookupModelDb(modelName: string): ResolvedProvider {
   throw new Error(`Unknown model: ${modelName}`);
 }
 
+interface DispatchResult {
+  result: any;
+  modelName: string;
+  providerType: string;
+  providerId: number;
+  providerConfig: { baseUrl: string; apiKey: string };
+  inputPrice: number | null;
+  outputPrice: number | null;
+}
+
+/**
+ * Dispatch a request.
+ * - model == 'coding-mode': use the user's fallback chain, try each model on error
+ * - model != 'coding-mode': direct call, no fallback
+ */
+async function dispatchWithFallback(
+  modelName: string,
+  body: Record<string, any>,
+  apiKeyId: number | undefined,
+): Promise<DispatchResult> {
+  const isCodingMode = modelName === "coding-mode";
+
+  if (isCodingMode) {
+    // Resolve user's fallback chain
+    if (!apiKeyId) {
+      throw new Error("coding-mode requires an API key");
+    }
+
+    const codingConfig = getActiveCodingForApiKey(apiKeyId);
+    if (!codingConfig || codingConfig.fallback_list.length === 0) {
+      throw new Error(
+        "coding-mode 未設定：請先使用 /set_coding 設定 Fallback 模型鏈"
+      );
+    }
+
+    let lastError: any = new Error("coding-mode: no fallback models available");
+
+    for (const fbModel of codingConfig.fallback_list) {
+      try {
+        const fbResolved = lookupModelDb(fbModel);
+        const fbModule = PROVIDER_MODULES[fbResolved.providerType];
+        if (!fbModule) continue;
+
+        console.log(`Coding mode: trying model ${fbModel}`);
+        const fbBody = { ...body, model: fbModel };
+        const result = await fbModule.chatCompletion(fbBody, fbResolved.config);
+
+        return {
+          result,
+          modelName: fbModel,
+          providerType: fbResolved.providerType,
+          providerId: fbResolved.providerId,
+          providerConfig: fbResolved.config,
+          inputPrice: fbResolved.inputPrice,
+          outputPrice: fbResolved.outputPrice,
+        };
+      } catch (fbError: any) {
+        console.warn(`Coding mode model ${fbModel} failed:`, fbError.message);
+        lastError = fbError;
+      }
+    }
+
+    throw lastError;
+  } else {
+    // Normal request — direct call, no fallback
+    const resolved = lookupModelDb(modelName);
+    const providerModule = PROVIDER_MODULES[resolved.providerType];
+    if (!providerModule) {
+      throw new Error(`Unknown provider type: ${resolved.providerType}`);
+    }
+
+    const result = await providerModule.chatCompletion(body, resolved.config);
+    return {
+      result,
+      modelName,
+      providerType: resolved.providerType,
+      providerId: resolved.providerId,
+      providerConfig: resolved.config,
+      inputPrice: resolved.inputPrice,
+      outputPrice: resolved.outputPrice,
+    };
+  }
+}
+
 interface ModelEntry {
   id: string;
   object: "model";
@@ -125,6 +209,14 @@ function getAllModelsFromDb(): ModelEntry[] {
   const providers = getProviders(true);
   const models: ModelEntry[] = [];
   const now = Math.floor(Date.now() / 1000);
+
+  // Always include the coding-mode virtual model
+  models.push({
+    id: "coding-mode",
+    object: "model",
+    created: now,
+    owned_by: "system",
+  });
 
   for (const p of providers) {
     const modelNames = p.models
@@ -300,49 +392,25 @@ app.post(
         return;
       }
 
-      let providerType: string;
-      let providerId: number;
-      let providerConfig: { baseUrl: string; apiKey: string };
-      let inputPrice: number | null;
-      let outputPrice: number | null;
-
+      // Dispatch with coding mode fallback
+      const originalModel = modelName;
+      let dispatch: DispatchResult;
+      const auth = req.auth as any;
+      const apiKeyId = auth?.apiKeyId as number | undefined;
       try {
-        const resolved = lookupModelDb(modelName);
-        providerType = resolved.providerType;
-        providerId = resolved.providerId;
-        providerConfig = resolved.config;
-        inputPrice = resolved.inputPrice;
-        outputPrice = resolved.outputPrice;
+        dispatch = await dispatchWithFallback(modelName, body, apiKeyId);
       } catch (err: any) {
-        res.status(400).json({
-          error: { message: err.message, type: "invalid_request_error" },
+        const statusCode = err.message?.includes("Unknown model") || err.message?.includes("coding-mode") ? 400 : 502;
+        res.status(statusCode).json({
+          error: { message: err.message, type: statusCode === 400 ? "invalid_request_error" : "upstream_error" },
         });
         return;
       }
 
-      const providerModule = PROVIDER_MODULES[providerType];
-      if (!providerModule) {
-        res.status(500).json({
-          error: {
-            message: `Unknown provider type: ${providerType}`,
-            type: "server_error",
-          },
-        });
-        return;
-      }
+      const { result, modelName: actualModel, providerType, providerId, providerConfig, inputPrice, outputPrice } = dispatch;
+      const isCodingMode = originalModel === "coding-mode";
 
       const isStream = body.stream === true;
-
-      let result: any;
-      try {
-        result = await providerModule.chatCompletion(body, providerConfig);
-      } catch (err: any) {
-        console.error(`Provider ${providerType} error for model ${modelName}:`, err);
-        res.status(502).json({
-          error: { message: err.message, type: "upstream_error" },
-        });
-        return;
-      }
 
       // Streaming response
       if (isStream && result && typeof result[Symbol.asyncIterator] === "function") {
@@ -374,8 +442,12 @@ app.post(
                   outputTokens: streamUsage.output_tokens,
                   inputCost: cost.input_cost,
                   outputCost: cost.output_cost,
-                  model: modelName,
+                  model: actualModel,
                 });
+                // Coding session stats
+                if (isCodingMode && auth.userId) {
+                  try { incrementCodingSessionStats(parseInt(auth.userId), streamUsage.input_tokens, streamUsage.output_tokens, cost.input_cost, cost.output_cost, actualModel); } catch {}
+                }
               }
             } catch (err) {
               console.error("Failed to record streaming usage:", err);
@@ -404,8 +476,12 @@ app.post(
               outputTokens: usage.output_tokens,
               inputCost: cost.input_cost,
               outputCost: cost.output_cost,
-              model: modelName,
+              model: actualModel,
             });
+            // Coding session stats
+            if (isCodingMode && auth.userId) {
+              try { incrementCodingSessionStats(parseInt(auth.userId), usage.input_tokens, usage.output_tokens, cost.input_cost, cost.output_cost, actualModel); } catch {}
+            }
           }
         } catch (err) {
           console.error("Failed to record usage:", err);
@@ -452,39 +528,14 @@ app.post(
         return;
       }
 
-      // Resolve model → provider
+      // Resolve model → provider (with fallback support)
       let providerType: string;
       let providerId: number;
       let providerConfig: { baseUrl: string; apiKey: string };
       let inputPrice: number | null;
       let outputPrice: number | null;
 
-      try {
-        const resolved = lookupModelDb(modelName);
-        providerType = resolved.providerType;
-        providerId = resolved.providerId;
-        providerConfig = resolved.config;
-        inputPrice = resolved.inputPrice;
-        outputPrice = resolved.outputPrice;
-      } catch (err: any) {
-        res.status(400).json({
-          error: { message: err.message, type: "invalid_request_error" },
-        });
-        return;
-      }
-
-      const providerModule = PROVIDER_MODULES[providerType];
-      if (!providerModule) {
-        res.status(500).json({
-          error: {
-            message: `Unknown provider type: ${providerType}`,
-            type: "server_error",
-          },
-        });
-        return;
-      }
-
-      // Convert Responses input → Chat Completions messages
+      // Convert Responses input → Chat Completions messages first
       const instructions: string | undefined = body.instructions;
       const messages = convertResponsesInputToMessages(input, instructions);
 
@@ -520,19 +571,33 @@ app.post(
 
       const isStream = chatBody.stream === true;
 
-      let result: any;
+      // Dispatch with coding mode fallback
+      const originalModelResp = modelName;
+      let dispatch: DispatchResult;
+      const authResp = req.auth as any;
+      const apiKeyIdResp = authResp?.apiKeyId as number | undefined;
       try {
-        result = await providerModule.chatCompletion(chatBody, providerConfig);
+        dispatch = await dispatchWithFallback(modelName, chatBody as Record<string, any>, apiKeyIdResp);
       } catch (err: any) {
-        console.error(`Provider ${providerType} error for model ${modelName}:`, err);
-        res.status(502).json({
-          error: { message: err.message, type: "upstream_error" },
+        const statusCode = err.message?.includes("Unknown model") || err.message?.includes("coding-mode") ? 400 : 502;
+        res.status(statusCode).json({
+          error: { message: err.message, type: statusCode === 400 ? "invalid_request_error" : "upstream_error" },
         });
         return;
       }
 
+      const { result, modelName: actualModel, providerType: pt, providerId: pid, providerConfig: pcfg, inputPrice: ip, outputPrice: op } = dispatch;
+      providerType = pt;
+      providerId = pid;
+      providerConfig = pcfg;
+      inputPrice = ip;
+      outputPrice = op;
+      const isCodingModeResp = originalModelResp === "coding-mode";
+
+      let result2: any = result;
+
       // Streaming: convert Chat Completions SSE → Responses API SSE
-      if (isStream && result && typeof result[Symbol.asyncIterator] === "function") {
+      if (isStream && result2 && typeof result2[Symbol.asyncIterator] === "function") {
         console.log("[DEBUG] Entering streaming path for /v1/responses");
         res.setHeader("Content-Type", "text/event-stream");
         res.setHeader("Cache-Control", "no-cache");
@@ -543,9 +608,9 @@ app.post(
         try {
           let chunkCount = 0;
           const streamUsage = await extractUsageFromProviderStream(
-            result as AsyncIterable<Uint8Array>,
+            result2 as AsyncIterable<Uint8Array>,
             async (passThrough) => {
-              const responsesStream = streamResponsesApi(passThrough, modelName, {
+              const responsesStream = streamResponsesApi(passThrough, actualModel, {
                 instructions,
                 previousResponseId: body.previous_response_id,
                 temperature: body.temperature,
@@ -572,8 +637,11 @@ app.post(
                   outputTokens: streamUsage.output_tokens,
                   inputCost: cost.input_cost,
                   outputCost: cost.output_cost,
-                  model: modelName,
+                  model: actualModel,
                 });
+                if (isCodingModeResp && auth.userId) {
+                  try { incrementCodingSessionStats(parseInt(auth.userId), streamUsage.input_tokens, streamUsage.output_tokens, cost.input_cost, cost.output_cost, actualModel); } catch {}
+                }
               }
             } catch (err) {
               console.error("Failed to record streaming usage:", err);
@@ -588,8 +656,8 @@ app.post(
       }
 
       // Non-streaming: convert Chat Completions → Responses format
-      if (result && typeof result === "object") {
-        const responsesResult = convertChatCompletionToResponses(result, modelName, {
+      if (result2 && typeof result2 === "object") {
+        const responsesResult = convertChatCompletionToResponses(result2, actualModel, {
           instructions,
           previousResponseId: body.previous_response_id,
           temperature: body.temperature,
@@ -598,7 +666,7 @@ app.post(
 
         // Extract usage and record
         try {
-          const usage = extractUsage(providerType, result);
+          const usage = extractUsage(providerType, result2);
           const cost = calculateCost(inputPrice, outputPrice, usage.input_tokens, usage.output_tokens);
 
           const auth = req.auth;
@@ -610,8 +678,11 @@ app.post(
               outputTokens: usage.output_tokens,
               inputCost: cost.input_cost,
               outputCost: cost.output_cost,
-              model: modelName,
+              model: actualModel,
             });
+            if (isCodingModeResp && auth.userId) {
+              try { incrementCodingSessionStats(parseInt(auth.userId), usage.input_tokens, usage.output_tokens, cost.input_cost, cost.output_cost, actualModel); } catch {}
+            }
           }
         } catch (err) {
           console.error("Failed to record usage:", err);
@@ -659,37 +730,6 @@ app.post(
         return;
       }
 
-      // Resolve model → provider
-      let providerType: string;
-      let providerId: number;
-      let providerConfig: { baseUrl: string; apiKey: string };
-      let inputPrice: number | null;
-      let outputPrice: number | null;
-
-      try {
-        const resolved = lookupModelDb(modelName);
-        providerType = resolved.providerType;
-        providerId = resolved.providerId;
-        providerConfig = resolved.config;
-        inputPrice = resolved.inputPrice;
-        outputPrice = resolved.outputPrice;
-      } catch (err: any) {
-        res.status(400).json({
-          type: "error",
-          error: { type: "invalid_request_error", message: err.message },
-        });
-        return;
-      }
-
-      const providerModule = PROVIDER_MODULES[providerType];
-      if (!providerModule) {
-        res.status(500).json({
-          type: "error",
-          error: { type: "server_error", message: `Unknown provider type: ${providerType}` },
-        });
-        return;
-      }
-
       // Convert Anthropic Messages API → OpenAI Chat Completions format
       const chatBody = convertAnthropicInputToMessages(body);
 
@@ -704,17 +744,25 @@ app.post(
 
       const isStream = chatBody.stream === true;
 
-      let result: any;
+      // Dispatch with coding mode fallback
+      const originalModelMsg = modelName;
+      let dispatch: DispatchResult;
+      const authMsg = req.auth as any;
+      const apiKeyIdMsg = authMsg?.apiKeyId as number | undefined;
       try {
-        result = await providerModule.chatCompletion(chatBody, providerConfig);
+        dispatch = await dispatchWithFallback(modelName, chatBody as Record<string, any>, apiKeyIdMsg);
       } catch (err: any) {
-        console.error(`Provider ${providerType} error for model ${modelName}:`, err);
-        res.status(502).json({
+        const statusCode = err.message?.includes("Unknown model") || err.message?.includes("coding-mode") ? 400 : 502;
+        const errorType = statusCode === 400 ? "invalid_request_error" : "api_error";
+        res.status(statusCode).json({
           type: "error",
-          error: { type: "api_error", message: err.message },
+          error: { type: errorType, message: err.message },
         });
         return;
       }
+
+      const { result, modelName: actualModel, providerType, providerId, providerConfig, inputPrice, outputPrice } = dispatch;
+      const isCodingModeMsg = originalModelMsg === "coding-mode";
 
       // Streaming: convert OpenAI SSE → Anthropic SSE
       if (isStream && result && typeof result[Symbol.asyncIterator] === "function") {
@@ -730,7 +778,7 @@ app.post(
           const streamUsage = await extractUsageFromProviderStream(
             result as AsyncIterable<Uint8Array>,
             async (passThrough) => {
-              const anthropicStream = streamAnthropicApi(passThrough, modelName);
+              const anthropicStream = streamAnthropicApi(passThrough, actualModel);
               for await (const chunk of anthropicStream) {
                 chunkCount++;
                 writeAndFlush(res, chunk);
@@ -752,8 +800,11 @@ app.post(
                   outputTokens: streamUsage.output_tokens,
                   inputCost: cost.input_cost,
                   outputCost: cost.output_cost,
-                  model: modelName,
+                  model: actualModel,
                 });
+                if (isCodingModeMsg && auth.userId) {
+                  try { incrementCodingSessionStats(parseInt(auth.userId), streamUsage.input_tokens, streamUsage.output_tokens, cost.input_cost, cost.output_cost, actualModel); } catch {}
+                }
               }
             } catch (err) {
               console.error("Failed to record streaming usage:", err);
@@ -769,7 +820,7 @@ app.post(
 
       // Non-streaming: convert OpenAI → Anthropic Messages API format
       if (result && typeof result === "object") {
-        const anthropicResult = convertChatCompletionToAnthropic(result, modelName);
+        const anthropicResult = convertChatCompletionToAnthropic(result, actualModel);
 
         // Extract usage and record
         try {
@@ -785,8 +836,11 @@ app.post(
               outputTokens: usage.output_tokens,
               inputCost: cost.input_cost,
               outputCost: cost.output_cost,
-              model: modelName,
+              model: actualModel,
             });
+            if (isCodingModeMsg && auth.userId) {
+              try { incrementCodingSessionStats(parseInt(auth.userId), usage.input_tokens, usage.output_tokens, cost.input_cost, cost.output_cost, actualModel); } catch {}
+            }
           }
         } catch (err) {
           console.error("Failed to record usage:", err);
