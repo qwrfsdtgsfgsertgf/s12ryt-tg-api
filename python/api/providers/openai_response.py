@@ -11,7 +11,6 @@ Exposes two public functions:
 
 from __future__ import annotations
 
-import json
 import logging
 import asyncio
 from typing import Any, AsyncIterator

@@ -13,9 +13,96 @@ from telegram.ext import ContextTypes, ConversationHandler
 from config import Config
 from db import database
 from bot.keyboards import make_numbered_list_keyboard
-from bot.handlers.model_fetcher import fetch_provider_models, fetch_models_pricing, detect_api_protocols
+from bot.handlers.model_fetcher import fetch_provider_models, fetch_models_pricing, detect_api_protocols, detect_protocols_no_auth
 
 logger = logging.getLogger(__name__)
+
+# Telegram message character limit (leave margin for formatting)
+_MAX_MSG_LEN = 3800
+
+
+async def _safe_reply_models(
+    update: Update,
+    models: list[dict],
+    *,
+    header: str = "",
+    footer: str = "",
+) -> None:
+    """Reply with a model list, splitting into multiple messages if needed.
+
+    Each model is shown as ``{n}. {model_id}``.
+    Messages are split at ~3800 chars to stay under Telegram's 4096 limit.
+    """
+    if not models:
+        await update.message.reply_text(header or "（無模型）")
+        return
+
+    lines: list[str] = []
+    for i, m in enumerate(models, 1):
+        lines.append(f"{i}. {m.get('id', m.get('name', '?'))}")
+
+    # Batch lines into chunks that fit within _MAX_MSG_LEN
+    chunks: list[str] = []
+    current_lines: list[str] = []
+    current_len = len(header) + 2 if header else 0
+
+    for line in lines:
+        added = len(line) + 1  # +1 for newline
+        if current_len + added > _MAX_MSG_LEN and current_lines:
+            chunks.append("\n".join(current_lines))
+            current_lines = []
+            current_len = 0
+        current_lines.append(line)
+        current_len += added
+
+    if current_lines:
+        chunks.append("\n".join(current_lines))
+
+    # Send chunks
+    for idx, chunk in enumerate(chunks):
+        parts: list[str] = []
+        if idx == 0 and header:
+            parts.append(header)
+        parts.append(chunk)
+        if idx == len(chunks) - 1 and footer:
+            parts.append(footer)
+        await update.message.reply_text("\n\n".join(parts))
+
+
+def _build_model_selection_prompt(
+    total: int,
+    *,
+    is_search: bool = False,
+    search_keyword: str = "",
+    shown: int | None = None,
+) -> str:
+    """Build the prompt text shown after a model list."""
+    if is_search:
+        header = f'🔍 搜尋 "{search_keyword}" 找到 {total} 個模型：'
+    else:
+        header = f"✅ 獲取到 {total} 個模型："
+
+    if shown is not None and shown < total:
+        header += f"（顯示前 {shown} 個）"
+
+    footer = (
+        "\n\n請選擇：\n"
+        "• 輸入編號（多選用逗號分隔）\n"
+        '• 輸入 "all" 全選\n'
+        '• 輸入 "manual" 手動輸入\n'
+        "• 輸入關鍵字搜尋模型（例如：gpt）"
+    )
+    if is_search:
+        footer += '\n• 輸入 "back" 返回完整列表'
+
+    return header, footer
+
+
+def _filter_models(models: list[dict], keyword: str) -> list[dict]:
+    """Filter models by keyword (case-insensitive substring match)."""
+    kw = keyword.lower()
+    return [m for m in models if kw in m.get("id", "").lower() or kw in m.get("name", "").lower()]
+
 
 # Conversation states
 (
@@ -46,6 +133,10 @@ logger = logging.getLogger(__name__)
     EDIT_USER_INPUT,
     RM_USERKEY_SELECT,
 ) = range(24)
+
+# /api_test conversation states (separate from main range)
+API_TEST_URL = 100
+API_TEST_KEY = 101
 
 
 # ============================================================
@@ -136,20 +227,11 @@ async def add_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     )
 
     if fetched:
-        # Show list for user to select
-        display = fetched[:50]
-        lines = [f"{i + 1}. {m['id']}" for i, m in enumerate(display)]
-        suffix = f"\n...還有 {len(fetched) - 50} 個" if len(fetched) > 50 else ""
+        # Show list for user to select (with safe pagination)
         context.user_data["fetched_models"] = fetched
 
-        await update.message.reply_text(
-            f"✅ 獲取到 {len(fetched)} 個模型：\n\n"
-            + "\n".join(lines)
-            + suffix
-            + "\n\n請選擇模型（輸入編號，多選用逗號分隔）\n"
-            '或輸入 "all" 全選\n'
-            '或輸入 "manual" 手動輸入：'
-        )
+        header, footer = _build_model_selection_prompt(len(fetched))
+        await _safe_reply_models(update, fetched, header=header, footer=footer)
         return ADD_PROVIDER_MODELS_SELECT
     else:
         await update.message.reply_text(
@@ -160,29 +242,63 @@ async def add_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def add_models_select(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Process model selection from fetched list."""
-    text = update.message.text.strip().lower()
-    fetched: list = context.user_data.get("fetched_models", [])
+    """Process model selection from fetched list. Supports search keywords."""
+    text = update.message.text.strip()
+    text_lower = text.lower()
+    all_fetched: list = context.user_data.get("fetched_models", [])
 
-    if text == "all":
-        models = ",".join(m["id"] for m in fetched)
-    elif text == "manual":
+    # Check if we are in search mode
+    search_results: list | None = context.user_data.get("search_results")
+
+    if text_lower == "back":
+        # Exit search mode, show full list again
+        context.user_data.pop("search_results", None)
+        header, footer = _build_model_selection_prompt(len(all_fetched))
+        await _safe_reply_models(update, all_fetched, header=header, footer=footer)
+        return ADD_PROVIDER_MODELS_SELECT
+
+    if text_lower == "all":
+        if search_results is not None:
+            models = ",".join(m["id"] for m in search_results)
+            context.user_data.pop("search_results", None)
+        else:
+            models = ",".join(m["id"] for m in all_fetched)
+    elif text_lower == "manual":
+        context.user_data.pop("search_results", None)
         await update.message.reply_text("請手動輸入模型（用逗號分隔）：")
         return ADD_PROVIDER_MODELS_MANUAL
     else:
+        # Try to parse as number indices (from search results or full list)
+        active_list = search_results if search_results is not None else all_fetched
         indices = []
-        for part in text.replace("，", ",").split(","):
+        for part in text_lower.replace("，", ",").split(","):
             part = part.strip()
             if part.isdigit():
                 n = int(part)
-                if 1 <= n <= len(fetched):
+                if 1 <= n <= len(active_list):
                     indices.append(n)
-        if not indices:
-            await update.message.reply_text("❌ 無效的選擇，已取消。")
-            context.user_data.pop("new_provider", None)
-            return ConversationHandler.END
-        indices = list(set(indices))
-        models = ",".join(fetched[i - 1]["id"] for i in indices)
+
+        if indices:
+            context.user_data.pop("search_results", None)
+            indices = list(set(indices))
+            models = ",".join(active_list[i - 1]["id"] for i in indices)
+        else:
+            # Treat as search keyword
+            keyword = text.strip()
+            filtered = _filter_models(all_fetched, keyword)
+            if filtered:
+                context.user_data["search_results"] = filtered
+                header, footer = _build_model_selection_prompt(
+                    len(filtered), is_search=True, search_keyword=keyword
+                )
+                await _safe_reply_models(update, filtered, header=header, footer=footer)
+                return ADD_PROVIDER_MODELS_SELECT
+            else:
+                await update.message.reply_text(
+                    f'🔍 搜尋 "{keyword}" 沒有找到任何模型。\n'
+                    "請嘗試其他關鍵字，或輸入編號 / all / manual："
+                )
+                return ADD_PROVIDER_MODELS_SELECT
 
     context.user_data["new_provider"]["models"] = models
     context.user_data.pop("fetched_models", None)
@@ -582,19 +698,10 @@ async def edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         )
 
         if fetched:
-            display = fetched[:50]
-            lines = [f"{i + 1}. {m['id']}" for i, m in enumerate(display)]
-            suffix = f"\n...還有 {len(fetched) - 50} 個" if len(fetched) > 50 else ""
             context.user_data["fetched_models"] = fetched
 
-            await update.message.reply_text(
-                f"✅ 獲取到 {len(fetched)} 個模型：\n\n"
-                + "\n".join(lines)
-                + suffix
-                + "\n\n請選擇模型（輸入編號，多選用逗號分隔）\n"
-                '或輸入 "all" 全選\n'
-                '或輸入 "manual" 手動輸入：'
-            )
+            header, footer = _build_model_selection_prompt(len(fetched))
+            await _safe_reply_models(update, fetched, header=header, footer=footer)
             return EDIT_PROVIDER_MODELS_SELECT
         else:
             await update.message.reply_text(
@@ -680,30 +787,63 @@ async def edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def edit_models_select(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Process model selection from fetched list in edit mode."""
-    text = update.message.text.strip().lower()
-    fetched: list = context.user_data.get("fetched_models", [])
+    """Process model selection from fetched list in edit mode. Supports search keywords."""
+    text = update.message.text.strip()
+    text_lower = text.lower()
+    all_fetched: list = context.user_data.get("fetched_models", [])
 
-    if text == "all":
-        models_value = ",".join(m["id"] for m in fetched)
-    elif text == "manual":
+    # Check if we are in search mode
+    search_results: list | None = context.user_data.get("search_results")
+
+    if text_lower == "back":
+        # Exit search mode, show full list again
+        context.user_data.pop("search_results", None)
+        header, footer = _build_model_selection_prompt(len(all_fetched))
+        await _safe_reply_models(update, all_fetched, header=header, footer=footer)
+        return EDIT_PROVIDER_MODELS_SELECT
+
+    if text_lower == "all":
+        if search_results is not None:
+            models_value = ",".join(m["id"] for m in search_results)
+            context.user_data.pop("search_results", None)
+        else:
+            models_value = ",".join(m["id"] for m in all_fetched)
+    elif text_lower == "manual":
+        context.user_data.pop("search_results", None)
         await update.message.reply_text("請手動輸入模型（用逗號分隔）：")
         return EDIT_PROVIDER_MODELS_MANUAL
     else:
+        # Try to parse as number indices
+        active_list = search_results if search_results is not None else all_fetched
         indices = []
-        for part in text.replace("，", ",").split(","):
+        for part in text_lower.replace("，", ",").split(","):
             part = part.strip()
             if part.isdigit():
                 n = int(part)
-                if 1 <= n <= len(fetched):
+                if 1 <= n <= len(active_list):
                     indices.append(n)
-        if not indices:
-            await update.message.reply_text("❌ 無效的選擇，已取消。")
-            context.user_data.pop("editing_provider", None)
-            context.user_data.pop("edit_field", None)
-            return ConversationHandler.END
-        indices = list(set(indices))
-        models_value = ",".join(fetched[i - 1]["id"] for i in indices)
+
+        if indices:
+            context.user_data.pop("search_results", None)
+            indices = list(set(indices))
+            models_value = ",".join(active_list[i - 1]["id"] for i in indices)
+        else:
+            # Treat as search keyword
+            keyword = text.strip()
+            filtered = _filter_models(all_fetched, keyword)
+            if filtered:
+                context.user_data["search_results"] = filtered
+                header, footer = _build_model_selection_prompt(
+                    len(filtered), is_search=True, search_keyword=keyword
+                )
+                await _safe_reply_models(update, filtered, header=header, footer=footer)
+                return EDIT_PROVIDER_MODELS_SELECT
+            else:
+                await update.message.reply_text(
+                    f'🔍 搜尋 "{keyword}" 沒有找到任何模型。\n'
+                    "請嘗試其他關鍵字，或輸入編號 / all / manual："
+                )
+                return EDIT_PROVIDER_MODELS_SELECT
 
     context.user_data.pop("fetched_models", None)
     context.user_data["pending_models"] = models_value
@@ -1308,6 +1448,84 @@ async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 # ============================================================
+# /api_test - Test API protocol reachability
+# ============================================================
+
+
+def _format_protocol_status(status: dict) -> str:
+    """Format protocol status dict into readable text."""
+    protocol_labels = {
+        "openai_chat": "OpenAI (Chat Completions)",
+        "openai_response": "OpenAI (Responses API)",
+        "anthropic": "Anthropic (Messages)",
+        "google": "Google (Gemini)",
+    }
+    lines = []
+    for proto, reachable in status.items():
+        label = protocol_labels.get(proto, proto)
+        icon = "✅" if reachable else "❌"
+        lines.append(f"  {icon} {label}")
+    return "\n".join(lines)
+
+
+async def api_test_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Start /api_test conversation — ask for URL."""
+    await update.message.reply_text(
+        "🧪 API 協議測試\n\n"
+        "請輸入要測試的 API URL：\n"
+        "例如：https://api.example.com/v1"
+    )
+    return API_TEST_URL
+
+
+async def api_test_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Receive URL and test protocols without auth."""
+    url = update.message.text.strip()
+    context.user_data["api_test_url"] = url
+
+    await update.message.reply_text("⏳ 正在偵測 API 協議（不帶 Key）...")
+
+    status, all_unreachable = await detect_protocols_no_auth(url)
+
+    if all_unreachable:
+        await update.message.reply_text(
+            "⚠️ 所有協議都無法連通。\n"
+            "可能是網路問題或需要認證。\n\n"
+            "請輸入 API Key 重試，或輸入 /cancel 取消："
+        )
+        return API_TEST_KEY
+
+    # Display results
+    result_text = _format_protocol_status(status)
+    reachable_count = sum(1 for v in status.values() if v)
+    await update.message.reply_text(
+        f"📊 偵測結果（不帶 Key）：\n\n{result_text}\n\n"
+        f"共 {reachable_count}/{len(status)} 個協議可連通。"
+    )
+    context.user_data.pop("api_test_url", None)
+    return ConversationHandler.END
+
+
+async def api_test_key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Receive API key and retry protocol detection."""
+    api_key = update.message.text.strip()
+    url = context.user_data.get("api_test_url", "")
+
+    await update.message.reply_text("⏳ 正在使用 Key 重新偵測 API 協議...")
+
+    status = await detect_api_protocols(url, api_key)
+
+    result_text = _format_protocol_status(status)
+    reachable_count = sum(1 for v in status.values() if v)
+    await update.message.reply_text(
+        f"📊 偵測結果（帶 Key）：\n\n{result_text}\n\n"
+        f"共 {reachable_count}/{len(status)} 個協議可連通。"
+    )
+    context.user_data.pop("api_test_url", None)
+    return ConversationHandler.END
+
+
+# ============================================================
 # Register all admin handlers
 # ============================================================
 
@@ -1427,3 +1645,14 @@ def register_admin_handlers(app):
         fallbacks=[CommandHandler("cancel", cancel_conversation)],
     )
     app.add_handler(edit_user_conv)
+
+    # /api_test
+    api_test_conv = ConversationHandler(
+        entry_points=[CommandHandler("api_test", api_test_start, filters=filters.User(user_id=Config.ADMIN_ID))],
+        states={
+            API_TEST_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, api_test_url)],
+            API_TEST_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, api_test_key)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_conversation)],
+    )
+    app.add_handler(api_test_conv)

@@ -10,7 +10,6 @@ Anthropic Messages API spec: https://docs.anthropic.com/en/api/messages
 from __future__ import annotations
 
 import json
-import time
 import uuid
 from typing import Any, AsyncIterator
 

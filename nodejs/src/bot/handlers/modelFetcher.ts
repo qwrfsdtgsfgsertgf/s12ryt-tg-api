@@ -1,7 +1,7 @@
 /**
  * Utility: fetch provider model list and pricing from external APIs.
  *
- * 1. Fetches models from the provider's base_url + /model endpoint
+ * 1. Fetches models from the provider's base_url + /models endpoint
  * 2. Fetches pricing from https://models.dev/api.json
  */
 
@@ -67,7 +67,7 @@ async function getModelsDevData(): Promise<ModelsDevData> {
 }
 
 // ---------------------------------------------------------------------------
-// Fetch model list from provider's /model endpoint
+// Fetch model list from provider's /models endpoint
 // ---------------------------------------------------------------------------
 
 export async function fetchProviderModels(
@@ -76,12 +76,12 @@ export async function fetchProviderModels(
   apiType: string
 ): Promise<FetchedModel[]> {
   try {
-    // Build models endpoint: baseUrl + /model (or + model if trailing /)
+    // Build models endpoint: baseUrl + /models (or + models if trailing /)
     let modelsUrl: string;
     if (baseUrl.endsWith("/")) {
-      modelsUrl = `${baseUrl}model`;
+      modelsUrl = `${baseUrl}models`;
     } else {
-      modelsUrl = `${baseUrl}/model`;
+      modelsUrl = `${baseUrl}/models`;
     }
 
     // Set authentication headers / URL params based on apiType
@@ -276,4 +276,71 @@ export async function detectApiProtocols(
     anthropic: anthropicPost,
     google: googleGet,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Fetch model list without auth (for /model_catch)
+// ---------------------------------------------------------------------------
+
+/**
+ * Try to fetch models without authentication.
+ * Returns { models, needsAuth }.
+ */
+export async function fetchModelsNoAuth(
+  baseUrl: string
+): Promise<{ models: FetchedModel[]; needsAuth: boolean }> {
+  try {
+    const url = baseUrl.endsWith("/") ? `${baseUrl}models` : `${baseUrl}/models`;
+
+    const resp = await fetch(url, { signal: AbortSignal.timeout(15_000) });
+
+    if (resp.status === 401 || resp.status === 403) {
+      return { models: [], needsAuth: true };
+    }
+
+    if (!resp.ok) {
+      return { models: [], needsAuth: false };
+    }
+
+    const json = (await resp.json()) as any;
+    const models: FetchedModel[] = [];
+
+    // OpenAI-compatible format
+    if (json.data && Array.isArray(json.data)) {
+      for (const m of json.data) {
+        if (m?.id) models.push({ id: m.id, name: m.id });
+      }
+    }
+    // Google format
+    else if (json.models && Array.isArray(json.models)) {
+      for (const m of json.models) {
+        const rawName: string = m.name || "";
+        const modelId = rawName ? rawName.replace("models/", "") : m.id || "";
+        if (modelId) {
+          models.push({ id: modelId, name: m.displayName || modelId });
+        }
+      }
+    }
+
+    return { models, needsAuth: false };
+  } catch (e) {
+    console.warn("[fetchModelsNoAuth] Failed:", (e as Error).message);
+    return { models: [], needsAuth: false };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Detect protocols without auth (for /api_test)
+// ---------------------------------------------------------------------------
+
+/**
+ * Probe API protocols without authentication.
+ * Returns { status, allUnreachable }.
+ */
+export async function detectProtocolsNoAuth(
+  baseUrl: string
+): Promise<{ status: ProtocolStatus; allUnreachable: boolean }> {
+  const status = await detectApiProtocols(baseUrl, "");
+  const allUnreachable = !Object.values(status).some(Boolean);
+  return { status, allUnreachable };
 }

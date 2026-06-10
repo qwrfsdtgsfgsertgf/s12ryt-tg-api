@@ -7,7 +7,6 @@ Input/Output: Standard OpenAI chat completion format.
 
 from __future__ import annotations
 
-import json
 import logging
 import asyncio
 from typing import Any, AsyncIterator

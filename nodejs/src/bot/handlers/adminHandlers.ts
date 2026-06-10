@@ -25,7 +25,7 @@ import {
   type User,
   type ApiKey,
 } from "../../db/database.js";
-import { fetchProviderModels, fetchModelsPricing, detectApiProtocols } from "./modelFetcher.js";
+import { fetchProviderModels, fetchModelsPricing, detectApiProtocols, detectProtocolsNoAuth, type ProtocolStatus, type FetchedModel } from "./modelFetcher.js";
 
 // ========================
 // Types
@@ -53,6 +53,81 @@ function parseIndices(input: string): number[] {
     .filter((s) => s.length > 0)
     .map((s) => parseInt(s, 10))
     .filter((n) => !isNaN(n));
+}
+
+// ========================
+// Helpers: Safe model list reply + search
+// ========================
+
+const MAX_MSG_LEN = 3800;
+
+/** Split model list into multiple messages to stay under Telegram's 4096 char limit */
+export async function safeReplyModels(
+  ctx: Context,
+  models: FetchedModel[],
+  header: string,
+  footer: string,
+): Promise<void> {
+  if (models.length === 0) {
+    await ctx.reply(header + "\n（無模型）\n" + footer);
+    return;
+  }
+
+  const modelLines = models.map((m, i) => `${i + 1}. ${m.name || m.id}`);
+  // First batch: header + as many models as fit
+  let firstMsg = header + "\n";
+  const batches: string[] = [];
+  let currentBatch = firstMsg;
+  let shown = 0;
+
+  for (const line of modelLines) {
+    if (currentBatch.length + line.length + 2 > MAX_MSG_LEN && currentBatch !== firstMsg) {
+      batches.push(currentBatch);
+      currentBatch = "";
+    }
+    currentBatch += line + "\n";
+    shown++;
+  }
+
+  // Append footer to last batch
+  if (currentBatch.length + footer.length + 2 > MAX_MSG_LEN) {
+    batches.push(currentBatch);
+    currentBatch = "";
+  }
+  currentBatch += footer;
+  batches.push(currentBatch);
+
+  // Send first batch (with header)
+  await ctx.reply(batches[0]);
+  // Send remaining batches
+  for (let i = 1; i < batches.length; i++) {
+    await ctx.reply(batches[i]);
+  }
+}
+
+/** Build the selection prompt header + footer */
+function buildModelSelectionPrompt(
+  total: number,
+  isSearch: boolean,
+  searchKeyword?: string,
+): { header: string; footer: string } {
+  const header = isSearch
+    ? `🔍 搜尋「${searchKeyword}」找到 ${total} 個模型：`
+    : `✅ 獲取到 ${total} 個模型：`;
+
+  const footer = isSearch
+    ? `\n請選擇：\n• 輸入編號（從搜尋結果中選擇，多選用逗號分隔）\n• 輸入 "all" 全選搜尋結果\n• 輸入 "manual" 手動輸入\n• 輸入新關鍵字繼續搜尋\n• 輸入 "back" 返回完整列表`
+    : `\n請選擇：\n• 輸入編號（多選用逗號分隔）\n• 輸入 "all" 全選\n• 輸入 "manual" 手動輸入\n• 輸入關鍵字搜尋模型（例如：gpt）`;
+
+  return { header, footer };
+}
+
+/** Case-insensitive substring match against model id and name */
+function filterModels(models: FetchedModel[], keyword: string): FetchedModel[] {
+  const lk = keyword.toLowerCase();
+  return models.filter(
+    (m) => m.id.toLowerCase().includes(lk) || (m.name && m.name.toLowerCase().includes(lk)),
+  );
 }
 
 // ========================
@@ -143,36 +218,54 @@ async function addConversation(
   let fetchedModels = await fetchProviderModels(baseUrl, apiKey, apiType);
 
   if (fetchedModels.length > 0) {
-    // Show list for user to select
-    const modelLines = fetchedModels
-      .slice(0, 50) // Limit to 50 to avoid message too long
-      .map((m, i) => `${i + 1}. ${m.id}`);
-    await ctx.reply(
-      `✅ 獲取到 ${fetchedModels.length} 個模型：\n\n${modelLines.join("\n")}` +
-        (fetchedModels.length > 50 ? `\n...還有 ${fetchedModels.length - 50} 個` : "") +
-        `\n\n請選擇模型（輸入編號，多選用逗號分隔，例如：1,3,5）\n或輸入 "all" 全選\n或輸入 "manual" 手動輸入：`
-    );
+    // Show list with safe pagination
+    const { header, footer } = buildModelSelectionPrompt(fetchedModels.length, false);
+    await safeReplyModels(ctx, fetchedModels, header, footer);
 
-    ctx = await conversation.wait();
-    const modelInput = ctx.msg?.text?.trim() ?? "";
+    // Search loop
+    let searchResults: FetchedModel[] | null = null;
+    let done = false;
 
-    if (modelInput.toLowerCase() === "all") {
-      models = fetchedModels.map((m) => m.id).join(",");
-    } else if (modelInput.toLowerCase() === "manual") {
-      await ctx.reply("請手動輸入模型（用逗號分隔，例如：gpt-4o,gpt-4o-mini）：");
+    while (!done) {
       ctx = await conversation.wait();
-      models = ctx.msg?.text?.trim() ?? "";
-    } else {
-      // Parse indices
-      const indices = parseIndices(modelInput).filter(
-        (n) => n >= 1 && n <= fetchedModels.length
-      );
-      if (indices.length === 0) {
-        await ctx.reply("❌ 無效的選擇，已取消。");
-        return;
+      const modelInput = (ctx.msg?.text?.trim() ?? "").toLowerCase();
+
+      if (modelInput === "all") {
+        const pool = searchResults ?? fetchedModels;
+        models = pool.map((m) => m.id).join(",");
+        done = true;
+      } else if (modelInput === "manual") {
+        await ctx.reply("請手動輸入模型（用逗號分隔，例如：gpt-4o,gpt-4o-mini）：");
+        ctx = await conversation.wait();
+        models = ctx.msg?.text?.trim() ?? "";
+        done = true;
+      } else if (modelInput === "back") {
+        // Exit search, show full list again
+        searchResults = null;
+        const { header: h, footer: f } = buildModelSelectionPrompt(fetchedModels.length, false);
+        await safeReplyModels(ctx, fetchedModels, h, f);
+      } else {
+        // Try parse as indices first
+        const pool = searchResults ?? fetchedModels;
+        const indices = parseIndices(modelInput).filter(
+          (n) => n >= 1 && n <= pool.length,
+        );
+        if (indices.length > 0) {
+          const uniqueIndices = [...new Set(indices)];
+          models = uniqueIndices.map((i) => pool[i - 1].id).join(",");
+          done = true;
+        } else {
+          // Treat as search keyword
+          const filtered = filterModels(fetchedModels, modelInput);
+          if (filtered.length === 0) {
+            await ctx.reply(`🔍 搜尋「${modelInput}」沒有找到任何模型，請換個關鍵字試試。`);
+          } else {
+            searchResults = filtered;
+            const { header: h, footer: f } = buildModelSelectionPrompt(filtered.length, true, modelInput);
+            await safeReplyModels(ctx, filtered, h, f);
+          }
+        }
       }
-      const uniqueIndices = [...new Set(indices)];
-      models = uniqueIndices.map((i) => fetchedModels[i - 1].id).join(",");
     }
   } else {
     // Failed to fetch, ask for manual input
@@ -500,7 +593,7 @@ async function editConversation(
   }
 
   // Step 3: Ask for new value (special handling for models field)
-  let processedValue: string | number | null;
+  let processedValue: string | number | null = null;
 
   if (field.key === "models") {
     // Auto-fetch models from provider
@@ -510,33 +603,50 @@ async function editConversation(
     );
 
     if (fetchedModels.length > 0) {
-      const modelLines = fetchedModels
-        .slice(0, 50)
-        .map((m, i) => `${i + 1}. ${m.id}`);
-      await ctx.reply(
-        `✅ 獲取到 ${fetchedModels.length} 個模型：\n\n${modelLines.join("\n")}` +
-        (fetchedModels.length > 50 ? `\n...還有 ${fetchedModels.length - 50} 個` : "") +
-        `\n\n請選擇模型（輸入編號，多選用逗號分隔）\n或輸入 "all" 全選\n或輸入 "manual" 手動輸入：`
-      );
+      // Show list with safe pagination
+      const { header, footer } = buildModelSelectionPrompt(fetchedModels.length, false);
+      await safeReplyModels(ctx, fetchedModels, header, footer);
 
-      ctx = await conversation.wait();
-      const modelInput = ctx.msg?.text?.trim() ?? "";
+      // Search loop
+      let searchResults: FetchedModel[] | null = null;
+      let done = false;
 
-      if (modelInput.toLowerCase() === "all") {
-        processedValue = fetchedModels.map((m) => m.id).join(",");
-      } else if (modelInput.toLowerCase() === "manual") {
-        await ctx.reply("請手動輸入模型（用逗號分隔）：");
+      while (!done) {
         ctx = await conversation.wait();
-        processedValue = ctx.msg?.text?.trim() ?? "";
-      } else {
-        const indices = parseIndices(modelInput).filter(
-          (n) => n >= 1 && n <= fetchedModels.length
-        );
-        if (indices.length === 0) {
-          await ctx.reply("❌ 無效的選擇，已取消。");
-          return;
+        const modelInput = (ctx.msg?.text?.trim() ?? "").toLowerCase();
+
+        if (modelInput === "all") {
+          const pool = searchResults ?? fetchedModels;
+          processedValue = pool.map((m) => m.id).join(",");
+          done = true;
+        } else if (modelInput === "manual") {
+          await ctx.reply("請手動輸入模型（用逗號分隔）：");
+          ctx = await conversation.wait();
+          processedValue = ctx.msg?.text?.trim() ?? "";
+          done = true;
+        } else if (modelInput === "back") {
+          searchResults = null;
+          const { header: h, footer: f } = buildModelSelectionPrompt(fetchedModels.length, false);
+          await safeReplyModels(ctx, fetchedModels, h, f);
+        } else {
+          const pool = searchResults ?? fetchedModels;
+          const indices = parseIndices(modelInput).filter(
+            (n) => n >= 1 && n <= pool.length,
+          );
+          if (indices.length > 0) {
+            processedValue = [...new Set(indices)].map((i) => pool[i - 1].id).join(",");
+            done = true;
+          } else {
+            const filtered = filterModels(fetchedModels, modelInput);
+            if (filtered.length === 0) {
+              await ctx.reply(`🔍 搜尋「${modelInput}」沒有找到任何模型，請換個關鍵字試試。`);
+            } else {
+              searchResults = filtered;
+              const { header: h, footer: f } = buildModelSelectionPrompt(filtered.length, true, modelInput);
+              await safeReplyModels(ctx, filtered, h, f);
+            }
+          }
         }
-        processedValue = [...new Set(indices)].map((i) => fetchedModels[i - 1].id).join(",");
       }
     } else {
       await ctx.reply("⚠️ 無法獲取模型列表，請手動輸入模型（用逗號分隔）：");
@@ -1145,6 +1255,85 @@ async function editUserConversation(
 }
 
 // ========================
+// /api_test — API protocol detection test (admin only)
+// ========================
+
+function formatProtocolStatus(status: ProtocolStatus | Record<string, boolean>): string {
+  const protocolLabels: Record<string, string> = {
+    openai_chat: "OpenAI (Chat Completions)",
+    openai_response: "OpenAI (Responses API)",
+    anthropic: "Anthropic (Messages)",
+    google: "Google (Gemini)",
+  };
+  const lines: string[] = [];
+  for (const [proto, reachable] of Object.entries(status)) {
+    const label = protocolLabels[proto] || proto;
+    const icon = reachable ? "✅" : "❌";
+    lines.push(`  ${icon} ${label}`);
+  }
+  return lines.join("\n");
+}
+
+async function apiTestConversation(
+  conversation: MyConversation,
+  ctx: MyContext
+): Promise<void> {
+  // Step 1: Ask for URL
+  await ctx.reply(
+    "🧪 API 協議測試\n\n" +
+    "請輸入要測試的 API URL：\n" +
+    "例如：https://api.example.com/v1"
+  );
+
+  const urlCtx = await conversation.wait();
+  if (!urlCtx.message?.text) return;
+  const url = urlCtx.message.text.trim();
+
+  // Step 2: Test protocols without auth
+  await ctx.reply("⏳ 正在偵測 API 協議（不帶 Key）...");
+  const { status, allUnreachable } = await conversation.external(() =>
+    detectProtocolsNoAuth(url)
+  );
+
+  if (allUnreachable) {
+    // Step 3: Ask for API key
+    await ctx.reply(
+      "⚠️ 所有協議都無法連通。\n" +
+      "可能是網路問題或需要認證。\n\n" +
+      "請輸入 API Key 重試，或輸入 /cancel 取消："
+    );
+
+    const keyCtx = await conversation.wait();
+    if (!keyCtx.message?.text) return;
+    const apiKey = keyCtx.message.text.trim();
+
+    // Step 4: Retry with key
+    await ctx.reply("⏳ 正在使用 Key 重新偵測 API 協議...");
+    const statusWithKey = await conversation.external(() =>
+      detectApiProtocols(url, apiKey)
+    );
+
+    const resultText = formatProtocolStatus(statusWithKey);
+    const reachableCount = Object.values(statusWithKey).filter(Boolean).length;
+    const totalCount = Object.keys(statusWithKey).length;
+    await ctx.reply(
+      `📊 偵測結果（帶 Key）：\n\n${resultText}\n\n` +
+      `共 ${reachableCount}/${totalCount} 個協議可連通。`
+    );
+    return;
+  }
+
+  // Display results without auth
+  const resultText = formatProtocolStatus(status);
+  const reachableCount = Object.values(status).filter(Boolean).length;
+  const totalCount = Object.keys(status).length;
+  await ctx.reply(
+    `📊 偵測結果（不帶 Key）：\n\n${resultText}\n\n` +
+    `共 ${reachableCount}/${totalCount} 個協議可連通。`
+  );
+}
+
+// ========================
 // Register all admin handlers
 // ========================
 
@@ -1159,6 +1348,7 @@ export function registerAdminHandlers(bot: Bot<MyContext>): void {
   bot.use(createConversation(stopUserConversation, "stopUserConversation"));
   bot.use(createConversation(delUserConversation, "delUserConversation"));
   bot.use(createConversation(editUserConversation, "editUserConversation"));
+  bot.use(createConversation(apiTestConversation, "apiTestConversation"));
 
   // Admin-only middleware wrapper
   const adminOnly = (
@@ -1206,6 +1396,10 @@ export function registerAdminHandlers(bot: Bot<MyContext>): void {
 
   bot.command("edit_user", adminOnly(async (ctx) => {
     await ctx.conversation.enter("editUserConversation");
+  }));
+
+  bot.command("api_test", adminOnly(async (ctx) => {
+    await ctx.conversation.enter("apiTestConversation");
   }));
 
   // Single-message commands

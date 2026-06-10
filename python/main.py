@@ -45,6 +45,27 @@ def main():
     register_admin_handlers(application)
     logger.info("已註冊所有 Bot 處理器")
 
+    # 指令日誌 — group -1 在所有 group 0 handler 之前執行，不會阻擋後續處理
+    from telegram.ext import MessageHandler, filters as tg_filters
+
+    async def _log_command(update, context):
+        """每次指令調用時在控制台打印用戶 ID、時間和指令詳情。"""
+        user = update.effective_user
+        text = update.effective_message.text or ""
+        command = text.split()[0] if text else "/?"
+        args = text[len(command):].strip()
+        logger.info(
+            "[CMD] user=%s (@%s) %s%s",
+            user.id,
+            user.username or "",
+            command,
+            f" args={args}" if args else "",
+        )
+
+    application.add_handler(
+        MessageHandler(tg_filters.COMMAND, _log_command), group=-1
+    )
+
     # 啟動 API 代理服務器（異步並行）
     async def post_init(application):
         """啟動後的初始化：設置指令選單 + 啟動 API 服務器"""
@@ -59,6 +80,7 @@ def main():
             BotCommand("usage", "查詢 Token 用量"),
             BotCommand("start_coding", "開啟/關閉 Coding 模式"),
             BotCommand("set_coding", "設定 Coding 模式（Fallback 模型鏈）"),
+            BotCommand("model_catch", "抓取 API 模型列表"),
         ]
         admin_commands = [
             BotCommand("add", "新增提供商"),
@@ -72,6 +94,7 @@ def main():
             BotCommand("stop_user", "停用用戶"),
             BotCommand("del_user", "刪除用戶"),
             BotCommand("edit_user", "編輯用戶"),
+            BotCommand("api_test", "測試 API 協議連通性"),
         ]
         try:
             await application.bot.set_my_commands(user_commands + admin_commands)

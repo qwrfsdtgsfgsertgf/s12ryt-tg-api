@@ -2,7 +2,7 @@
 User handlers - Regular user commands for the Telegram Bot.
 
 Commands: /start, /url, /key, /usage, /key-add, /key-del,
-          /start-coding, /set-coding
+          /start-coding, /set-coding, /model_catch
 """
 import logging
 
@@ -15,6 +15,11 @@ from db.database import (
     get_coding_config_by_tg_id,
     set_coding_config,
 )
+from bot.handlers.model_fetcher import (
+    fetch_models_no_auth,
+    fetch_provider_models,
+)
+from bot.handlers.admin_handlers import _safe_reply_models
 
 logger = logging.getLogger(__name__)
 
@@ -393,6 +398,88 @@ async def set_coding_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     return ConversationHandler.END
 
 
+# ============================================================
+# /model_catch - Fetch model list from an external API URL
+# ============================================================
+
+MODEL_CATCH_URL = 0
+MODEL_CATCH_KEY = 1
+
+
+async def model_catch_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Start /model_catch conversation — ask for URL."""
+    await update.message.reply_text(
+        "🔍 請輸入要抓取模型的 API URL：\n\n"
+        "例如：https://api.example.com/v1"
+    )
+    return MODEL_CATCH_URL
+
+
+async def model_catch_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Receive URL and try fetching models without auth."""
+    url = update.message.text.strip()
+    context.user_data["model_catch_url"] = url
+
+    await update.message.reply_text("⏳ 正在嘗試抓取模型列表（不帶 Key）...")
+
+    models, needs_auth = await fetch_models_no_auth(url)
+
+    if needs_auth:
+        await update.message.reply_text(
+            "🔒 伺服器要求認證（401/403）。\n"
+            "請輸入 API Key，或輸入 /cancel 取消："
+        )
+        return MODEL_CATCH_KEY
+
+    if not models:
+        await update.message.reply_text(
+            "❌ 無法從該 URL 獲取模型列表。\n"
+            "可能原因：URL 不正確、伺服器無回應、或回應格式不支援。\n\n"
+            "請確認 URL 格式後重新嘗試。"
+        )
+        return ConversationHandler.END
+
+    # Display models (with safe pagination)
+    await _safe_reply_models(update, models, header=f"✅ 找到 {len(models)} 個模型：")
+    context.user_data.pop("model_catch_url", None)
+    return ConversationHandler.END
+
+
+async def model_catch_key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Receive API key and retry fetching models."""
+    api_key = update.message.text.strip()
+    url = context.user_data.get("model_catch_url", "")
+
+    await update.message.reply_text("⏳ 正在使用 Key 重新抓取模型列表...")
+
+    # Try with openai_chat format (most common)
+    models = await fetch_provider_models(url, api_key, "openai_chat")
+
+    if not models:
+        # Try google format as fallback
+        models = await fetch_provider_models(url, api_key, "google")
+
+    if not models:
+        await update.message.reply_text(
+            "❌ 即使使用 Key 也無法獲取模型列表。\n"
+            "請確認 URL 和 Key 是否正確。"
+        )
+        context.user_data.pop("model_catch_url", None)
+        return ConversationHandler.END
+
+    # Display models (with safe pagination)
+    await _safe_reply_models(update, models, header=f"✅ 找到 {len(models)} 個模型：")
+    context.user_data.pop("model_catch_url", None)
+    return ConversationHandler.END
+
+
+async def model_catch_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Cancel /model_catch conversation."""
+    context.user_data.pop("model_catch_url", None)
+    await update.message.reply_text("❌ 已取消。")
+    return ConversationHandler.END
+
+
 def register_user_handlers(app):
     """Register all user command handlers."""
     from telegram.ext import CommandHandler, MessageHandler, filters, ConversationHandler
@@ -426,3 +513,14 @@ def register_user_handlers(app):
         fallbacks=[CommandHandler("cancel", set_coding_cancel)],
     )
     app.add_handler(set_coding_conv)
+
+    # /model_catch needs conversation (URL → optional key)
+    model_catch_conv = ConversationHandler(
+        entry_points=[CommandHandler("model_catch", model_catch_start, filters=filters.Async(trusted_user_filter.filter_async))],
+        states={
+            MODEL_CATCH_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, model_catch_url)],
+            MODEL_CATCH_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, model_catch_key)],
+        },
+        fallbacks=[CommandHandler("cancel", model_catch_cancel)],
+    )
+    app.add_handler(model_catch_conv)

@@ -20,6 +20,8 @@ import {
   getAllCachedModelNames,
 } from "../../db/database.js";
 import { isTrustedUser } from "../filters.js";
+import { fetchModelsNoAuth, fetchProviderModels } from "./modelFetcher.js";
+import { safeReplyModels } from "./adminHandlers.js";
 
 // ========================
 // 型別定義
@@ -381,6 +383,68 @@ function maskKey(key: string): string {
   return key.slice(0, 12) + "..." + key.slice(-4);
 }
 
+// ========================
+// /model_catch conversation
+// ========================
+
+async function modelCatchConversation(conversation: MyConversation, ctx: MyContext): Promise<void> {
+  await ctx.reply(
+    "🔍 請輸入要抓取模型的 API URL：\n\n" +
+    "例如：https://api.example.com/v1"
+  );
+
+  const urlCtx = await conversation.wait();
+  if (!urlCtx.message?.text) return;
+  const url = urlCtx.message.text.trim();
+
+  await urlCtx.reply("⏳ 正在嘗試抓取模型列表（不帶 Key）...");
+
+  const { models, needsAuth } = await fetchModelsNoAuth(url);
+
+  if (needsAuth) {
+    await urlCtx.reply(
+      "🔒 伺服器要求認證（401/403）。\n" +
+      "請輸入 API Key，或輸入 /cancel 取消："
+    );
+
+    const keyCtx = await conversation.wait();
+    if (!keyCtx.message?.text) return;
+    const apiKey = keyCtx.message.text.trim();
+
+    await keyCtx.reply("⏳ 正在使用 Key 重新抓取模型列表...");
+
+    // Try openai_chat format first (most common)
+    let fetchedModels = await fetchProviderModels(url, apiKey, "openai_chat");
+    if (!fetchedModels.length) {
+      fetchedModels = await fetchProviderModels(url, apiKey, "google");
+    }
+
+    if (!fetchedModels.length) {
+      await keyCtx.reply(
+        "❌ 即使使用 Key 也無法獲取模型列表。\n" +
+        "請確認 URL 和 Key 是否正確。"
+      );
+      return;
+    }
+
+    const header = `✅ 找到 ${fetchedModels.length} 個模型：`;
+    await safeReplyModels(keyCtx, fetchedModels, header, "");
+    return;
+  }
+
+  if (!models.length) {
+    await urlCtx.reply(
+      "❌ 無法從該 URL 獲取模型列表。\n" +
+      "可能原因：URL 不正確、伺服器無回應、或回應格式不支援。\n\n" +
+      "請確認 URL 格式後重新嘗試。"
+    );
+    return;
+  }
+
+  const header = `✅ 找到 ${models.length} 個模型：`;
+  await safeReplyModels(urlCtx, models, header, "");
+}
+
 /**
  * 註冊所有使用者指令與對話
  */
@@ -388,6 +452,7 @@ export function registerUserHandlers(bot: Bot<MyContext>): void {
   // Note: conversations() plugin is installed in index.ts (only once)
   bot.use(createConversation(keyDelConversation, "keyDel"));
   bot.use(createConversation(setCodingConversation, "setCoding"));
+  bot.use(createConversation(modelCatchConversation, "modelCatch"));
 
   // /start
   bot.command("start", async (ctx) => {
@@ -435,5 +500,11 @@ export function registerUserHandlers(bot: Bot<MyContext>): void {
   bot.command("set_coding", async (ctx) => {
     if (!isTrustedUser(ctx)) return;
     await ctx.conversation.enter("setCoding");
+  });
+
+  // /model_catch → 進入對話
+  bot.command("model_catch", async (ctx) => {
+    if (!isTrustedUser(ctx)) return;
+    await ctx.conversation.enter("modelCatch");
   });
 }

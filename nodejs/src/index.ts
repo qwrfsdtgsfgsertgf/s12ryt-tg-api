@@ -52,6 +52,7 @@ async function setBotCommands(bot: MyBot): Promise<void> {
     { command: "usage", description: "查詢 Token 用量" },
     { command: "start_coding", description: "開啟/關閉 Coding 模式" },
     { command: "set_coding", description: "設定 Coding 模式（Fallback 模型鏈）" },
+    { command: "model_catch", description: "抓取 API 模型列表" },
   ];
 
   // 管理員指令
@@ -67,6 +68,7 @@ async function setBotCommands(bot: MyBot): Promise<void> {
     { command: "stop_user", description: "停用用戶" },
     { command: "del_user", description: "刪除用戶" },
     { command: "edit_user", description: "編輯用戶" },
+    { command: "api_test", description: "測試 API 協議連通性" },
   ];
 
   try {
@@ -111,6 +113,24 @@ async function main(): Promise<void> {
 
   // Install conversations plugin
   bot.use(conversations());
+
+  // -----------------------------------------------------------------------
+  // Command logging middleware — runs before all handlers
+  // -----------------------------------------------------------------------
+  bot.use(async (ctx, next) => {
+    const entities = ctx.msg?.entities;
+    if (entities?.some((e) => e.type === "bot_command")) {
+      const text = ctx.msg?.text ?? "";
+      const command = text.split(/\s/)[0] ?? "/?";
+      const args = text.slice(command.length).trim();
+      const user = ctx.from;
+      console.log(
+        `[CMD] user=${user?.id ?? "?"} (@${user?.username ?? ""}) ` +
+        `${command}${args ? " args=" + args : ""}`
+      );
+    }
+    await next();
+  });
 
   // Register bot handlers
   registerUserHandlers(bot);

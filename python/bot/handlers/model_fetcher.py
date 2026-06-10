@@ -1,7 +1,7 @@
 """
 Utility: fetch provider model list and pricing from external APIs.
 
-1. Fetches models from the provider's base_url + /model endpoint
+1. Fetches models from the provider's base_url + /models endpoint
 2. Fetches pricing from https://models.dev/api.json
 3. Detects supported API protocols by probing endpoints
 """
@@ -57,7 +57,7 @@ async def _get_models_dev_data() -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Fetch model list from provider's /model endpoint
+# Fetch model list from provider's /models endpoint
 # ---------------------------------------------------------------------------
 
 
@@ -68,16 +68,16 @@ async def fetch_provider_models(
 ) -> list[FetchedModel]:
     """Fetch the list of models from a provider's API endpoint.
 
-    Constructs the models URL by appending '/model' (or 'model' if the
+    Constructs the models URL by appending '/models' (or 'models' if the
     base_url already ends with '/') to the user-provided base_url, then
     authenticates according to the provider's api_type.
     """
     try:
-        # Build models endpoint: base_url + /model (or + model if trailing /)
+        # Build models endpoint: base_url + /models (or + models if trailing /)
         if base_url.endswith("/"):
-            url = f"{base_url}model"
+            url = f"{base_url}models"
         else:
-            url = f"{base_url}/model"
+            url = f"{base_url}/models"
 
         # Set authentication headers / URL params based on api_type
         headers: dict[str, str] = {}
@@ -182,8 +182,79 @@ async def fetch_models_pricing(
 
 
 # ---------------------------------------------------------------------------
+# Fetch model list without auth (for /model_catch)
+# ---------------------------------------------------------------------------
+
+
+async def fetch_models_no_auth(
+    base_url: str,
+) -> tuple[list[FetchedModel], bool]:
+    """Try to fetch models without authentication.
+
+    Returns (models, needs_auth):
+      - models: list of fetched models (may be empty)
+      - needs_auth: True if server returned 401/403 (auth required)
+    """
+    try:
+        if base_url.endswith("/"):
+            url = f"{base_url}models"
+        else:
+            url = f"{base_url}/models"
+
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(url)
+
+        if resp.status_code in (401, 403):
+            return [], True
+
+        if resp.status_code >= 400:
+            return [], False
+
+        json_data = resp.json()
+        models: list[FetchedModel] = []
+
+        # OpenAI-compatible format
+        if "data" in json_data and isinstance(json_data["data"], list):
+            for m in json_data["data"]:
+                if isinstance(m, dict) and m.get("id"):
+                    models.append({"id": m["id"], "name": m["id"]})
+
+        # Google format
+        elif "models" in json_data and isinstance(json_data["models"], list):
+            for m in json_data["models"]:
+                if isinstance(m, dict):
+                    raw_name = m.get("name", "")
+                    model_id = raw_name.replace("models/", "") if raw_name else m.get("id", "")
+                    if model_id:
+                        models.append({
+                            "id": model_id,
+                            "name": m.get("displayName", model_id),
+                        })
+
+        return models, False
+
+    except Exception as e:
+        print(f"[fetch_models_no_auth] Failed: {e}")
+        return [], False
+
+
+# ---------------------------------------------------------------------------
 # Detect supported API protocols by probing endpoints
 # ---------------------------------------------------------------------------
+
+
+async def detect_protocols_no_auth(
+    base_url: str,
+) -> tuple[ProtocolStatus, bool]:
+    """Probe API protocols without authentication.
+
+    Returns (status, all_unreachable):
+      - status: protocol reachability results
+      - all_unreachable: True if ALL protocols failed to get ANY HTTP response
+    """
+    status = await detect_api_protocols(base_url, "")
+    all_unreachable = not any(status.values())
+    return status, all_unreachable
 
 
 def _build_url(base_url: str, path: str) -> str:
@@ -272,39 +343,5 @@ async def detect_api_protocols(base_url: str, api_key: str) -> ProtocolStatus:
         "anthropic": tasks["anthropic_post"].result(),
         "google": tasks["google_get"].result(),
     }
-
-    return result
-
-    try:
-        data = await _get_models_dev_data()
-
-        for provider_data in data.values():
-            if not isinstance(provider_data, dict):
-                continue
-            provider_models = provider_data.get("models", {})
-            if not isinstance(provider_models, dict):
-                continue
-
-            for model_id, model_info in provider_models.items():
-                if not isinstance(model_info, dict):
-                    continue
-
-                for target_id in model_ids:
-                    if target_id in result:
-                        continue
-
-                    # Match by exact, contains, or reverse-contains
-                    if (
-                        model_id == target_id
-                        or model_id in target_id
-                        or target_id in model_id
-                    ):
-                        cost = model_info.get("cost", {})
-                        result[target_id] = {
-                            "input": cost.get("input") if isinstance(cost, dict) else None,
-                            "output": cost.get("output") if isinstance(cost, dict) else None,
-                        }
-    except Exception as e:
-        print(f"[fetch_models_pricing] Failed: {e}")
 
     return result
