@@ -181,14 +181,18 @@ export async function fetchModelsPricing(
 }
 
 // ---------------------------------------------------------------------------
-// Detect supported API protocols by probing endpoints
+// Detect supported API protocols by probing endpoints (v2 — precise analysis)
 // ---------------------------------------------------------------------------
 
-export interface ProtocolStatus {
-  openai_chat: boolean;
-  openai_response: boolean;
-  anthropic: boolean;
-  google: boolean;
+export interface ProbeDetail {
+  supported: boolean;
+  confidence: "high" | "medium" | "low";
+  reason: string;
+}
+
+export interface DetectionResult {
+  protocols: Record<string, ProbeDetail>;
+  recommended: string | null;
 }
 
 function buildUrl(baseUrl: string, path: string): string {
@@ -198,44 +202,101 @@ function buildUrl(baseUrl: string, path: string): string {
   return `${baseUrl}/${path.replace(/^\//, "")}`;
 }
 
-async function probeGet(url: string, headers: Record<string, string>): Promise<boolean> {
+/**
+ * Send a probe request. Returns { status, bodySnippet } or nulls on error.
+ */
+async function detailedProbe(
+  method: string,
+  url: string,
+  headers: Record<string, string>,
+  body?: Record<string, unknown>,
+  timeoutMs = 15_000
+): Promise<{ status: number | null; bodySnippet: string | null }> {
   try {
-    await fetch(url, { headers, signal: AbortSignal.timeout(15_000) });
-    return true;
+    const opts: RequestInit = {
+      headers,
+      signal: AbortSignal.timeout(timeoutMs),
+    };
+    if (method === "POST") {
+      opts.method = "POST";
+      opts.body = JSON.stringify(body ?? {});
+    }
+    const resp = await fetch(url, opts);
+    const text = await resp.text();
+    return { status: resp.status, bodySnippet: text.slice(0, 500) || null };
   } catch {
-    return false;
+    return { status: null, bodySnippet: null };
   }
 }
 
-async function probePost(
-  url: string,
-  headers: Record<string, string>,
-  body: Record<string, unknown>
-): Promise<boolean> {
-  try {
-    await fetch(url, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(15_000),
-    });
-    return true;
-  } catch {
-    return false;
+/**
+ * Analyze a probe's HTTP status code to determine protocol support.
+ */
+function analyzeStatus(statusCode: number | null, _body: string | null): ProbeDetail {
+  if (statusCode === null) {
+    return { supported: false, confidence: "high", reason: "連線失敗（無法連接到伺服器）" };
   }
+  if (statusCode === 404) {
+    return { supported: false, confidence: "high", reason: "端點不存在（404 Not Found）" };
+  }
+  if (statusCode >= 200 && statusCode < 300) {
+    return { supported: true, confidence: "high", reason: "端點正常回應" };
+  }
+  if (statusCode === 400 || statusCode === 422) {
+    return { supported: true, confidence: "high", reason: "端點存在（請求格式有誤）" };
+  }
+  if (statusCode === 401 || statusCode === 403) {
+    return { supported: true, confidence: "medium", reason: "端點存在但需要認證" };
+  }
+  if (statusCode === 405) {
+    return { supported: true, confidence: "low", reason: "端點可能存在（方法不允許）" };
+  }
+  if (statusCode >= 500) {
+    return { supported: true, confidence: "low", reason: "伺服器錯誤（端點可能存在）" };
+  }
+  return { supported: false, confidence: "low", reason: `未預期的狀態碼 (${statusCode})` };
+}
+
+/**
+ * Pick the better of two ProbeDetails (higher confidence + supported wins).
+ */
+function pickBetter(a: ProbeDetail, b: ProbeDetail): ProbeDetail {
+  if (a.supported && !b.supported) return a;
+  if (b.supported && !a.supported) return b;
+  if (!a.supported && !b.supported) return a;
+  const rank: Record<string, number> = { high: 3, medium: 2, low: 1 };
+  return (rank[a.confidence] ?? 0) >= (rank[b.confidence] ?? 0) ? a : b;
+}
+
+/**
+ * Auto-recommend an api_type based on detection results.
+ */
+function recommendType(protocols: Record<string, ProbeDetail>): string | null {
+  const high = Object.entries(protocols)
+    .filter(([, v]) => v.supported && v.confidence === "high")
+    .map(([k]) => k);
+  if (high.length === 1) return high[0];
+  if (high.length > 1) return high.includes("openai_chat") ? "openai_chat" : high[0];
+
+  const medium = Object.entries(protocols)
+    .filter(([, v]) => v.supported && (v.confidence === "high" || v.confidence === "medium"))
+    .map(([k]) => k);
+  if (medium.length === 1) return medium[0];
+  if (medium.length > 1) return medium.includes("openai_chat") ? "openai_chat" : medium[0];
+
+  return null;
 }
 
 /**
  * Probe the provider to detect which API protocols are supported.
  *
- * Sends GET + POST requests in parallel with 15s timeout per protocol.
- * A protocol is "reachable" if the server returns ANY HTTP response
- * (including 4xx) — only network-level failures count as unreachable.
+ * v2: Uses precise HTTP status code analysis instead of binary reachable/unreachable.
+ * Returns a DetectionResult with per-protocol ProbeDetail and an auto-recommended api_type.
  */
 export async function detectApiProtocols(
   baseUrl: string,
   apiKey: string
-): Promise<ProtocolStatus> {
+): Promise<DetectionResult> {
   const bearer: Record<string, string> = { Authorization: `Bearer ${apiKey}` };
   const bearerJson: Record<string, string> = {
     ...bearer,
@@ -248,34 +309,63 @@ export async function detectApiProtocols(
   };
 
   // Run all probes in parallel
-  const [chatGet, chatPost, responsePost, anthropicPost, googleGet] = await Promise.all([
-    // openai_chat: GET /models + POST /chat/completions
-    probeGet(buildUrl(baseUrl, "/models"), bearer),
-    probePost(buildUrl(baseUrl, "/chat/completions"), bearerJson, {}),
-
+  // For anthropic, try BOTH /v1/messages AND /messages (handle /v1 prefix in baseUrl)
+  const [
+    modelsGet,
+    chatPost,
+    responsePost,
+    anthropicV1,
+    anthropicNoV1,
+    googleGet,
+  ] = await Promise.all([
+    // openai_chat: GET /models
+    detailedProbe("GET", buildUrl(baseUrl, "/models"), bearer),
+    // openai_chat: POST /chat/completions
+    detailedProbe("POST", buildUrl(baseUrl, "/chat/completions"), bearerJson, {}),
     // openai_response: POST /responses
-    probePost(buildUrl(baseUrl, "/responses"), bearerJson, {}),
-
-    // anthropic: POST /v1/messages (minimal body)
-    probePost(buildUrl(baseUrl, "/v1/messages"), anthropicHeaders, {
+    detailedProbe("POST", buildUrl(baseUrl, "/responses"), bearerJson, {}),
+    // anthropic: POST /v1/messages (standard — baseUrl doesn't include /v1)
+    detailedProbe("POST", buildUrl(baseUrl, "/v1/messages"), anthropicHeaders, {
       model: "claude-3-5-sonnet-20241022",
       max_tokens: 1,
       messages: [{ role: "user", content: "hi" }],
     }),
-
+    // anthropic: POST /messages (baseUrl already includes /v1)
+    detailedProbe("POST", buildUrl(baseUrl, "/messages"), anthropicHeaders, {
+      model: "claude-3-5-sonnet-20241022",
+      max_tokens: 1,
+      messages: [{ role: "user", content: "hi" }],
+    }),
     // google: GET /models?key=
-    probeGet(
+    detailedProbe(
+      "GET",
       `${buildUrl(baseUrl, "/models")}?key=${encodeURIComponent(apiKey)}`,
       {}
     ),
   ]);
 
-  return {
-    openai_chat: chatGet || chatPost,
-    openai_response: responsePost,
-    anthropic: anthropicPost,
-    google: googleGet,
+  // openai_chat: combine GET /models and POST /chat/completions (pick best)
+  const openaiChat = pickBetter(analyzeStatus(modelsGet.status, modelsGet.bodySnippet), analyzeStatus(chatPost.status, chatPost.bodySnippet));
+
+  // openai_response: POST /responses
+  const openaiResponse = analyzeStatus(responsePost.status, responsePost.bodySnippet);
+
+  // anthropic: pick the better of /v1/messages and /messages
+  const anthropic = pickBetter(analyzeStatus(anthropicV1.status, anthropicV1.bodySnippet), analyzeStatus(anthropicNoV1.status, anthropicNoV1.bodySnippet));
+
+  // google: GET /models?key=
+  const google = analyzeStatus(googleGet.status, googleGet.bodySnippet);
+
+  const protocols: Record<string, ProbeDetail> = {
+    openai_chat: openaiChat,
+    openai_response: openaiResponse,
+    anthropic,
+    google,
   };
+
+  const recommended = recommendType(protocols);
+
+  return { protocols, recommended };
 }
 
 // ---------------------------------------------------------------------------
@@ -335,12 +425,14 @@ export async function fetchModelsNoAuth(
 
 /**
  * Probe API protocols without authentication.
- * Returns { status, allUnreachable }.
+ * Returns { result, allUnreachable }.
  */
 export async function detectProtocolsNoAuth(
   baseUrl: string
-): Promise<{ status: ProtocolStatus; allUnreachable: boolean }> {
-  const status = await detectApiProtocols(baseUrl, "");
-  const allUnreachable = !Object.values(status).some(Boolean);
-  return { status, allUnreachable };
+): Promise<{ result: DetectionResult; allUnreachable: boolean }> {
+  const result = await detectApiProtocols(baseUrl, "");
+  const allUnreachable = Object.values(result.protocols).every(
+    (d) => !d.supported && d.confidence === "high"
+  );
+  return { result, allUnreachable };
 }

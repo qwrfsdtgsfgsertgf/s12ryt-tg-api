@@ -25,7 +25,7 @@ import {
   type User,
   type ApiKey,
 } from "../../db/database.js";
-import { fetchProviderModels, fetchModelsPricing, detectApiProtocols, detectProtocolsNoAuth, type ProtocolStatus, type FetchedModel } from "./modelFetcher.js";
+import { fetchProviderModels, fetchModelsPricing, detectApiProtocols, detectProtocolsNoAuth, type DetectionResult, type ProbeDetail, type FetchedModel } from "./modelFetcher.js";
 
 // ========================
 // Types
@@ -165,13 +165,13 @@ async function addConversation(
     return;
   }
 
-  // Step 4: Auto-detect API protocols
-  await ctx.reply("🔍 正在偵測 API 協議連通性...");
-  let detectedProtocols: Record<string, boolean>;
+  // Step 4: Auto-detect API protocols (v2: precise status code analysis)
+  await ctx.reply("🔍 正在偵測 API 端點支持的協議...");
+  let detection: DetectionResult;
   try {
-    detectedProtocols = await detectApiProtocols(baseUrl, apiKey) as unknown as Record<string, boolean>;
+    detection = await detectApiProtocols(baseUrl, apiKey);
   } catch {
-    detectedProtocols = {};
+    detection = { protocols: {}, recommended: null };
   }
 
   const typeMap: Record<string, string> = {
@@ -182,25 +182,36 @@ async function addConversation(
   };
   const VALID_TYPES = ["openai_chat", "openai_response", "anthropic", "google"];
 
-  // Build protocol status display
+  // Build protocol status display with confidence levels and reasons
   const protocolLabels: Record<string, string> = {
-    openai_chat: "openai_chat (Chat Completions)",
-    openai_response: "openai_response (Responses API)",
-    anthropic: "anthropic",
-    google: "google",
+    openai_chat: "OpenAI (Chat Completions)",
+    openai_response: "OpenAI (Responses API)",
+    anthropic: "Anthropic (Messages)",
+    google: "Google (Gemini)",
   };
+  const confIcon: Record<string, string> = { high: "✅", medium: "⚠️", low: "❓" };
+
   const protocolLines = Object.entries(protocolLabels).map(([key, label]) => {
-    const reachable = detectedProtocols[key] ? "✅ 可連通" : "❌ 無法連通";
-    return `${label}：${reachable}`;
+    const detail: ProbeDetail = detection.protocols[key] ?? { supported: false, confidence: "low", reason: "" };
+    if (detail.supported) {
+      const icon = confIcon[detail.confidence] ?? "❓";
+      return `${label}：${icon} ${detail.reason}`;
+    }
+    return `${label}：❌ ${detail.reason}`;
   });
 
-  const anyReachable = Object.values(detectedProtocols).some(Boolean);
-  const noticeLine = anyReachable
+  const anySupported = Object.values(detection.protocols).some((d) => d.supported);
+  const recommended = detection.recommended;
+  const recLine = recommended
+    ? `\n💡 建議選擇：${protocolLabels[recommended] ?? recommended}`
+    : "";
+
+  const noticeLine = anySupported
     ? ""
-    : "\n⚠️ 自動偵測不到任何可用的 API 協議，請手動確認後選擇類型。";
+    : "\n⚠️ 所有協議都不支援，請手動確認後選擇類型。";
 
   await ctx.reply(
-    `📋 API 協議連通性偵測結果：\n\n${protocolLines.join("\n")}${noticeLine}\n\n` +
+    `📡 API 端點偵測結果：\n\n${protocolLines.join("\n")}${recLine}${noticeLine}\n\n` +
     `請選擇 API 類型：\n1️⃣ openai_chat (Chat Completions)\n2️⃣ openai_response (Responses API)\n3️⃣ anthropic\n4️⃣ google\n\n請輸入 1/2/3/4：`
   );
 
@@ -1258,19 +1269,31 @@ async function editUserConversation(
 // /api_test — API protocol detection test (admin only)
 // ========================
 
-function formatProtocolStatus(status: ProtocolStatus | Record<string, boolean>): string {
+function formatProtocolStatus(detection: DetectionResult): string {
   const protocolLabels: Record<string, string> = {
     openai_chat: "OpenAI (Chat Completions)",
     openai_response: "OpenAI (Responses API)",
     anthropic: "Anthropic (Messages)",
     google: "Google (Gemini)",
   };
+  const confIcon: Record<string, string> = { high: "✅", medium: "⚠️", low: "❓" };
   const lines: string[] = [];
-  for (const [proto, reachable] of Object.entries(status)) {
+
+  for (const [proto, detail] of Object.entries(detection.protocols)) {
     const label = protocolLabels[proto] || proto;
-    const icon = reachable ? "✅" : "❌";
-    lines.push(`  ${icon} ${label}`);
+    if (detail.supported) {
+      const icon = confIcon[detail.confidence] ?? "❓";
+      lines.push(`  ${icon} ${label} — ${detail.reason}`);
+    } else {
+      lines.push(`  ❌ ${label} — ${detail.reason}`);
+    }
   }
+
+  if (detection.recommended) {
+    const recLabel = protocolLabels[detection.recommended] ?? detection.recommended;
+    lines.push(`\n  💡 建議：${recLabel}`);
+  }
+
   return lines.join("\n");
 }
 
@@ -1291,7 +1314,7 @@ async function apiTestConversation(
 
   // Step 2: Test protocols without auth
   await ctx.reply("⏳ 正在偵測 API 協議（不帶 Key）...");
-  const { status, allUnreachable } = await conversation.external(() =>
+  const { result: detection, allUnreachable } = await conversation.external(() =>
     detectProtocolsNoAuth(url)
   );
 
@@ -1309,27 +1332,27 @@ async function apiTestConversation(
 
     // Step 4: Retry with key
     await ctx.reply("⏳ 正在使用 Key 重新偵測 API 協議...");
-    const statusWithKey = await conversation.external(() =>
+    const detectionWithKey = await conversation.external(() =>
       detectApiProtocols(url, apiKey)
     );
 
-    const resultText = formatProtocolStatus(statusWithKey);
-    const reachableCount = Object.values(statusWithKey).filter(Boolean).length;
-    const totalCount = Object.keys(statusWithKey).length;
+    const resultText = formatProtocolStatus(detectionWithKey);
+    const supportedCount = Object.values(detectionWithKey.protocols).filter((d) => d.supported).length;
+    const totalCount = Object.keys(detectionWithKey.protocols).length;
     await ctx.reply(
       `📊 偵測結果（帶 Key）：\n\n${resultText}\n\n` +
-      `共 ${reachableCount}/${totalCount} 個協議可連通。`
+      `共 ${supportedCount}/${totalCount} 個協議支援。`
     );
     return;
   }
 
   // Display results without auth
-  const resultText = formatProtocolStatus(status);
-  const reachableCount = Object.values(status).filter(Boolean).length;
-  const totalCount = Object.keys(status).length;
+  const resultText = formatProtocolStatus(detection);
+  const supportedCount = Object.values(detection.protocols).filter((d) => d.supported).length;
+  const totalCount = Object.keys(detection.protocols).length;
   await ctx.reply(
     `📊 偵測結果（不帶 Key）：\n\n${resultText}\n\n` +
-    `共 ${reachableCount}/${totalCount} 個協議可連通。`
+    `共 ${supportedCount}/${totalCount} 個協議支援。`
   );
 }
 

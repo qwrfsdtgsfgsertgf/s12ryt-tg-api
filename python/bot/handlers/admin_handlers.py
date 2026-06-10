@@ -171,39 +171,53 @@ async def add_key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["new_provider"]["api_key"] = update.message.text.strip()
     provider = context.user_data["new_provider"]
 
-    # Auto-detect supported API protocols
+    # Auto-detect supported API protocols (v2: precise status code analysis)
     await update.message.reply_text("🔍 正在偵測 API 端點支持的協議...")
-    protocols = await detect_api_protocols(provider["base_url"], provider["api_key"])
+    detection = await detect_api_protocols(provider["base_url"], provider["api_key"])
+    protocols = detection["protocols"]
+    recommended = detection["recommended"]
 
-    # Build display with reachability status
+    # Build display with confidence levels and reasons
     protocol_labels = {
-        "openai_chat": "openai (Chat Completions)",
-        "openai_response": "openai_response (Responses API)",
-        "anthropic": "anthropic",
-        "google": "google",
+        "openai_chat": "OpenAI (Chat Completions)",
+        "openai_response": "OpenAI (Responses API)",
+        "anthropic": "Anthropic (Messages)",
+        "google": "Google (Gemini)",
     }
     type_map = {"1": "openai_chat", "2": "openai_response", "3": "anthropic", "4": "google"}
 
-    any_reachable = any(protocols.values())
+    _conf_icon = {"high": "✅", "medium": "⚠️", "low": "❓"}
+
+    any_supported = any(d["supported"] for d in protocols.values())
     lines = []
     for i, (key, label) in enumerate(protocol_labels.items(), 1):
-        status = "✅ 可連通" if protocols.get(key) else "❌ 無法連通"
-        lines.append(f"{i}. {label} — {status}")
+        detail = protocols.get(key, {"supported": False, "confidence": "low", "reason": ""})
+        if detail["supported"]:
+            icon = _conf_icon.get(detail["confidence"], "❓")
+            lines.append(f"{i}. {label} — {icon} {detail['reason']}")
+        else:
+            lines.append(f"{i}. {label} — ❌ {detail['reason']}")
 
-    if any_reachable:
+    header = "📡 API 端點偵測結果：\n\n"
+    body = "\n".join(lines)
+
+    # Show recommendation if available
+    rec_line = ""
+    if recommended:
+        rec_label = protocol_labels.get(recommended, recommended)
+        rec_line = f"\n\n💡 建議選擇：{rec_label}"
+
+    if any_supported:
         await update.message.reply_text(
-            "📡 API 端點偵測結果：\n\n"
-            + "\n".join(lines)
-            + "\n\n請選擇 API 類型（輸入數字或名稱）："
+            header + body + rec_line + "\n\n請選擇 API 類型（輸入數字或名稱）："
         )
     else:
         await update.message.reply_text(
-            "📡 API 端點偵測結果：\n\n"
-            + "\n".join(lines)
-            + "\n\n⚠️ 自動偵測不到任何可用的 API 協議，請手動確認後選擇類型："
+            header + body
+            + "\n\n⚠️ 所有協議都不支援，請手動確認後選擇類型："
         )
 
-    context.user_data["detected_protocols"] = protocols
+    context.user_data["detected_protocols"] = detection
     return ADD_PROVIDER_TYPE
 
 
@@ -1452,19 +1466,35 @@ async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
 # ============================================================
 
 
-def _format_protocol_status(status: dict) -> str:
-    """Format protocol status dict into readable text."""
+def _format_protocol_status(detection: dict) -> str:
+    """Format DetectionResult into readable text with confidence and reasons.
+
+    Args:
+        detection: DetectionResult = {"protocols": dict[str, ProbeDetail], "recommended": str|None}
+    """
     protocol_labels = {
         "openai_chat": "OpenAI (Chat Completions)",
         "openai_response": "OpenAI (Responses API)",
         "anthropic": "Anthropic (Messages)",
         "google": "Google (Gemini)",
     }
+    _conf_icon = {"high": "✅", "medium": "⚠️", "low": "❓"}
+    protocols = detection.get("protocols", {})
+    recommended = detection.get("recommended")
+
     lines = []
-    for proto, reachable in status.items():
+    for proto, detail in protocols.items():
         label = protocol_labels.get(proto, proto)
-        icon = "✅" if reachable else "❌"
-        lines.append(f"  {icon} {label}")
+        if detail["supported"]:
+            icon = _conf_icon.get(detail["confidence"], "❓")
+            lines.append(f"  {icon} {label} — {detail['reason']}")
+        else:
+            lines.append(f"  ❌ {label} — {detail['reason']}")
+
+    if recommended:
+        rec_label = protocol_labels.get(recommended, recommended)
+        lines.append(f"\n  💡 建議：{rec_label}")
+
     return "\n".join(lines)
 
 
@@ -1485,7 +1515,7 @@ async def api_test_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
     await update.message.reply_text("⏳ 正在偵測 API 協議（不帶 Key）...")
 
-    status, all_unreachable = await detect_protocols_no_auth(url)
+    detection, all_unreachable = await detect_protocols_no_auth(url)
 
     if all_unreachable:
         await update.message.reply_text(
@@ -1495,12 +1525,13 @@ async def api_test_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         )
         return API_TEST_KEY
 
-    # Display results
-    result_text = _format_protocol_status(status)
-    reachable_count = sum(1 for v in status.values() if v)
+    # Display results with confidence levels
+    result_text = _format_protocol_status(detection)
+    supported_count = sum(1 for d in detection["protocols"].values() if d["supported"])
+    total = len(detection["protocols"])
     await update.message.reply_text(
         f"📊 偵測結果（不帶 Key）：\n\n{result_text}\n\n"
-        f"共 {reachable_count}/{len(status)} 個協議可連通。"
+        f"共 {supported_count}/{total} 個協議支援。"
     )
     context.user_data.pop("api_test_url", None)
     return ConversationHandler.END
@@ -1513,13 +1544,14 @@ async def api_test_key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
     await update.message.reply_text("⏳ 正在使用 Key 重新偵測 API 協議...")
 
-    status = await detect_api_protocols(url, api_key)
+    detection = await detect_api_protocols(url, api_key)
 
-    result_text = _format_protocol_status(status)
-    reachable_count = sum(1 for v in status.values() if v)
+    result_text = _format_protocol_status(detection)
+    supported_count = sum(1 for d in detection["protocols"].values() if d["supported"])
+    total = len(detection["protocols"])
     await update.message.reply_text(
         f"📊 偵測結果（帶 Key）：\n\n{result_text}\n\n"
-        f"共 {reachable_count}/{len(status)} 個協議可連通。"
+        f"共 {supported_count}/{total} 個協議支援。"
     )
     context.user_data.pop("api_test_url", None)
     return ConversationHandler.END

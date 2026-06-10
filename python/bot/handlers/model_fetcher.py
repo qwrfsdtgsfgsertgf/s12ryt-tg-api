@@ -239,22 +239,18 @@ async def fetch_models_no_auth(
 
 
 # ---------------------------------------------------------------------------
-# Detect supported API protocols by probing endpoints
+# Detect supported API protocols by probing endpoints (v2 — precise analysis)
 # ---------------------------------------------------------------------------
 
+# --- Types ---
 
-async def detect_protocols_no_auth(
-    base_url: str,
-) -> tuple[ProtocolStatus, bool]:
-    """Probe API protocols without authentication.
+ProbeDetail = dict[str, Any]  # {"supported": bool, "confidence": str, "reason": str}
+# confidence: "high" | "medium" | "low"
 
-    Returns (status, all_unreachable):
-      - status: protocol reachability results
-      - all_unreachable: True if ALL protocols failed to get ANY HTTP response
-    """
-    status = await detect_api_protocols(base_url, "")
-    all_unreachable = not any(status.values())
-    return status, all_unreachable
+DetectionResult = dict[str, Any]  # {"protocols": dict[str, ProbeDetail], "recommended": str | None}
+
+
+# --- Helpers ---
 
 
 def _build_url(base_url: str, path: str) -> str:
@@ -264,84 +260,183 @@ def _build_url(base_url: str, path: str) -> str:
     return f"{base_url}/{path.lstrip('/')}"
 
 
-async def _probe_get(url: str, headers: dict[str, str], timeout: float = 15.0) -> bool:
-    """GET probe — returns True if the server responded (any HTTP status)."""
+async def _detailed_probe(
+    method: str,
+    url: str,
+    headers: dict[str, str],
+    body: dict | None = None,
+    timeout: float = 15.0,
+) -> tuple[int | None, str | None]:
+    """Send a probe request. Returns (status_code, body_snippet) or (None, None) on error."""
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
-            await client.get(url, headers=headers)
-        return True
+            if method == "GET":
+                resp = await client.get(url, headers=headers)
+            else:
+                resp = await client.post(url, headers=headers, json=body or {})
+            body_text = resp.text[:500] if resp.text else None
+            return resp.status_code, body_text
     except Exception:
-        return False
+        return None, None
 
 
-async def _probe_post(url: str, headers: dict[str, str], body: dict, timeout: float = 15.0) -> bool:
-    """POST probe — returns True if the server responded (any HTTP status)."""
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            await client.post(url, headers=headers, json=body)
-        return True
-    except Exception:
-        return False
+def _analyze_status(status_code: int | None, body: str | None) -> ProbeDetail:
+    """Analyze a probe's HTTP status code to determine protocol support.
+
+    Returns a ProbeDetail with:
+      - supported: whether the protocol is supported
+      - confidence: "high" / "medium" / "low"
+      - reason: human-readable explanation
+    """
+    # Connection failed completely (DNS, timeout, TCP reset, etc.)
+    if status_code is None:
+        return {"supported": False, "confidence": "high", "reason": "連線失敗（無法連接到伺服器）"}
+
+    # 404 = endpoint doesn't exist
+    if status_code == 404:
+        return {"supported": False, "confidence": "high", "reason": "端點不存在（404 Not Found）"}
+
+    # 200-level = endpoint works normally
+    if 200 <= status_code < 300:
+        return {"supported": True, "confidence": "high", "reason": "端點正常回應"}
+
+    # 400/422 = endpoint exists, request format was bad (valid indicator)
+    if status_code in (400, 422):
+        return {"supported": True, "confidence": "high", "reason": "端點存在（請求格式有誤）"}
+
+    # 401/403 = endpoint exists but auth is required
+    if status_code in (401, 403):
+        return {"supported": True, "confidence": "medium", "reason": "端點存在但需要認證"}
+
+    # 405 = endpoint might exist but doesn't accept this method
+    if status_code == 405:
+        return {"supported": True, "confidence": "low", "reason": "端點可能存在（方法不允許）"}
+
+    # 5xx = server error, endpoint likely exists
+    if status_code >= 500:
+        return {"supported": True, "confidence": "low", "reason": "伺服器錯誤（端點可能存在）"}
+
+    # Other / unknown status codes
+    return {"supported": False, "confidence": "low", "reason": f"未預期的狀態碼 ({status_code})"}
 
 
-async def detect_api_protocols(base_url: str, api_key: str) -> ProtocolStatus:
+def _pick_better(a: ProbeDetail, b: ProbeDetail) -> ProbeDetail:
+    """Pick the better of two ProbeDetails (higher confidence + supported wins)."""
+    if a["supported"] and not b["supported"]:
+        return a
+    if b["supported"] and not a["supported"]:
+        return b
+    if not a["supported"] and not b["supported"]:
+        return a  # both unsupported, doesn't matter
+    # Both supported — compare confidence
+    conf_rank = {"high": 3, "medium": 2, "low": 1}
+    return a if conf_rank.get(a["confidence"], 0) >= conf_rank.get(b["confidence"], 0) else b
+
+
+def _recommend_type(protocols: dict[str, ProbeDetail]) -> str | None:
+    """Auto-recommend an api_type based on detection results."""
+    # Priority 1: exactly one high-confidence supported protocol
+    high = [k for k, v in protocols.items() if v["supported"] and v["confidence"] == "high"]
+    if len(high) == 1:
+        return high[0]
+    if len(high) > 1:
+        # Multiple high confidence — prefer openai_chat (most common)
+        if "openai_chat" in high:
+            return "openai_chat"
+        return high[0]
+
+    # Priority 2: exactly one medium+ confidence
+    medium = [k for k, v in protocols.items() if v["supported"] and v["confidence"] in ("high", "medium")]
+    if len(medium) == 1:
+        return medium[0]
+    if len(medium) > 1:
+        if "openai_chat" in medium:
+            return "openai_chat"
+        return medium[0]
+
+    return None
+
+
+# --- Main detection functions ---
+
+
+async def detect_api_protocols(base_url: str, api_key: str) -> DetectionResult:
     """Probe the provider to detect which API protocols are supported.
 
-    Sends GET + POST requests in parallel with 15s timeout per protocol.
-    A protocol is considered "reachable" if the server returns ANY HTTP
-    response (including 4xx errors) — only network-level failures count as unreachable.
-
-    Returns a dict mapping protocol name to bool (True = reachable).
+    v2: Uses precise HTTP status code analysis instead of binary reachable/unreachable.
+    Returns a DetectionResult with per-protocol ProbeDetail and an auto-recommended api_type.
     """
     bearer = {"Authorization": f"Bearer {api_key}"}
+    bearer_json = {**bearer, "content-type": "application/json"}
     anthropic_headers = {
         "x-api-key": api_key,
         "anthropic-version": "2023-06-01",
         "content-type": "application/json",
     }
 
-    # Build probe tasks — each protocol gets both GET and POST attempts
-    tasks: dict[str, asyncio.Task] = {}
-
-    # openai_chat: GET /models + POST /chat/completions (empty body)
-    tasks["openai_chat_get"] = asyncio.create_task(
-        _probe_get(_build_url(base_url, "/models"), bearer)
-    )
-    tasks["openai_chat_post"] = asyncio.create_task(
-        _probe_post(_build_url(base_url, "/chat/completions"), {**bearer, "content-type": "application/json"}, {})
-    )
-
-    # openai_response: GET /models (reuse result) + POST /responses (empty body)
-    # POST /responses is the key differentiator
-    tasks["openai_response_post"] = asyncio.create_task(
-        _probe_post(_build_url(base_url, "/responses"), {**bearer, "content-type": "application/json"}, {})
-    )
-
-    # anthropic: POST /v1/messages (minimal body to see if endpoint exists)
-    tasks["anthropic_post"] = asyncio.create_task(
-        _probe_post(_build_url(base_url, "/v1/messages"), anthropic_headers, {
+    # Run all probes in parallel
+    # For anthropic, try BOTH /v1/messages AND /messages (handle /v1 prefix in base_url)
+    results = await asyncio.gather(
+        # openai_chat: GET /models
+        _detailed_probe("GET", _build_url(base_url, "/models"), bearer),
+        # openai_chat: POST /chat/completions
+        _detailed_probe("POST", _build_url(base_url, "/chat/completions"), bearer_json, {}),
+        # openai_response: POST /responses
+        _detailed_probe("POST", _build_url(base_url, "/responses"), bearer_json, {}),
+        # anthropic: POST /v1/messages (standard — base_url doesn't include /v1)
+        _detailed_probe("POST", _build_url(base_url, "/v1/messages"), anthropic_headers, {
             "model": "claude-3-5-sonnet-20241022",
             "max_tokens": 1,
             "messages": [{"role": "user", "content": "hi"}],
-        })
+        }),
+        # anthropic: POST /messages (base_url already includes /v1)
+        _detailed_probe("POST", _build_url(base_url, "/messages"), anthropic_headers, {
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 1,
+            "messages": [{"role": "user", "content": "hi"}],
+        }),
+        # google: GET /models?key=
+        _detailed_probe("GET", f"{_build_url(base_url, '/models')}?key={urllib.parse.quote(api_key, safe='')}", {}),
     )
+
+    models_get, chat_post, response_post, anthropic_v1, anthropic_no_v1, google_get = results
+
+    # openai_chat: combine GET /models and POST /chat/completions (pick best)
+    openai_chat = _pick_better(_analyze_status(*models_get), _analyze_status(*chat_post))
+
+    # openai_response: POST /responses
+    openai_response = _analyze_status(*response_post)
+
+    # anthropic: pick the better of /v1/messages and /messages
+    anthropic = _pick_better(_analyze_status(*anthropic_v1), _analyze_status(*anthropic_no_v1))
 
     # google: GET /models?key=
-    google_url = _build_url(base_url, "/models")
-    google_url = f"{google_url}?key={urllib.parse.quote(api_key, safe='')}"
-    tasks["google_get"] = asyncio.create_task(
-        _probe_get(google_url, {})
-    )
+    google = _analyze_status(*google_get)
 
-    # Wait for all tasks
-    await asyncio.gather(*tasks.values())
-
-    # Compile results — protocol is reachable if ANY of its probes succeeded
-    result: ProtocolStatus = {
-        "openai_chat": tasks["openai_chat_get"].result() or tasks["openai_chat_post"].result(),
-        "openai_response": tasks["openai_response_post"].result(),
-        "anthropic": tasks["anthropic_post"].result(),
-        "google": tasks["google_get"].result(),
+    protocols = {
+        "openai_chat": openai_chat,
+        "openai_response": openai_response,
+        "anthropic": anthropic,
+        "google": google,
     }
 
-    return result
+    recommended = _recommend_type(protocols)
+
+    return {"protocols": protocols, "recommended": recommended}
+
+
+async def detect_protocols_no_auth(
+    base_url: str,
+) -> tuple[DetectionResult, bool]:
+    """Probe API protocols without authentication.
+
+    Returns (result, all_unreachable):
+      - result: DetectionResult with protocol details and recommendation
+      - all_unreachable: True if ALL protocols failed to get ANY HTTP response
+    """
+    result = await detect_api_protocols(base_url, "")
+    all_unreachable = all(
+        not d["supported"] and d["confidence"] == "high"
+        for d in result["protocols"].values()
+    )
+    return result, all_unreachable
