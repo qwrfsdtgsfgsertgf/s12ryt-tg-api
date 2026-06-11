@@ -1,8 +1,8 @@
 """
 Admin handlers - Admin-only commands for the Telegram Bot.
 
-Commands: /add, /del, /list, /edit, /uu, /admin_rm_userkey,
-          /sub_url, /add_user, /stop_user, /del_user, /edit_user
+Commands: /add, /del, /list, /edit, /uu, /admin_user,
+          /sub_url, /api_test
 """
 import logging
 from typing import Any
@@ -126,17 +126,20 @@ def _filter_models(models: list[dict], keyword: str) -> list[dict]:
     EDIT_PROVIDER_PRICE_PER_MODEL,
     DEL_PROVIDER_SELECT,
     SUB_URL_INPUT,
-    ADD_USER_INPUT,
-    STOP_USER_SELECT,
-    DEL_USER_SELECT,
-    EDIT_USER_SELECT,
-    EDIT_USER_INPUT,
-    RM_USERKEY_SELECT,
-) = range(24)
+) = range(18)
 
 # /api_test conversation states (separate from main range)
 API_TEST_URL = 100
 API_TEST_KEY = 101
+
+# /admin_user conversation states (separate unified menu)
+ADMIN_USER_MENU = 200
+ADMIN_USER_ADD_INPUT = 201
+ADMIN_USER_STOP_SELECT = 202
+ADMIN_USER_DEL_SELECT = 203
+ADMIN_USER_EDIT_SELECT = 204
+ADMIN_USER_EDIT_INPUT = 205
+ADMIN_USER_RM_KEY_SELECT = 206
 
 
 # ============================================================
@@ -1240,48 +1243,6 @@ async def uu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 # /admin_rm_userkey - Admin delete any user's API key
 # ============================================================
 
-async def rm_userkey_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """List all API keys for admin to delete."""
-    all_keys = await database.get_all_keys()
-    active_keys = [k for k in all_keys if k.get("is_active")]
-
-    if not active_keys:
-        await update.message.reply_text("目前沒有任何 API key。")
-        return ConversationHandler.END
-
-    context.user_data["keys_map"] = {str(i + 1): k["id"] for i, k in enumerate(active_keys)}
-    lines = [f"{i + 1}. {k['key']} (用戶: {k.get('tg_user_id', k.get('username', 'N/A'))})" for i, k in enumerate(active_keys)]
-
-    await update.message.reply_text(
-        "請回覆要刪除的 API key 編號（多選用逗號分隔）：\n\n" + "\n".join(lines)
-    )
-    return RM_USERKEY_SELECT
-
-
-async def rm_userkey_select(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Process admin key deletion."""
-    text = update.message.text.strip()
-    keys_map: dict = context.user_data.get("keys_map", {})
-
-    try:
-        indices = [idx.strip() for idx in text.split(",")]
-    except Exception:
-        await update.message.reply_text("❌ 格式錯誤。")
-        return ConversationHandler.END
-
-    deleted = 0
-    for idx in indices:
-        key_id = keys_map.get(idx)
-        if key_id:
-            success = await database.delete_api_key(key_id)
-            if success:
-                deleted += 1
-
-    await update.message.reply_text(f"✅ 已刪除 {deleted} 個 API key。")
-    context.user_data.pop("keys_map", None)
-    return ConversationHandler.END
-
-
 # ============================================================
 # /sub_url - Set/override API endpoint URL
 # ============================================================
@@ -1299,200 +1260,6 @@ async def sub_url_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     url = update.message.text.strip()
     await database.set_setting("api_url", url)
     await update.message.reply_text(f"✅ API 接口已更新為: {url}")
-    return ConversationHandler.END
-
-
-# ============================================================
-# /add_user - Add a trusted user
-# ============================================================
-
-async def add_user_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Start /add_user conversation."""
-    await update.message.reply_text("請輸入要新增的用戶 Telegram ID：")
-    return ADD_USER_INPUT
-
-
-async def add_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Add user by TG ID."""
-    text = update.message.text.strip()
-    try:
-        tg_id = int(text)
-    except ValueError:
-        await update.message.reply_text("❌ 無效的用戶 ID，請輸入數字。")
-        return ADD_USER_INPUT
-
-    existing = await database.get_user_by_tg_id(tg_id)
-    if existing:
-        if existing.get("is_active"):
-            await update.message.reply_text("該用戶已存在且為活躍狀態。")
-        else:
-            await database.update_user_status(tg_id, 1)
-            await update.message.reply_text("✅ 已重新啟用該用戶。")
-    else:
-        await database.add_user(tg_id)
-        await update.message.reply_text(f"✅ 已新增用戶 {tg_id}。")
-
-    return ConversationHandler.END
-
-
-# ============================================================
-# /stop_user - Stop (disable) users
-# ============================================================
-
-async def stop_user_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """List users for admin to stop."""
-    users = await database.get_users()
-    # Exclude admin
-    users = [u for u in users if u.get("tg_user_id") != Config.ADMIN_ID]
-
-    if not users:
-        await update.message.reply_text("目前沒有其他用戶。")
-        return ConversationHandler.END
-
-    context.user_data["users_map"] = {str(i + 1): u for i, u in enumerate(users)}
-    lines = [f"{i + 1}. {u.get('username', '')} (ID: {u['tg_user_id']})" for i, u in enumerate(users)]
-
-    await update.message.reply_text(
-        "請回覆要停用的用戶編號（多選用逗號分隔）：\n\n" + "\n".join(lines)
-    )
-    return STOP_USER_SELECT
-
-
-async def stop_user_select(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Process user stop selection."""
-    text = update.message.text.strip()
-    users_map: dict = context.user_data.get("users_map", {})
-
-    try:
-        indices = [idx.strip() for idx in text.split(",")]
-    except Exception:
-        await update.message.reply_text("❌ 格式錯誤。")
-        return ConversationHandler.END
-
-    stopped = 0
-    for idx in indices:
-        user = users_map.get(idx)
-        if user:
-            await database.update_user_status(user["tg_user_id"], 0)
-            # Try to notify the user
-            try:
-                await context.bot.send_message(
-                    chat_id=user["tg_user_id"],
-                    text="你的帳號已被管理員停用",
-                )
-            except Exception:
-                logger.warning("無法通知用戶 %s", user["tg_user_id"])
-            stopped += 1
-
-    await update.message.reply_text(f"✅ 已停用 {stopped} 個用戶。")
-    context.user_data.pop("users_map", None)
-    return ConversationHandler.END
-
-
-# ============================================================
-# /del_user - Delete users
-# ============================================================
-
-async def del_user_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """List users for admin to delete."""
-    users = await database.get_users()
-    users = [u for u in users if u.get("tg_user_id") != Config.ADMIN_ID]
-
-    if not users:
-        await update.message.reply_text("目前沒有其他用戶。")
-        return ConversationHandler.END
-
-    context.user_data["users_map"] = {str(i + 1): u for i, u in enumerate(users)}
-    lines = [f"{i + 1}. {u.get('username', '')} (ID: {u['tg_user_id']})" for i, u in enumerate(users)]
-
-    await update.message.reply_text(
-        "請回覆要刪除的用戶編號（多選用逗號分隔）：\n\n" + "\n".join(lines)
-    )
-    return DEL_USER_SELECT
-
-
-async def del_user_select(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Process user deletion."""
-    text = update.message.text.strip()
-    users_map: dict = context.user_data.get("users_map", {})
-
-    try:
-        indices = [idx.strip() for idx in text.split(",")]
-    except Exception:
-        await update.message.reply_text("❌ 格式錯誤。")
-        return ConversationHandler.END
-
-    deleted = 0
-    for idx in indices:
-        user = users_map.get(idx)
-        if user:
-            success = await database.delete_user(user["tg_user_id"])
-            if success:
-                deleted += 1
-
-    await update.message.reply_text(f"✅ 已刪除 {deleted} 個用戶。")
-    context.user_data.pop("users_map", None)
-    return ConversationHandler.END
-
-
-# ============================================================
-# /edit_user - Edit user TG ID
-# ============================================================
-
-async def edit_user_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """List users for admin to edit."""
-    users = await database.get_users()
-    users = [u for u in users if u.get("tg_user_id") != Config.ADMIN_ID]
-
-    if not users:
-        await update.message.reply_text("目前沒有其他用戶。")
-        return ConversationHandler.END
-
-    context.user_data["users_map"] = {str(i + 1): u for i, u in enumerate(users)}
-    lines = [f"{i + 1}. {u.get('username', '')} (ID: {u['tg_user_id']})" for i, u in enumerate(users)]
-
-    await update.message.reply_text(
-        "請回覆要編輯的用戶編號（不支持多選）：\n\n" + "\n".join(lines)
-    )
-    return EDIT_USER_SELECT
-
-
-async def edit_user_select(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Receive user selection for edit."""
-    text = update.message.text.strip()
-    users_map: dict = context.user_data.get("users_map", {})
-
-    if text not in users_map:
-        await update.message.reply_text("❌ 無效的編號。")
-        return ConversationHandler.END
-
-    user = users_map[text]
-    context.user_data["editing_user"] = user
-
-    await update.message.reply_text(
-        "已收到您的請求，請在下則訊息給出完整用戶 ID 且不要包含其他內容"
-    )
-    return EDIT_USER_INPUT
-
-
-async def edit_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Receive new user TG ID."""
-    text = update.message.text.strip()
-    try:
-        new_tg_id = int(text)
-    except ValueError:
-        await update.message.reply_text("❌ 無效的用戶 ID，請輸入數字。")
-        return EDIT_USER_INPUT
-
-    user = context.user_data.get("editing_user", {})
-    result = await database.update_user_tg_id(user["tg_user_id"], new_tg_id)
-
-    if result:
-        await update.message.reply_text(f"✅ 已更新用戶 ID: {user['tg_user_id']} → {new_tg_id}")
-    else:
-        await update.message.reply_text("❌ 更新失敗，新 ID 可能已存在。")
-
-    context.user_data.pop("editing_user", None)
     return ConversationHandler.END
 
 
@@ -1545,18 +1312,49 @@ def _format_protocol_status(detection: dict) -> str:
 
 
 async def api_test_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Start /api_test conversation — ask for URL."""
+    """Start /api_test conversation — ask for URL or URL,Key."""
     await update.message.reply_text(
         "🧪 API 協議測試\n\n"
-        "請輸入要測試的 API URL：\n"
-        "例如：https://api.example.com/v1"
+        "請輸入要測試的 API URL（可附帶 Key）：\n\n"
+        "格式：`URL` 或 `URL,API-KEY`\n\n"
+        "例如：\n"
+        "  `https://api.example.com/v1`\n"
+        "  `https://api.example.com/v1,sk-xxxx`",
+        parse_mode="Markdown"
     )
     return API_TEST_URL
 
 
 async def api_test_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Receive URL and test protocols without auth."""
-    url = update.message.text.strip()
+    """Receive URL (or URL,Key) and test protocols.
+
+    Input format: 'URL' or 'URL,API-KEY'
+    - If Key provided → directly test with auth
+    - If URL only → test without auth, fall back to asking for Key if unreachable
+    """
+    raw = update.message.text.strip()
+
+    # Parse "url,key" format — split on the FIRST comma only
+    parts = raw.split(",", 1)
+    url = parts[0].strip()
+    api_key = parts[1].strip() if len(parts) > 1 else ""
+
+    # If Key provided → directly test with auth
+    if api_key:
+        await update.message.reply_text("⏳ 正在使用 Key 偵測 API 協議...")
+
+        detection = await detect_api_protocols(url, api_key)
+
+        result_text = _format_protocol_status(detection)
+        supported_count = sum(1 for d in detection["protocols"].values() if d["supported"])
+        total = len(detection["protocols"])
+        await update.message.reply_text(
+            f"📊 偵測結果（帶 Key）：\n\n{result_text}\n\n"
+            f"共 {supported_count}/{total} 個協議支援。"
+        )
+        return ConversationHandler.END
+
+    # URL only → test without auth first
     context.user_data["api_test_url"] = url
 
     await update.message.reply_text("⏳ 正在偵測 API 協議（不帶 Key）...")
@@ -1600,6 +1398,256 @@ async def api_test_key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         f"共 {supported_count}/{total} 個協議支援。"
     )
     context.user_data.pop("api_test_url", None)
+    return ConversationHandler.END
+
+
+# ============================================================
+# /admin_user - Unified user management menu (merges 5 commands)
+# ============================================================
+
+_ADMIN_USER_MENU_TEXT = (
+    "👤 用戶管理\n\n"
+    "請選擇操作：\n"
+    "1. 新增用戶\n"
+    "2. 停用用戶\n"
+    "3. 刪除用戶\n"
+    "4. 編輯用戶\n"
+    "5. 移除用戶 API Key\n\n"
+    "輸入數字選擇，或輸入 /cancel 離開："
+)
+
+
+async def admin_user_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Show user management menu."""
+    await update.message.reply_text(_ADMIN_USER_MENU_TEXT)
+    return ADMIN_USER_MENU
+
+
+async def admin_user_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Process menu selection and route to sub-flow."""
+    text = update.message.text.strip()
+
+    if text == "1":
+        # Add user
+        await update.message.reply_text("請輸入要新增的用戶 Telegram ID：")
+        return ADMIN_USER_ADD_INPUT
+
+    elif text == "2":
+        # Stop user
+        users = await database.get_users()
+        users = [u for u in users if u.get("tg_user_id") != Config.ADMIN_ID]
+        if not users:
+            await update.message.reply_text("目前沒有其他用戶。\n\n" + _ADMIN_USER_MENU_TEXT)
+            return ADMIN_USER_MENU
+
+        context.user_data["admin_user_map"] = {str(i + 1): u for i, u in enumerate(users)}
+        lines = [f"{i + 1}. {u.get('username', '')} (ID: {u['tg_user_id']})" for i, u in enumerate(users)]
+        await update.message.reply_text(
+            "請回覆要停用的用戶編號（多選用逗號分隔）：\n\n" + "\n".join(lines)
+        )
+        return ADMIN_USER_STOP_SELECT
+
+    elif text == "3":
+        # Delete user
+        users = await database.get_users()
+        users = [u for u in users if u.get("tg_user_id") != Config.ADMIN_ID]
+        if not users:
+            await update.message.reply_text("目前沒有其他用戶。\n\n" + _ADMIN_USER_MENU_TEXT)
+            return ADMIN_USER_MENU
+
+        context.user_data["admin_user_map"] = {str(i + 1): u for i, u in enumerate(users)}
+        lines = [f"{i + 1}. {u.get('username', '')} (ID: {u['tg_user_id']})" for i, u in enumerate(users)]
+        await update.message.reply_text(
+            "請回覆要刪除的用戶編號（多選用逗號分隔）：\n\n" + "\n".join(lines)
+        )
+        return ADMIN_USER_DEL_SELECT
+
+    elif text == "4":
+        # Edit user
+        users = await database.get_users()
+        users = [u for u in users if u.get("tg_user_id") != Config.ADMIN_ID]
+        if not users:
+            await update.message.reply_text("目前沒有其他用戶。\n\n" + _ADMIN_USER_MENU_TEXT)
+            return ADMIN_USER_MENU
+
+        context.user_data["admin_user_map"] = {str(i + 1): u for i, u in enumerate(users)}
+        lines = [f"{i + 1}. {u.get('username', '')} (ID: {u['tg_user_id']})" for i, u in enumerate(users)]
+        await update.message.reply_text(
+            "請回覆要編輯的用戶編號（不支持多選）：\n\n" + "\n".join(lines)
+        )
+        return ADMIN_USER_EDIT_SELECT
+
+    elif text == "5":
+        # Remove user API key
+        all_keys = await database.get_all_keys()
+        active_keys = [k for k in all_keys if k.get("is_active")]
+        if not active_keys:
+            await update.message.reply_text("目前沒有任何 API key。\n\n" + _ADMIN_USER_MENU_TEXT)
+            return ADMIN_USER_MENU
+
+        context.user_data["admin_user_keys_map"] = {str(i + 1): k["id"] for i, k in enumerate(active_keys)}
+        lines = [f"{i + 1}. {k['key']} (用戶: {k.get('tg_user_id', k.get('username', 'N/A'))})" for i, k in enumerate(active_keys)]
+        await update.message.reply_text(
+            "請回覆要刪除的 API key 編號（多選用逗號分隔）：\n\n" + "\n".join(lines)
+        )
+        return ADMIN_USER_RM_KEY_SELECT
+
+    else:
+        await update.message.reply_text("❌ 無效的選擇，請輸入 1-5：\n\n" + _ADMIN_USER_MENU_TEXT)
+        return ADMIN_USER_MENU
+
+
+async def admin_user_add_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Add user from admin_user menu."""
+    text = update.message.text.strip()
+    try:
+        tg_id = int(text)
+    except ValueError:
+        await update.message.reply_text("❌ 無效的用戶 ID，請輸入數字。\n\n" + _ADMIN_USER_MENU_TEXT)
+        return ADMIN_USER_MENU
+
+    existing = await database.get_user_by_tg_id(tg_id)
+    if existing:
+        if existing.get("is_active"):
+            await update.message.reply_text("該用戶已存在且為活躍狀態。")
+        else:
+            await database.update_user_status(tg_id, 1)
+            await update.message.reply_text("✅ 已重新啟用該用戶。")
+    else:
+        await database.add_user(tg_id)
+        await update.message.reply_text(f"✅ 已新增用戶 {tg_id}。")
+
+    await update.message.reply_text(_ADMIN_USER_MENU_TEXT)
+    return ADMIN_USER_MENU
+
+
+async def admin_user_stop_select(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Process user stop selection from admin_user menu."""
+    text = update.message.text.strip()
+    users_map: dict = context.user_data.get("admin_user_map", {})
+
+    try:
+        indices = [idx.strip() for idx in text.split(",")]
+    except Exception:
+        await update.message.reply_text("❌ 格式錯誤。\n\n" + _ADMIN_USER_MENU_TEXT)
+        return ADMIN_USER_MENU
+
+    stopped = 0
+    for idx in indices:
+        user = users_map.get(idx)
+        if user:
+            await database.update_user_status(user["tg_user_id"], 0)
+            try:
+                await context.bot.send_message(
+                    chat_id=user["tg_user_id"],
+                    text="你的帳號已被管理員停用",
+                )
+            except Exception:
+                logger.warning("無法通知用戶 %s", user["tg_user_id"])
+            stopped += 1
+
+    await update.message.reply_text(f"✅ 已停用 {stopped} 個用戶。")
+    context.user_data.pop("admin_user_map", None)
+    await update.message.reply_text(_ADMIN_USER_MENU_TEXT)
+    return ADMIN_USER_MENU
+
+
+async def admin_user_del_select(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Process user deletion from admin_user menu."""
+    text = update.message.text.strip()
+    users_map: dict = context.user_data.get("admin_user_map", {})
+
+    try:
+        indices = [idx.strip() for idx in text.split(",")]
+    except Exception:
+        await update.message.reply_text("❌ 格式錯誤。\n\n" + _ADMIN_USER_MENU_TEXT)
+        return ADMIN_USER_MENU
+
+    deleted = 0
+    for idx in indices:
+        user = users_map.get(idx)
+        if user:
+            success = await database.delete_user(user["tg_user_id"])
+            if success:
+                deleted += 1
+
+    await update.message.reply_text(f"✅ 已刪除 {deleted} 個用戶。")
+    context.user_data.pop("admin_user_map", None)
+    await update.message.reply_text(_ADMIN_USER_MENU_TEXT)
+    return ADMIN_USER_MENU
+
+
+async def admin_user_edit_select(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Receive user selection for edit from admin_user menu."""
+    text = update.message.text.strip()
+    users_map: dict = context.user_data.get("admin_user_map", {})
+
+    if text not in users_map:
+        await update.message.reply_text("❌ 無效的編號。\n\n" + _ADMIN_USER_MENU_TEXT)
+        return ADMIN_USER_MENU
+
+    user = users_map[text]
+    context.user_data["editing_user"] = user
+
+    await update.message.reply_text(
+        "已收到您的請求，請在下則訊息給出完整用戶 ID 且不要包含其他內容"
+    )
+    return ADMIN_USER_EDIT_INPUT
+
+
+async def admin_user_edit_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Receive new user TG ID from admin_user menu."""
+    text = update.message.text.strip()
+    try:
+        new_tg_id = int(text)
+    except ValueError:
+        await update.message.reply_text("❌ 無效的用戶 ID，請輸入數字。\n\n" + _ADMIN_USER_MENU_TEXT)
+        return ADMIN_USER_MENU
+
+    user = context.user_data.get("editing_user", {})
+    result = await database.update_user_tg_id(user["tg_user_id"], new_tg_id)
+
+    if result:
+        await update.message.reply_text(f"✅ 已更新用戶 ID: {user['tg_user_id']} → {new_tg_id}")
+    else:
+        await update.message.reply_text("❌ 更新失敗，新 ID 可能已存在。")
+
+    context.user_data.pop("editing_user", None)
+    await update.message.reply_text(_ADMIN_USER_MENU_TEXT)
+    return ADMIN_USER_MENU
+
+
+async def admin_user_rm_key_select(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Process admin key deletion from admin_user menu."""
+    text = update.message.text.strip()
+    keys_map: dict = context.user_data.get("admin_user_keys_map", {})
+
+    try:
+        indices = [idx.strip() for idx in text.split(",")]
+    except Exception:
+        await update.message.reply_text("❌ 格式錯誤。\n\n" + _ADMIN_USER_MENU_TEXT)
+        return ADMIN_USER_MENU
+
+    deleted = 0
+    for idx in indices:
+        key_id = keys_map.get(idx)
+        if key_id:
+            success = await database.delete_api_key(key_id)
+            if success:
+                deleted += 1
+
+    await update.message.reply_text(f"✅ 已刪除 {deleted} 個 API key。")
+    context.user_data.pop("admin_user_keys_map", None)
+    await update.message.reply_text(_ADMIN_USER_MENU_TEXT)
+    return ADMIN_USER_MENU
+
+
+async def admin_user_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Cancel admin_user conversation."""
+    await update.message.reply_text("👋 已離開用戶管理。")
+    context.user_data.pop("admin_user_map", None)
+    context.user_data.pop("admin_user_keys_map", None)
+    context.user_data.pop("editing_user", None)
     return ConversationHandler.END
 
 
@@ -1663,15 +1711,7 @@ def register_admin_handlers(app):
     )
     app.add_handler(edit_conv)
 
-    # /admin_rm_userkey
-    rm_userkey_conv = ConversationHandler(
-        entry_points=[CommandHandler("admin_rm_userkey", rm_userkey_start, filters=filters.User(user_id=Config.ADMIN_ID))],
-        states={
-            RM_USERKEY_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, rm_userkey_select)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel_conversation)],
-    )
-    app.add_handler(rm_userkey_conv)
+    # /admin_rm_userkey — now part of /admin_user (removed standalone)
 
     # /sub_url
     sub_url_conv = ConversationHandler(
@@ -1683,46 +1723,21 @@ def register_admin_handlers(app):
     )
     app.add_handler(sub_url_conv)
 
-    # /add_user
-    add_user_conv = ConversationHandler(
-        entry_points=[CommandHandler("add_user", add_user_start, filters=filters.User(user_id=Config.ADMIN_ID))],
+    # /admin_user — unified user management (merges add/stop/del/edit_user + admin_rm_userkey)
+    admin_user_conv = ConversationHandler(
+        entry_points=[CommandHandler("admin_user", admin_user_start, filters=filters.User(user_id=Config.ADMIN_ID))],
         states={
-            ADD_USER_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_user_input)],
+            ADMIN_USER_MENU: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_user_menu)],
+            ADMIN_USER_ADD_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_user_add_input)],
+            ADMIN_USER_STOP_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_user_stop_select)],
+            ADMIN_USER_DEL_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_user_del_select)],
+            ADMIN_USER_EDIT_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_user_edit_select)],
+            ADMIN_USER_EDIT_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_user_edit_input)],
+            ADMIN_USER_RM_KEY_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_user_rm_key_select)],
         },
-        fallbacks=[CommandHandler("cancel", cancel_conversation)],
+        fallbacks=[CommandHandler("cancel", admin_user_cancel)],
     )
-    app.add_handler(add_user_conv)
-
-    # /stop_user
-    stop_user_conv = ConversationHandler(
-        entry_points=[CommandHandler("stop_user", stop_user_start, filters=filters.User(user_id=Config.ADMIN_ID))],
-        states={
-            STOP_USER_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, stop_user_select)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel_conversation)],
-    )
-    app.add_handler(stop_user_conv)
-
-    # /del_user
-    del_user_conv = ConversationHandler(
-        entry_points=[CommandHandler("del_user", del_user_start, filters=filters.User(user_id=Config.ADMIN_ID))],
-        states={
-            DEL_USER_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, del_user_select)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel_conversation)],
-    )
-    app.add_handler(del_user_conv)
-
-    # /edit_user
-    edit_user_conv = ConversationHandler(
-        entry_points=[CommandHandler("edit_user", edit_user_start, filters=filters.User(user_id=Config.ADMIN_ID))],
-        states={
-            EDIT_USER_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_user_select)],
-            EDIT_USER_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_user_input)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel_conversation)],
-    )
-    app.add_handler(edit_user_conv)
+    app.add_handler(admin_user_conv)
 
     # /api_test
     api_test_conv = ConversationHandler(

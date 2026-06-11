@@ -8,7 +8,6 @@ import {
   updateProvider,
   deleteProvider,
   getUsers,
-  getUserByTgId,
   addUser,
   updateUserStatus,
   deleteUser,
@@ -1023,49 +1022,6 @@ async function uuCommand(ctx: MyContext): Promise<void> {
 }
 
 // ========================
-// /admin_rm_userkey — Remove API keys (multi-select)
-// ========================
-
-async function adminRmUserkeyConversation(
-  conversation: MyConversation,
-  ctx: MyContext
-): Promise<void> {
-  const keys = getAllKeys();
-  if (keys.length === 0) {
-    await ctx.reply("📭 目前沒有任何 API Key。");
-    return;
-  }
-
-  const lines = keys.map(
-    (k, i) =>
-      `${i + 1}. ${k.key.slice(0, 12)}... — TG: ${k.tg_user_id} (${k.username ?? "無名"}) ${k.is_active ? "✅" : "⛔"}`
-  );
-  await ctx.reply(
-    `請選擇要刪除的 API Key（輸入編號，多選用逗號分隔，例如：1,3）：\n\n${lines.join("\n")}`
-  );
-
-  ctx = await conversation.wait();
-  const indices = parseIndices(ctx.msg?.text ?? "");
-  const selectedIds = indices
-    .map((i) => keys[i - 1]?.id)
-    .filter((id): id is number => id !== undefined);
-
-  if (selectedIds.length === 0) {
-    await ctx.reply("❌ 沒有有效的選擇，已取消。");
-    return;
-  }
-
-  try {
-    for (const id of selectedIds) {
-      deleteApiKey(id);
-    }
-    await ctx.reply(`✅ 已刪除 ${selectedIds.length} 個 API Key。`);
-  } catch (err) {
-    await ctx.reply(`❌ 刪除失敗：${(err as Error).message}`);
-  }
-}
-
-// ========================
 // /sub_url — Set API URL (2-step)
 // ========================
 
@@ -1092,186 +1048,193 @@ async function subUrlConversation(
 }
 
 // ========================
-// /add_user — Add a user (2-step)
+// /admin_user — Unified user management (menu loop)
 // ========================
 
-async function addUserConversation(
+const ADMIN_USER_MENU_TEXT =
+  "👤 用戶管理\n\n" +
+  "1. 新增用戶\n" +
+  "2. 停用用戶\n" +
+  "3. 刪除用戶\n" +
+  "4. 編輯用戶 TG ID\n" +
+  "5. 移除用戶 API Key\n\n" +
+  "請輸入編號選擇操作（/cancel 結束）：";
+
+async function adminUserConversation(
   conversation: MyConversation,
   ctx: MyContext
 ): Promise<void> {
-  await ctx.reply("請輸入新使用者的 TG User ID：");
+  while (true) {
+    await ctx.reply(ADMIN_USER_MENU_TEXT);
+    ctx = await conversation.wait();
+    const choice = ctx.msg?.text?.trim() ?? "";
 
-  ctx = await conversation.wait();
-  const tgUserId = parseInt(ctx.msg?.text?.trim() ?? "", 10);
-  if (isNaN(tgUserId)) {
-    await ctx.reply("❌ 無效的 TG User ID，已取消。");
-    return;
-  }
+    if (choice === "/cancel") return;
 
-  try {
-    addUser(tgUserId);
-    await ctx.reply(`✅ 已新增使用者 (TG ID: ${tgUserId})。`);
-  } catch (err) {
-    await ctx.reply(`❌ 新增失敗：${(err as Error).message}`);
-  }
-}
-
-// ========================
-// /stop_user — Stop users (multi-select)
-// ========================
-
-async function stopUserConversation(
-  conversation: MyConversation,
-  ctx: MyContext
-): Promise<void> {
-  const users = getUsers(config.ADMIN_ID);
-  if (users.length === 0) {
-    await ctx.reply("📭 沒有可停用的使用者（排除管理員）。");
-    return;
-  }
-
-  const lines = users.map(
-    (u, i) =>
-      `${i + 1}. ${u.username ? "@" + u.username : "無名"} (TG: ${u.tg_user_id}) — ${u.is_active ? "✅ 啟用" : "⛔ 已停用"}`
-  );
-  await ctx.reply(
-    `請選擇要停用的使用者（輸入編號，多選用逗號分隔，例如：1,3）：\n\n${lines.join("\n")}`
-  );
-
-  ctx = await conversation.wait();
-  const indices = parseIndices(ctx.msg?.text ?? "");
-  const selectedUsers = indices
-    .map((i) => users[i - 1])
-    .filter((u): u is User => u !== undefined);
-
-  if (selectedUsers.length === 0) {
-    await ctx.reply("❌ 沒有有效的選擇，已取消。");
-    return;
-  }
-
-  for (const user of selectedUsers) {
-    try {
-      updateUserStatus(user.id, 0);
-      // Try to notify the stopped user
-      try {
-        await ctx.api.sendMessage(
-          user.tg_user_id,
-          "你的帳號已被管理員停用"
-        );
-      } catch {
-        // User may have blocked the bot, ignore
+    if (choice === "1") {
+      // ── 新增用戶 ──
+      await ctx.reply("請輸入新使用者的 TG User ID：");
+      ctx = await conversation.wait();
+      const tgUserId = parseInt(ctx.msg?.text?.trim() ?? "", 10);
+      if (isNaN(tgUserId)) {
+        await ctx.reply("❌ 無效的 TG User ID。");
+        continue;
       }
-    } catch (err) {
-      await ctx.reply(
-        `❌ 停用 ${user.tg_user_id} 失敗：${(err as Error).message}`
-      );
+      try {
+        addUser(tgUserId);
+        await ctx.reply(`✅ 已新增使用者 (TG ID: ${tgUserId})。`);
+      } catch (err) {
+        await ctx.reply(`❌ 新增失敗：${(err as Error).message}`);
+      }
+      continue;
     }
-  }
 
-  await ctx.reply(
-    `✅ 已停用 ${selectedUsers.length} 個使用者。`
-  );
-}
-
-// ========================
-// /del_user — Delete users (multi-select)
-// ========================
-
-async function delUserConversation(
-  conversation: MyConversation,
-  ctx: MyContext
-): Promise<void> {
-  const users = getUsers(config.ADMIN_ID);
-  if (users.length === 0) {
-    await ctx.reply("📭 沒有可刪除的使用者（排除管理員）。");
-    return;
-  }
-
-  const lines = users.map(
-    (u, i) =>
-      `${i + 1}. ${u.username ? "@" + u.username : "無名"} (TG: ${u.tg_user_id})`
-  );
-  await ctx.reply(
-    `請選擇要刪除的使用者（輸入編號，多選用逗號分隔，例如：1,3）：\n\n${lines.join("\n")}`
-  );
-
-  ctx = await conversation.wait();
-  const indices = parseIndices(ctx.msg?.text ?? "");
-  const selectedUsers = indices
-    .map((i) => users[i - 1])
-    .filter((u): u is User => u !== undefined);
-
-  if (selectedUsers.length === 0) {
-    await ctx.reply("❌ 沒有有效的選擇，已取消。");
-    return;
-  }
-
-  for (const user of selectedUsers) {
-    try {
-      deleteUser(user.id);
-    } catch (err) {
-      await ctx.reply(
-        `❌ 刪除 ${user.tg_user_id} 失敗：${(err as Error).message}`
+    if (choice === "2") {
+      // ── 停用用戶 ──
+      const users = getUsers(config.ADMIN_ID);
+      if (users.length === 0) {
+        await ctx.reply("📭 沒有可停用的使用者（排除管理員）。");
+        continue;
+      }
+      const lines = users.map(
+        (u, i) =>
+          `${i + 1}. ${u.username ? "@" + u.username : "無名"} (TG: ${u.tg_user_id}) — ${u.is_active ? "✅ 啟用" : "⛔ 已停用"}`
       );
+      await ctx.reply(
+        `請選擇要停用的使用者（輸入編號，多選用逗號分隔，例如：1,3）：\n\n${lines.join("\n")}`
+      );
+      ctx = await conversation.wait();
+      const indices = parseIndices(ctx.msg?.text ?? "");
+      const selectedUsers = indices
+        .map((i) => users[i - 1])
+        .filter((u): u is User => u !== undefined);
+      if (selectedUsers.length === 0) {
+        await ctx.reply("❌ 沒有有效的選擇。");
+        continue;
+      }
+      for (const user of selectedUsers) {
+        try {
+          updateUserStatus(user.id, 0);
+          try {
+            await ctx.api.sendMessage(user.tg_user_id, "你的帳號已被管理員停用");
+          } catch { /* user may have blocked the bot */ }
+        } catch (err) {
+          await ctx.reply(`❌ 停用 ${user.tg_user_id} 失敗：${(err as Error).message}`);
+        }
+      }
+      await ctx.reply(`✅ 已停用 ${selectedUsers.length} 個使用者。`);
+      continue;
     }
-  }
 
-  await ctx.reply(
-    `✅ 已刪除 ${selectedUsers.length} 個使用者。`
-  );
-}
+    if (choice === "3") {
+      // ── 刪除用戶 ──
+      const users = getUsers(config.ADMIN_ID);
+      if (users.length === 0) {
+        await ctx.reply("📭 沒有可刪除的使用者（排除管理員）。");
+        continue;
+      }
+      const lines = users.map(
+        (u, i) =>
+          `${i + 1}. ${u.username ? "@" + u.username : "無名"} (TG: ${u.tg_user_id})`
+      );
+      await ctx.reply(
+        `請選擇要刪除的使用者（輸入編號，多選用逗號分隔，例如：1,3）：\n\n${lines.join("\n")}`
+      );
+      ctx = await conversation.wait();
+      const indices = parseIndices(ctx.msg?.text ?? "");
+      const selectedUsers = indices
+        .map((i) => users[i - 1])
+        .filter((u): u is User => u !== undefined);
+      if (selectedUsers.length === 0) {
+        await ctx.reply("❌ 沒有有效的選擇。");
+        continue;
+      }
+      for (const user of selectedUsers) {
+        try {
+          deleteUser(user.id);
+        } catch (err) {
+          await ctx.reply(`❌ 刪除 ${user.tg_user_id} 失敗：${(err as Error).message}`);
+        }
+      }
+      await ctx.reply(`✅ 已刪除 ${selectedUsers.length} 個使用者。`);
+      continue;
+    }
 
-// ========================
-// /edit_user — Edit user TG ID (3-step)
-// ========================
+    if (choice === "4") {
+      // ── 編輯用戶 TG ID ──
+      const users = getUsers();
+      if (users.length === 0) {
+        await ctx.reply("📭 目前沒有任何使用者。");
+        continue;
+      }
+      const lines = users.map(
+        (u, i) =>
+          `${i + 1}. ${u.username ? "@" + u.username : "無名"} (TG: ${u.tg_user_id}) — ${u.is_active ? "✅" : "⛔"}`
+      );
+      await ctx.reply(
+        `請選擇要編輯的使用者（輸入編號）：\n\n${lines.join("\n")}`
+      );
+      ctx = await conversation.wait();
+      const idx = parseInt(ctx.msg?.text?.trim() ?? "", 10);
+      const user = users[idx - 1];
+      if (!user) {
+        await ctx.reply("❌ 無效的編號。");
+        continue;
+      }
+      await ctx.reply(
+        "已收到您的請求,請在下則訊息給出完整用戶id且不要包含其他內容"
+      );
+      ctx = await conversation.wait();
+      const newTgId = parseInt(ctx.msg?.text?.trim() ?? "", 10);
+      if (isNaN(newTgId)) {
+        await ctx.reply("❌ 無效的 TG User ID。");
+        continue;
+      }
+      try {
+        updateUserTgId(user.tg_user_id, newTgId);
+        await ctx.reply(`✅ 已更新使用者 TG ID：${user.tg_user_id} → ${newTgId}`);
+      } catch (err) {
+        await ctx.reply(`❌ 更新失敗：${(err as Error).message}`);
+      }
+      continue;
+    }
 
-async function editUserConversation(
-  conversation: MyConversation,
-  ctx: MyContext
-): Promise<void> {
-  const users = getUsers();
-  if (users.length === 0) {
-    await ctx.reply("📭 目前沒有任何使用者。");
-    return;
-  }
+    if (choice === "5") {
+      // ── 移除用戶 API Key ──
+      const keys = getAllKeys();
+      if (keys.length === 0) {
+        await ctx.reply("📭 目前沒有任何 API Key。");
+        continue;
+      }
+      const lines = keys.map(
+        (k, i) =>
+          `${i + 1}. ${k.key.slice(0, 12)}... — TG: ${k.tg_user_id} (${k.username ?? "無名"}) ${k.is_active ? "✅" : "⛔"}`
+      );
+      await ctx.reply(
+        `請選擇要刪除的 API Key（輸入編號，多選用逗號分隔，例如：1,3）：\n\n${lines.join("\n")}`
+      );
+      ctx = await conversation.wait();
+      const indices = parseIndices(ctx.msg?.text ?? "");
+      const selectedIds = indices
+        .map((i) => keys[i - 1]?.id)
+        .filter((id): id is number => id !== undefined);
+      if (selectedIds.length === 0) {
+        await ctx.reply("❌ 沒有有效的選擇。");
+        continue;
+      }
+      try {
+        for (const id of selectedIds) {
+          deleteApiKey(id);
+        }
+        await ctx.reply(`✅ 已刪除 ${selectedIds.length} 個 API Key。`);
+      } catch (err) {
+        await ctx.reply(`❌ 刪除失敗：${(err as Error).message}`);
+      }
+      continue;
+    }
 
-  // Step 1: List users, pick one
-  const lines = users.map(
-    (u, i) =>
-      `${i + 1}. ${u.username ? "@" + u.username : "無名"} (TG: ${u.tg_user_id}) — ${u.is_active ? "✅" : "⛔"}`
-  );
-  await ctx.reply(
-    `請選擇要編輯的使用者（輸入編號）：\n\n${lines.join("\n")}`
-  );
-
-  ctx = await conversation.wait();
-  const idx = parseInt(ctx.msg?.text?.trim() ?? "", 10);
-  const user = users[idx - 1];
-  if (!user) {
-    await ctx.reply("❌ 無效的編號，已取消。");
-    return;
-  }
-
-  // Step 2: Ask for new TG user ID
-  await ctx.reply(
-    "已收到您的請求,請在下則訊息給出完整用戶id且不要包含其他內容"
-  );
-
-  // Step 3: Wait for new ID
-  ctx = await conversation.wait();
-  const newTgId = parseInt(ctx.msg?.text?.trim() ?? "", 10);
-  if (isNaN(newTgId)) {
-    await ctx.reply("❌ 無效的 TG User ID，已取消。");
-    return;
-  }
-
-  try {
-    updateUserTgId(user.tg_user_id, newTgId);
-    await ctx.reply(
-      `✅ 已更新使用者 TG ID：${user.tg_user_id} → ${newTgId}`
-    );
-  } catch (err) {
-    await ctx.reply(`❌ 更新失敗：${(err as Error).message}`);
+    // Invalid choice
+    await ctx.reply("❌ 請輸入 1-5 選擇操作，或 /cancel 結束。");
   }
 }
 
@@ -1311,17 +1274,45 @@ async function apiTestConversation(
   conversation: MyConversation,
   ctx: MyContext
 ): Promise<void> {
-  // Step 1: Ask for URL
+  // Step 1: Ask for URL (or URL,Key)
   await ctx.reply(
     "🧪 API 協議測試\n\n" +
-    "請輸入要測試的 API URL：\n" +
-    "例如：https://api.example.com/v1"
+    "請輸入要測試的 API URL（可附帶 Key）：\n\n" +
+    "格式：`URL` 或 `URL,API-KEY`\n\n" +
+    "例如：\n" +
+    "  `https://api.example.com/v1`\n" +
+    "  `https://api.example.com/v1,sk-xxxx`",
+    { parse_mode: "Markdown" }
   );
 
   const urlCtx = await conversation.wait();
   if (!urlCtx.message?.text) return;
-  const url = urlCtx.message.text.trim();
+  const raw = urlCtx.message.text.trim();
 
+  // Parse "url,key" format — split on the FIRST comma only
+  const commaIdx = raw.indexOf(",");
+  const url = (commaIdx >= 0 ? raw.substring(0, commaIdx) : raw).trim();
+  const apiKey = commaIdx >= 0 ? raw.substring(commaIdx + 1).trim() : "";
+
+  // If Key provided → directly test with auth
+  if (apiKey) {
+    await ctx.reply("⏳ 正在使用 Key 偵測 API 協議...");
+
+    const detectionWithKey = await conversation.external(() =>
+      detectApiProtocols(url, apiKey)
+    );
+
+    const resultText = formatProtocolStatus(detectionWithKey);
+    const supportedCount = Object.values(detectionWithKey.protocols).filter((d) => d.supported).length;
+    const totalCount = Object.keys(detectionWithKey.protocols).length;
+    await ctx.reply(
+      `📊 偵測結果（帶 Key）：\n\n${resultText}\n\n` +
+      `共 ${supportedCount}/${totalCount} 個協議支援。`
+    );
+    return;
+  }
+
+  // URL only → test without auth first
   // Step 2: Test protocols without auth
   await ctx.reply("⏳ 正在偵測 API 協議（不帶 Key）...");
   const { result: detection, allUnreachable } = await conversation.external(() =>
@@ -1338,12 +1329,12 @@ async function apiTestConversation(
 
     const keyCtx = await conversation.wait();
     if (!keyCtx.message?.text) return;
-    const apiKey = keyCtx.message.text.trim();
+    const retryKey = keyCtx.message.text.trim();
 
     // Step 4: Retry with key
     await ctx.reply("⏳ 正在使用 Key 重新偵測 API 協議...");
     const detectionWithKey = await conversation.external(() =>
-      detectApiProtocols(url, apiKey)
+      detectApiProtocols(url, retryKey)
     );
 
     const resultText = formatProtocolStatus(detectionWithKey);
@@ -1375,12 +1366,8 @@ export function registerAdminHandlers(bot: Bot<MyContext>): void {
   bot.use(createConversation(addConversation, "addConversation"));
   bot.use(createConversation(delConversation, "delConversation"));
   bot.use(createConversation(editConversation, "editConversation"));
-  bot.use(createConversation(adminRmUserkeyConversation, "adminRmUserkeyConversation"));
   bot.use(createConversation(subUrlConversation, "subUrlConversation"));
-  bot.use(createConversation(addUserConversation, "addUserConversation"));
-  bot.use(createConversation(stopUserConversation, "stopUserConversation"));
-  bot.use(createConversation(delUserConversation, "delUserConversation"));
-  bot.use(createConversation(editUserConversation, "editUserConversation"));
+  bot.use(createConversation(adminUserConversation, "adminUserConversation"));
   bot.use(createConversation(apiTestConversation, "apiTestConversation"));
 
   // Admin-only middleware wrapper
@@ -1407,28 +1394,12 @@ export function registerAdminHandlers(bot: Bot<MyContext>): void {
     await ctx.conversation.enter("editConversation");
   }));
 
-  bot.command("admin_rm_userkey", adminOnly(async (ctx) => {
-    await ctx.conversation.enter("adminRmUserkeyConversation");
-  }));
-
   bot.command("sub_url", adminOnly(async (ctx) => {
     await ctx.conversation.enter("subUrlConversation");
   }));
 
-  bot.command("add_user", adminOnly(async (ctx) => {
-    await ctx.conversation.enter("addUserConversation");
-  }));
-
-  bot.command("stop_user", adminOnly(async (ctx) => {
-    await ctx.conversation.enter("stopUserConversation");
-  }));
-
-  bot.command("del_user", adminOnly(async (ctx) => {
-    await ctx.conversation.enter("delUserConversation");
-  }));
-
-  bot.command("edit_user", adminOnly(async (ctx) => {
-    await ctx.conversation.enter("editUserConversation");
+  bot.command("admin_user", adminOnly(async (ctx) => {
+    await ctx.conversation.enter("adminUserConversation");
   }));
 
   bot.command("api_test", adminOnly(async (ctx) => {
