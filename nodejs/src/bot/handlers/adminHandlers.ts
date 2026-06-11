@@ -1439,23 +1439,6 @@ export function registerAdminHandlers(bot: Bot<MyContext>): void {
     await ctx.conversation.enter("providerConversation");
   }));
 
-  // Legacy aliases: /add, /del, /edit, /list → all enter provider conversation
-  bot.command("add", adminOnly(async (ctx) => {
-    await ctx.conversation.enter("providerConversation");
-  }));
-
-  bot.command("del", adminOnly(async (ctx) => {
-    await ctx.conversation.enter("providerConversation");
-  }));
-
-  bot.command("edit", adminOnly(async (ctx) => {
-    await ctx.conversation.enter("providerConversation");
-  }));
-
-  bot.command("list", adminOnly(async (ctx) => {
-    await ctx.conversation.enter("providerConversation");
-  }));
-
   // Other conversations
   bot.command("sub_url", adminOnly(async (ctx) => {
     await ctx.conversation.enter("subUrlConversation");

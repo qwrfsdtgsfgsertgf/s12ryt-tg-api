@@ -545,17 +545,6 @@ export function registerUserHandlers(bot: Bot<MyContext>): void {
     await ctx.conversation.enter("key");
   });
 
-  // /key_add and /key_del as aliases for /key
-  bot.command("key_add", async (ctx) => {
-    if (!isTrustedUser(ctx)) return;
-    await ctx.conversation.enter("key");
-  });
-
-  bot.command("key_del", async (ctx) => {
-    if (!isTrustedUser(ctx)) return;
-    await ctx.conversation.enter("key");
-  });
-
   // /usage
   bot.command("usage", async (ctx) => {
     if (!isTrustedUser(ctx)) return;
@@ -564,17 +553,6 @@ export function registerUserHandlers(bot: Bot<MyContext>): void {
 
   // /coding — unified coding management
   bot.command("coding", async (ctx) => {
-    if (!isTrustedUser(ctx)) return;
-    await ctx.conversation.enter("coding");
-  });
-
-  // /start_coding and /set_coding as aliases for /coding
-  bot.command("start_coding", async (ctx) => {
-    if (!isTrustedUser(ctx)) return;
-    await ctx.conversation.enter("coding");
-  });
-
-  bot.command("set_coding", async (ctx) => {
     if (!isTrustedUser(ctx)) return;
     await ctx.conversation.enter("coding");
   });
