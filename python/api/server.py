@@ -265,8 +265,10 @@ async def _lookup_model_db(model_name: str) -> tuple[str, str, dict[str, Any], f
 
     Returns (provider_type, provider_id, config, input_price, output_price) or None.
     Prices are per-model from model_prices table, falling back to provider-level.
+    Config includes a single selected api_key (from multi-key failover selector).
     """
     from db.database import get_provider_cache, CachedProvider, get_model_price, get_providers
+    from api.key_selector import select_key
 
     # 1. Try in-memory cache first
     cache = get_provider_cache()
@@ -277,10 +279,13 @@ async def _lookup_model_db(model_name: str) -> tuple[str, str, dict[str, Any], f
         input_price = model_price.get("input_price") if model_price else cached.input_price
         output_price = model_price.get("output_price") if model_price else cached.output_price
 
+        # Select a single key from multi-key JSON array
+        selected_key, key_index = select_key(cached.provider_id, cached.api_key)
+
         return (
             cached.provider_type,
             str(cached.provider_id),
-            {"base_url": cached.base_url, "api_key": cached.api_key},
+            {"base_url": cached.base_url, "api_key": selected_key or "", "_key_index": key_index},
             input_price,
             output_price,
         )
@@ -298,10 +303,13 @@ async def _lookup_model_db(model_name: str) -> tuple[str, str, dict[str, Any], f
                 input_price = p.get("input_price")
                 output_price = p.get("output_price")
 
+            # Select a single key from multi-key JSON array
+            selected_key, key_index = select_key(p["id"], p["api_key"])
+
             return (
                 p["api_type"],
                 str(p["id"]),
-                {"base_url": p["base_url"], "api_key": p["api_key"]},
+                {"base_url": p["base_url"], "api_key": selected_key or "", "_key_index": key_index},
                 input_price,
                 output_price,
             )
@@ -390,8 +398,20 @@ async def _dispatch_with_fallback(
         if provider_module is None:
             raise ValueError(f"Unknown provider type: {provider_type}")
 
-        result = await provider_module.chat_completion(body, provider_config)
-        return result, model_name, provider_type, provider_id, provider_config, input_price, output_price
+        key_index = provider_config.get("_key_index")
+        try:
+            result = await provider_module.chat_completion(body, provider_config)
+            # Report success to key selector
+            if key_index is not None:
+                from api.key_selector import report_success
+                report_success(int(provider_id), key_index)
+            return result, model_name, provider_type, provider_id, provider_config, input_price, output_price
+        except Exception:
+            # Report failure to key selector
+            if key_index is not None:
+                from api.key_selector import report_failure
+                report_failure(int(provider_id), key_index)
+            raise
 
 
 # ---------------------------------------------------------------------------

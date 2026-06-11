@@ -5,6 +5,8 @@
  * 2. Fetches pricing from https://models.dev/api.json
  */
 
+import { getFirstKey } from "../../api/keySelector.js";
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -75,6 +77,8 @@ export async function fetchProviderModels(
   apiKey: string,
   apiType: string
 ): Promise<FetchedModel[]> {
+  // Extract single key from possible JSON array for API calls
+  const singleKey = getFirstKey(apiKey);
   try {
     // Build models endpoint: baseUrl + /models (or + models if trailing /)
     let modelsUrl: string;
@@ -88,12 +92,12 @@ export async function fetchProviderModels(
     const headers: Record<string, string> = {};
     if (apiType === "google") {
       const separator = modelsUrl.includes("?") ? "&" : "?";
-      modelsUrl = `${modelsUrl}${separator}key=${encodeURIComponent(apiKey)}`;
+      modelsUrl = `${modelsUrl}${separator}key=${encodeURIComponent(singleKey)}`;
     } else if (apiType === "anthropic") {
-      headers["x-api-key"] = apiKey;
+      headers["x-api-key"] = singleKey;
       headers["anthropic-version"] = "2023-06-01";
     } else {
-      headers["Authorization"] = `Bearer ${apiKey}`;
+      headers["Authorization"] = `Bearer ${singleKey}`;
     }
 
     const resp = await fetch(modelsUrl, {
@@ -297,13 +301,15 @@ export async function detectApiProtocols(
   baseUrl: string,
   apiKey: string
 ): Promise<DetectionResult> {
-  const bearer: Record<string, string> = { Authorization: `Bearer ${apiKey}` };
+  // Extract single key from possible JSON array for API probes
+  const singleKey = getFirstKey(apiKey);
+  const bearer: Record<string, string> = { Authorization: `Bearer ${singleKey}` };
   const bearerJson: Record<string, string> = {
     ...bearer,
     "content-type": "application/json",
   };
   const anthropicHeaders: Record<string, string> = {
-    "x-api-key": apiKey,
+    "x-api-key": singleKey,
     "anthropic-version": "2023-06-01",
     "content-type": "application/json",
   };
@@ -339,7 +345,7 @@ export async function detectApiProtocols(
     // google: GET /models?key=
     detailedProbe(
       "GET",
-      `${buildUrl(baseUrl, "/models")}?key=${encodeURIComponent(apiKey)}`,
+      `${buildUrl(baseUrl, "/models")}?key=${encodeURIComponent(singleKey)}`,
       {}
     ),
   ]);

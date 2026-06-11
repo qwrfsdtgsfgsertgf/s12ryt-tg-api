@@ -68,11 +68,13 @@ const PROVIDER_MODULES: Record<string, any> = {
 // Database-driven model resolution (optimized with in-memory cache)
 // ---------------------------------------------------------------------------
 
+import { selectKey, reportSuccess, reportFailure } from "./keySelector.js";
+
 interface ResolvedProvider {
   providerType: string;
   providerId: number;
   providerName: string;
-  config: { baseUrl: string; apiKey: string };
+  config: { baseUrl: string; apiKey: string; _keyIndex: number | null };
   inputPrice: number | null;
   outputPrice: number | null;
 }
@@ -80,15 +82,17 @@ interface ResolvedProvider {
 /**
  * Fast model lookup — uses in-memory provider cache (zero DB queries).
  * Falls back to full DB scan + cache rebuild on cache miss.
+ * Selects best available API key from multi-key JSON array.
  */
 function lookupModelDb(modelName: string): ResolvedProvider {
   const cached = lookupModelCached(modelName);
   if (cached) {
+    const { key, keyIndex } = selectKey(cached.providerId, cached.apiKey);
     return {
       providerType: cached.providerType,
       providerId: cached.providerId,
       providerName: cached.providerName,
-      config: { baseUrl: cached.baseUrl, apiKey: cached.apiKey },
+      config: { baseUrl: cached.baseUrl, apiKey: key ?? cached.apiKey, _keyIndex: keyIndex },
       inputPrice: cached.inputPrice,
       outputPrice: cached.outputPrice,
     };
@@ -98,11 +102,12 @@ function lookupModelDb(modelName: string): ResolvedProvider {
   rebuildProviderCache();
   const retry = lookupModelCached(modelName);
   if (retry) {
+    const { key, keyIndex } = selectKey(retry.providerId, retry.apiKey);
     return {
       providerType: retry.providerType,
       providerId: retry.providerId,
       providerName: retry.providerName,
-      config: { baseUrl: retry.baseUrl, apiKey: retry.apiKey },
+      config: { baseUrl: retry.baseUrl, apiKey: key ?? retry.apiKey, _keyIndex: keyIndex },
       inputPrice: retry.inputPrice,
       outputPrice: retry.outputPrice,
     };
@@ -116,7 +121,7 @@ interface DispatchResult {
   modelName: string;
   providerType: string;
   providerId: number;
-  providerConfig: { baseUrl: string; apiKey: string };
+  providerConfig: { baseUrl: string; apiKey: string; _keyIndex: number | null };
   inputPrice: number | null;
   outputPrice: number | null;
 }
@@ -182,16 +187,28 @@ async function dispatchWithFallback(
       throw new Error(`Unknown provider type: ${resolved.providerType}`);
     }
 
-    const result = await providerModule.chatCompletion(body, resolved.config);
-    return {
-      result,
-      modelName,
-      providerType: resolved.providerType,
-      providerId: resolved.providerId,
-      providerConfig: resolved.config,
-      inputPrice: resolved.inputPrice,
-      outputPrice: resolved.outputPrice,
-    };
+    try {
+      const result = await providerModule.chatCompletion(body, resolved.config);
+      // Report success for multi-key failover tracking
+      if (resolved.config._keyIndex != null) {
+        reportSuccess(resolved.providerId, resolved.config._keyIndex);
+      }
+      return {
+        result,
+        modelName,
+        providerType: resolved.providerType,
+        providerId: resolved.providerId,
+        providerConfig: resolved.config,
+        inputPrice: resolved.inputPrice,
+        outputPrice: resolved.outputPrice,
+      };
+    } catch (err: any) {
+      // Report failure for multi-key failover tracking
+      if (resolved.config._keyIndex != null) {
+        reportFailure(resolved.providerId, resolved.config._keyIndex);
+      }
+      throw err;
+    }
   }
 }
 

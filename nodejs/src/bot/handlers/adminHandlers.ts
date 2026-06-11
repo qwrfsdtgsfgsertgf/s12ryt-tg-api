@@ -26,6 +26,7 @@ import {
   type ApiKey,
 } from "../../db/database.js";
 import { fetchProviderModels, fetchModelsPricing, detectApiProtocols, detectProtocolsNoAuth, type DetectionResult, type ProbeDetail, type FetchedModel } from "./modelFetcher.js";
+import { parseApiKeys, getFirstKey } from "../../api/keySelector.js";
 
 // ========================
 // Types
@@ -157,13 +158,15 @@ async function addConversation(
   }
 
   // Step 3: API key
-  await ctx.reply("請輸入 API Key：");
+  await ctx.reply("請輸入 API Key（可使用 , 分隔多個 API Key）：");
   ctx = await conversation.wait();
-  const apiKey = ctx.msg?.text?.trim();
-  if (!apiKey) {
+  const apiKeyRaw = ctx.msg?.text?.trim();
+  if (!apiKeyRaw) {
     await ctx.reply("❌ API Key 不能為空，已取消。");
     return;
   }
+  // Parse comma-separated keys → JSON array
+  const apiKey = JSON.stringify(apiKeyRaw.split(",").map((k: string) => k.trim()).filter(Boolean));
 
   // Step 4: Auto-detect API protocols (v2: precise status code analysis)
   await ctx.reply("🔍 正在偵測 API 端點支持的協議...");
@@ -582,7 +585,7 @@ async function editConversation(
     { key: "name", label: "名稱", current: provider.name },
     { key: "api_type", label: "API 類型", current: provider.api_type },
     { key: "base_url", label: "Base URL", current: provider.base_url },
-    { key: "api_key", label: "API Key", current: provider.api_key.slice(0, 8) + "..." },
+    { key: "api_key", label: "API Key", current: (() => { const keys = parseApiKeys(provider.api_key); return keys.length > 1 ? `${keys.length} 個 Key (${keys[0].slice(0,8)}...)` : provider.api_key.slice(0, 8) + "..."; })() },
     { key: "models", label: "模型", current: provider.models || "(無)" },
     { key: "pricing", label: "模型定價", current: "（每個模型獨立定價）" },
     { key: "enabled", label: "啟用狀態", current: provider.enabled ? "啟用 (1)" : "停用 (0)" },
@@ -955,7 +958,11 @@ async function editConversation(
     }
   } else {
     // Normal field edit
-    await ctx.reply(`請輸入「${field.label}」的新值：`);
+    if (field.key === "api_key") {
+      await ctx.reply(`請輸入「${field.label}」的新值（可使用 , 分隔多個 API Key）：`);
+    } else {
+      await ctx.reply(`請輸入「${field.label}」的新值：`);
+    }
     ctx = await conversation.wait();
     const newValue = ctx.msg?.text?.trim();
     if (!newValue) {
@@ -963,10 +970,13 @@ async function editConversation(
       return;
     }
 
-    processedValue = newValue;
-
-    if (field.key === "enabled") {
+    if (field.key === "api_key") {
+      // Parse comma-separated → JSON array
+      processedValue = JSON.stringify(newValue.split(",").map((k: string) => k.trim()).filter(Boolean));
+    } else if (field.key === "enabled") {
       processedValue = newValue === "1" ? 1 : 0;
+    } else {
+      processedValue = newValue;
     }
   }
 

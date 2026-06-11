@@ -216,6 +216,27 @@ function createTables(db: SqlJsDatabase): void {
     console.log("[db] Migration complete: openai → openai_chat");
   }
 
+  // Migration: single api_key → JSON array
+  const multiKeyRow = db.exec(
+    "SELECT value FROM settings WHERE key = 'migration_multi_key'"
+  );
+  if (!multiKeyRow.length) {
+    console.log("[db] Running migration: single api_key → JSON array");
+    const providers = db.exec("SELECT id, api_key FROM providers");
+    for (const result of providers) {
+      for (const row of result.values) {
+        const id = row[0] as number;
+        const apiKey = row[1] as string;
+        if (apiKey && !apiKey.startsWith("[")) {
+          const wrapped = JSON.stringify([apiKey]);
+          db.run("UPDATE providers SET api_key = ? WHERE id = ?", [wrapped, id]);
+        }
+      }
+    }
+    db.run("INSERT INTO settings (key, value) VALUES ('migration_multi_key', '1')");
+    console.log("[db] Migration complete: single api_key → JSON array");
+  }
+
   saveDb();
 }
 

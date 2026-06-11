@@ -350,6 +350,27 @@ async def init_db() -> None:
             await db.commit()
             logger.info("Migration complete: openai → openai_chat")
 
+        # Migration: single api_key → JSON array for multi-key support
+        async with db.execute(
+            "SELECT value FROM settings WHERE key = 'migration_multi_key'"
+        ) as cur:
+            row = await cur.fetchone()
+        if not row:
+            logger.info("Running migration: single api_key → JSON array")
+            async with db.execute("SELECT id, api_key FROM providers") as cur:
+                rows = await cur.fetchall()
+            for row in rows:
+                pid, key = row[0], row[1]
+                if not key.startswith("["):
+                    import json
+                    wrapped = json.dumps([key])
+                    await db.execute("UPDATE providers SET api_key = ? WHERE id = ?", (wrapped, pid))
+            await db.execute(
+                "INSERT INTO settings (key, value) VALUES ('migration_multi_key', '1')"
+            )
+            await db.commit()
+            logger.info("Migration complete: %d providers migrated to multi-key format", len(rows))
+
         await db.commit()
 
     # Rebuild provider cache and start usage flush timer

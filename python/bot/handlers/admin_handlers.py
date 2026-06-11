@@ -162,18 +162,28 @@ async def add_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def add_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Receive provider base URL, then ask for API key."""
     context.user_data["new_provider"]["base_url"] = update.message.text.strip()
-    await update.message.reply_text("請輸入 API Key：")
+    await update.message.reply_text("請輸入 API Key（可使用 , 分隔多個 API Key）：")
     return ADD_PROVIDER_KEY
 
 
 async def add_key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Receive provider API key, auto-detect protocols, then ask user to select type."""
-    context.user_data["new_provider"]["api_key"] = update.message.text.strip()
+    """Receive provider API key(s), auto-detect protocols, then ask user to select type."""
+    import json
+    from api.key_selector import get_first_key
+
+    # Parse comma-separated keys → JSON array
+    raw_input = update.message.text.strip()
+    keys = [k.strip() for k in raw_input.split(",") if k.strip()]
+    api_key_json = json.dumps(keys)
+    context.user_data["new_provider"]["api_key"] = api_key_json
+
+    # Use first key for detection and model fetching
+    first_key = keys[0]
     provider = context.user_data["new_provider"]
 
     # Auto-detect supported API protocols (v2: precise status code analysis)
     await update.message.reply_text("🔍 正在偵測 API 端點支持的協議...")
-    detection = await detect_api_protocols(provider["base_url"], provider["api_key"])
+    detection = await detect_api_protocols(provider["base_url"], first_key)
     protocols = detection["protocols"]
     recommended = detection["recommended"]
 
@@ -236,8 +246,10 @@ async def add_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     # Auto-fetch models from provider
     provider = context.user_data["new_provider"]
     await update.message.reply_text("🔍 正在從提供商獲取模型列表...")
+    from api.key_selector import get_first_key
+    first_key = get_first_key(provider["api_key"])
     fetched = await fetch_provider_models(
-        provider["base_url"], provider["api_key"], provider["api_type"]
+        provider["base_url"], first_key, provider["api_type"]
     )
 
     if fetched:
@@ -707,8 +719,10 @@ async def edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if field == "models":
         # Auto-fetch models from provider
         await update.message.reply_text("🔍 正在從提供商獲取模型列表...")
+        from api.key_selector import get_first_key
+        first_key = get_first_key(provider["api_key"])
         fetched = await fetch_provider_models(
-            provider["base_url"], provider["api_key"], provider["api_type"]
+            provider["base_url"], first_key, provider["api_type"]
         )
 
         if fetched:
@@ -796,8 +810,40 @@ async def edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             )
             return EDIT_PROVIDER_PRICE_PER_MODEL
     else:
-        await update.message.reply_text(f"當前值: {provider.get(field, 'N/A')}\n\n請輸入新值：")
+        current = provider.get(field, "N/A")
+        if field == "api_key":
+            # Show key count instead of raw JSON
+            from api.key_selector import parse_api_keys
+            keys = parse_api_keys(current)
+            current_display = f"{len(keys)} 個 API Key（{', '.join(k[:8] + '...' for k in keys)}）"
+            await update.message.reply_text(
+                f"當前值: {current_display}\n\n"
+                "請輸入新的 API Key（可使用 , 分隔多個 API Key）："
+            )
+        else:
+            await update.message.reply_text(f"當前值: {current}\n\n請輸入新值：")
         return EDIT_PROVIDER_VALUE
+
+
+async def edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Receive new value for the editing field and update the provider."""
+    text = update.message.text.strip()
+    field = context.user_data.get("edit_field")
+
+    if field == "api_key":
+        # Parse comma-separated keys → JSON array
+        import json
+        keys = [k.strip() for k in text.replace("，", ",").split(",") if k.strip()]
+        if not keys:
+            await update.message.reply_text("❌ 未輸入有效的 API Key。")
+            return EDIT_PROVIDER_VALUE
+        value = json.dumps(keys)
+    elif field == "enabled":
+        value = text
+    else:
+        value = text
+
+    return await _do_edit_update(update, context, value)
 
 
 async def edit_models_select(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
