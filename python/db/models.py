@@ -89,6 +89,19 @@ CREATE TABLE IF NOT EXISTS coding_configs (
 );
 """
 
+CREATE_TABLE_MODEL_RESTRICTIONS = """
+CREATE TABLE IF NOT EXISTS model_restrictions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    api_key_id INTEGER REFERENCES api_keys(id) ON DELETE CASCADE,
+    mode TEXT NOT NULL CHECK(mode IN ('whitelist', 'blacklist')) DEFAULT 'whitelist',
+    models TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(user_id, api_key_id)
+);
+"""
+
 ALL_TABLES = [
     CREATE_TABLE_PROVIDERS,
     CREATE_TABLE_USERS,
@@ -97,4 +110,5 @@ ALL_TABLES = [
     CREATE_TABLE_SETTINGS,
     CREATE_TABLE_MODEL_PRICES,
     CREATE_TABLE_CODING_CONFIGS,
+    CREATE_TABLE_MODEL_RESTRICTIONS,
 ]

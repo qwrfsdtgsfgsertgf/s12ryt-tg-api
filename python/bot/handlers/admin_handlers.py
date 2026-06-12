@@ -138,6 +138,11 @@ ADMIN_USER_DEL_SELECT = 203
 ADMIN_USER_EDIT_SELECT = 204
 ADMIN_USER_EDIT_INPUT = 205
 ADMIN_USER_RM_KEY_SELECT = 206
+ADMIN_USER_MODEL_RESTRICT = 207
+ADMIN_USER_MODEL_RESTRICT_SUB = 208
+ADMIN_USER_MODEL_RESTRICT_KEY = 209
+ADMIN_USER_MODEL_RESTRICT_INPUT = 210
+ADMIN_USER_MODEL_RESTRICT_DEL = 211
 
 # /provider conversation states (separate unified menu)
 PROVIDER_MENU = 300
@@ -1520,7 +1525,8 @@ _ADMIN_USER_MENU_TEXT = (
     "2. 停用用戶\n"
     "3. 刪除用戶\n"
     "4. 編輯用戶\n"
-    "5. 移除用戶 API Key\n\n"
+    "5. 移除用戶 API Key\n"
+    "6. 模型限制管理\n\n"
     "輸入數字選擇，或輸入 /cancel 離開："
 )
 
@@ -1600,8 +1606,22 @@ async def admin_user_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return ADMIN_USER_RM_KEY_SELECT
 
+    elif text == "6":
+        # Model restriction management - list users to pick
+        users = await database.get_users()
+        if not users:
+            await update.message.reply_text("目前沒有用戶。\n\n" + _ADMIN_USER_MENU_TEXT)
+            return ADMIN_USER_MENU
+
+        context.user_data["admin_user_map"] = {str(i + 1): u for i, u in enumerate(users)}
+        lines = [f"{i + 1}. {u.get('username', '')} (ID: {u['tg_user_id']})" for i, u in enumerate(users)]
+        await update.message.reply_text(
+            "🔒 模型限制管理\n\n請選擇要管理的用戶：\n\n" + "\n".join(lines)
+        )
+        return ADMIN_USER_MODEL_RESTRICT
+
     else:
-        await update.message.reply_text("❌ 無效的選擇，請輸入 1-5：\n\n" + _ADMIN_USER_MENU_TEXT)
+        await update.message.reply_text("❌ 無效的選擇，請輸入 1-6：\n\n" + _ADMIN_USER_MENU_TEXT)
         return ADMIN_USER_MENU
 
 
@@ -1750,12 +1770,215 @@ async def admin_user_rm_key_select(update: Update, context: ContextTypes.DEFAULT
     return ADMIN_USER_MENU
 
 
+async def admin_user_model_restrict(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """User selected a user for model restriction management. Show sub-menu."""
+    from db.database import get_model_restrictions_for_user
+
+    text = update.message.text.strip()
+    users_map: dict = context.user_data.get("admin_user_map", {})
+
+    if text not in users_map:
+        await update.message.reply_text("❌ 無效的選擇，請輸入正確的編號。\n\n" + _ADMIN_USER_MENU_TEXT)
+        return ADMIN_USER_MENU
+
+    user = users_map[text]
+    user_id = user["id"]
+    tg_user_id = user["tg_user_id"]
+    context.user_data["restrict_user_id"] = user_id
+    context.user_data["restrict_tg_user_id"] = tg_user_id
+
+    # Show current restrictions
+    restrictions = await get_model_restrictions_for_user(user_id)
+    info_lines = []
+    for r in restrictions:
+        scope = "用戶級" if r["api_key_id"] is None else f"Key #{r['api_key_id']}"
+        info_lines.append(f"  • [{scope}] 模式: {r['mode']}, 模型: {r['models'] or '(空)'}")
+
+    current_info = "\n".join(info_lines) if info_lines else "  (無)"
+
+    await update.message.reply_text(
+        f"🔒 用戶 {user.get('username', '')} (TG ID: {tg_user_id}) 的模型限制：\n\n"
+        f"{current_info}\n\n"
+        "請選擇操作：\n"
+        "1. 設定用戶級限制\n"
+        "2. 設定 API Key 級限制\n"
+        "3. 刪除限制\n"
+        "4. 返回用戶管理選單"
+    )
+    return ADMIN_USER_MODEL_RESTRICT_SUB
+
+
+async def admin_user_model_restrict_sub(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Process model restriction sub-menu selection."""
+    from db.database import get_keys_by_user
+
+    text = update.message.text.strip()
+    user_id = context.user_data.get("restrict_user_id")
+    tg_user_id = context.user_data.get("restrict_tg_user_id")
+
+    if text == "1":
+        # Set user-level restriction — ask for mode and models
+        await update.message.reply_text(
+            "請輸入限制設定，格式：\n"
+            "whitelist:模型1,模型2,模型3\n"
+            "blacklist:模型1,模型2\n\n"
+            "例如：whitelist:gpt-4o,claude-3.5-sonnet\n"
+            "空白名單 = 白名單模式拒絕所有 / 黑名單模式允許所有"
+        )
+        context.user_data["restrict_scope"] = "user"
+        return ADMIN_USER_MODEL_RESTRICT_INPUT
+
+    elif text == "2":
+        # Set key-level restriction — list user's keys first
+        keys = await get_keys_by_user(tg_user_id)
+        if not keys:
+            await update.message.reply_text("該用戶沒有 API Key。\n\n" + _ADMIN_USER_MENU_TEXT)
+            return ADMIN_USER_MENU
+
+        context.user_data["restrict_keys_map"] = {str(i + 1): k for i, k in enumerate(keys)}
+        lines = [f"{i + 1}. {k['key']}" for i, k in enumerate(keys)]
+        await update.message.reply_text(
+            "請選擇要設定限制的 API Key：\n\n" + "\n".join(lines)
+        )
+        return ADMIN_USER_MODEL_RESTRICT_KEY
+
+    elif text == "3":
+        # Delete restriction — list all restrictions
+        from db.database import get_model_restrictions_for_user
+        restrictions = await get_model_restrictions_for_user(user_id)
+        if not restrictions:
+            await update.message.reply_text("該用戶沒有任何模型限制設定。\n\n" + _ADMIN_USER_MENU_TEXT)
+            return ADMIN_USER_MENU
+
+        context.user_data["restrict_del_map"] = {str(i + 1): r for i, r in enumerate(restrictions)}
+        lines = []
+        for i, r in enumerate(restrictions):
+            scope = "用戶級" if r["api_key_id"] is None else f"Key #{r['api_key_id']}"
+            lines.append(f"{i + 1}. [{scope}] {r['mode']}: {r['models'] or '(空)'}")
+        await update.message.reply_text(
+            "請輸入要刪除的限制編號：\n\n" + "\n".join(lines)
+        )
+        return ADMIN_USER_MODEL_RESTRICT_DEL
+
+    elif text == "4":
+        # Back to main menu
+        context.user_data.pop("restrict_user_id", None)
+        context.user_data.pop("restrict_tg_user_id", None)
+        await update.message.reply_text(_ADMIN_USER_MENU_TEXT)
+        return ADMIN_USER_MENU
+
+    else:
+        await update.message.reply_text("❌ 無效的選擇，請輸入 1-4：")
+        return ADMIN_USER_MODEL_RESTRICT_SUB
+
+
+async def admin_user_model_restrict_key(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """User picked a key for key-level restriction."""
+    text = update.message.text.strip()
+    keys_map: dict = context.user_data.get("restrict_keys_map", {})
+
+    if text not in keys_map:
+        await update.message.reply_text("❌ 無效的選擇，請輸入正確的編號：")
+        return ADMIN_USER_MODEL_RESTRICT_KEY
+
+    key = keys_map[text]
+    context.user_data["restrict_api_key_id"] = key["id"]
+    context.user_data["restrict_scope"] = "key"
+
+    await update.message.reply_text(
+        f"已選擇 Key: {key['key']}\n\n"
+        "請輸入限制設定，格式：\n"
+        "whitelist:模型1,模型2,模型3\n"
+        "blacklist:模型1,模型2\n\n"
+        "例如：blacklist:gpt-3.5-turbo"
+    )
+    return ADMIN_USER_MODEL_RESTRICT_INPUT
+
+
+async def admin_user_model_restrict_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Process mode+models input for model restriction."""
+    from db.database import set_model_restriction
+
+    text = update.message.text.strip()
+    user_id = context.user_data.get("restrict_user_id")
+    scope = context.user_data.get("restrict_scope")
+    api_key_id = context.user_data.get("restrict_api_key_id") if scope == "key" else None
+
+    # Parse "mode:models" format
+    if ":" not in text:
+        await update.message.reply_text("❌ 格式錯誤。請使用 mode:models 格式，例如 whitelist:gpt-4o,claude-3.5-sonnet")
+        return ADMIN_USER_MODEL_RESTRICT_INPUT
+
+    parts = text.split(":", 1)
+    mode = parts[0].strip().lower()
+    models_str = parts[1].strip() if len(parts) > 1 else ""
+
+    if mode not in ("whitelist", "blacklist"):
+        await update.message.reply_text("❌ 模式必須是 whitelist 或 blacklist")
+        return ADMIN_USER_MODEL_RESTRICT_INPUT
+
+    await set_model_restriction(user_id, api_key_id, mode, models_str)
+
+    scope_label = "用戶級" if scope == "user" else f"Key #{api_key_id}"
+    models_display = models_str or "(空)"
+    await update.message.reply_text(
+        f"✅ 已設定 {scope_label} 模型限制：\n"
+        f"模式: {mode}\n"
+        f"模型: {models_display}"
+    )
+
+    # Cleanup and return to main menu
+    context.user_data.pop("restrict_scope", None)
+    context.user_data.pop("restrict_api_key_id", None)
+    context.user_data.pop("restrict_keys_map", None)
+    context.user_data.pop("restrict_user_id", None)
+    context.user_data.pop("restrict_tg_user_id", None)
+    await update.message.reply_text(_ADMIN_USER_MENU_TEXT)
+    return ADMIN_USER_MENU
+
+
+async def admin_user_model_restrict_del(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Process restriction deletion."""
+    from db.database import delete_model_restriction
+
+    text = update.message.text.strip()
+    del_map: dict = context.user_data.get("restrict_del_map", {})
+
+    if text not in del_map:
+        await update.message.reply_text("❌ 無效的選擇，請輸入正確的編號：")
+        return ADMIN_USER_MODEL_RESTRICT_DEL
+
+    restriction = del_map[text]
+    user_id = restriction["user_id"]
+    api_key_id = restriction["api_key_id"]
+
+    success = await delete_model_restriction(user_id, api_key_id)
+    if success:
+        scope_label = "用戶級" if api_key_id is None else f"Key #{api_key_id}"
+        await update.message.reply_text(f"✅ 已刪除 {scope_label} 模型限制。")
+    else:
+        await update.message.reply_text("❌ 刪除失敗。")
+
+    # Cleanup and return to main menu
+    context.user_data.pop("restrict_del_map", None)
+    context.user_data.pop("restrict_user_id", None)
+    context.user_data.pop("restrict_tg_user_id", None)
+    await update.message.reply_text(_ADMIN_USER_MENU_TEXT)
+    return ADMIN_USER_MENU
+
+
 async def admin_user_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Cancel admin_user conversation."""
     await update.message.reply_text("👋 已離開用戶管理。")
     context.user_data.pop("admin_user_map", None)
     context.user_data.pop("admin_user_keys_map", None)
     context.user_data.pop("editing_user", None)
+    context.user_data.pop("restrict_user_id", None)
+    context.user_data.pop("restrict_tg_user_id", None)
+    context.user_data.pop("restrict_scope", None)
+    context.user_data.pop("restrict_api_key_id", None)
+    context.user_data.pop("restrict_keys_map", None)
+    context.user_data.pop("restrict_del_map", None)
     return ConversationHandler.END
 
 
@@ -1827,6 +2050,11 @@ def register_admin_handlers(app):
             ADMIN_USER_EDIT_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_user_edit_select)],
             ADMIN_USER_EDIT_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_user_edit_input)],
             ADMIN_USER_RM_KEY_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_user_rm_key_select)],
+            ADMIN_USER_MODEL_RESTRICT: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_user_model_restrict)],
+            ADMIN_USER_MODEL_RESTRICT_SUB: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_user_model_restrict_sub)],
+            ADMIN_USER_MODEL_RESTRICT_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_user_model_restrict_key)],
+            ADMIN_USER_MODEL_RESTRICT_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_user_model_restrict_input)],
+            ADMIN_USER_MODEL_RESTRICT_DEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_user_model_restrict_del)],
         },
         fallbacks=[CommandHandler("cancel", admin_user_cancel)],
     )

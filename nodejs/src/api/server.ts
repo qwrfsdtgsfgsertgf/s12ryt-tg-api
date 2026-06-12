@@ -25,7 +25,8 @@ import {
   convertChatCompletionToAnthropic,
   streamAnthropicApi,
 } from "./anthropic_out.js";
-import { getProviders, lookupModelCached, rebuildProviderCache, onProviderCacheRebuild, type Provider, getActiveCodingForApiKey, incrementCodingSessionStats } from "../db/database.js";
+import { getProviders, lookupModelCached, rebuildProviderCache, onProviderCacheRebuild, type Provider, getActiveCodingForApiKey, incrementCodingSessionStats, checkModelAllowed, getAllowedModels, getUserByTgId } from "../db/database.js";
+import { config } from "../config.js";
 
 // ---------------------------------------------------------------------------
 // App setup
@@ -265,6 +266,29 @@ onProviderCacheRebuild(() => { cachedModelList = null; });
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
+// Model restriction helper
+// ---------------------------------------------------------------------------
+
+/**
+ * Check if the requested model is allowed for the authenticated user/apiKey.
+ * Returns true if allowed (or no auth), false if denied.
+ * For coding-mode, always allow (the fallback chain handles individual model checks).
+ */
+function isModelAllowedForRequest(
+  auth: { userId: string; apiKeyId: string; tgUserId: number } | undefined,
+  modelName: string,
+): boolean {
+  if (!auth) return true; // no auth → public paths only (middleware handles this)
+  if (modelName === "coding-mode") return true; // coding-mode handled by fallback
+
+  const userId = parseInt(auth.userId, 10);
+  const apiKeyId = parseInt(auth.apiKeyId, 10);
+  const isAdmin = auth.tgUserId === config.ADMIN_ID;
+
+  return checkModelAllowed(userId, apiKeyId, modelName, isAdmin);
+}
+
+// ---------------------------------------------------------------------------
 // Streaming helper: forward SSE chunks while extracting usage from the last chunk
 // ---------------------------------------------------------------------------
 
@@ -390,9 +414,30 @@ app.get("/health", (_req: Request, res: Response) => {
   res.json({ status: "ok" });
 });
 
-app.get("/v1/models", (_req: Request, res: Response) => {
-  const models = getAllModelsFromDb();
-  res.json({ object: "list", data: models });
+app.get("/v1/models", (req: Request, res: Response) => {
+  const allModels = getAllModelsFromDb();
+
+  // Filter models based on auth + model restrictions
+  const auth = req.auth;
+  if (auth) {
+    const userId = parseInt(auth.userId, 10);
+    const apiKeyId = parseInt(auth.apiKeyId, 10);
+    const isAdmin = auth.tgUserId === config.ADMIN_ID;
+
+    const allModelNames = allModels.map((m) => m.id);
+    const allowedNames = new Set(getAllowedModels(userId, apiKeyId, allModelNames, isAdmin));
+
+    // Always include coding-mode virtual model if user has any models allowed
+    if (allowedNames.size > 0 || isAdmin) {
+      allowedNames.add("coding-mode");
+    }
+
+    const filteredModels = allModels.filter((m) => allowedNames.has(m.id));
+    res.json({ object: "list", data: filteredModels });
+  } else {
+    // No auth → return all (shouldn't happen since middleware blocks unauthenticated)
+    res.json({ object: "list", data: allModels });
+  }
 });
 
 app.post(
@@ -407,6 +452,14 @@ app.post(
       if (!modelName) {
         res.status(400).json({
           error: { message: "model is required", type: "invalid_request_error" },
+        });
+        return;
+      }
+
+      // Check model restriction
+      if (!isModelAllowedForRequest(req.auth, modelName)) {
+        res.status(403).json({
+          error: { message: `Model '${modelName}' is not allowed for this API key`, type: "permission_error" },
         });
         return;
       }
@@ -545,6 +598,14 @@ app.post(
       if (input === undefined || input === null) {
         res.status(400).json({
           error: { message: "input is required", type: "invalid_request_error" },
+        });
+        return;
+      }
+
+      // Check model restriction
+      if (!isModelAllowedForRequest(req.auth, modelName)) {
+        res.status(403).json({
+          error: { message: `Model '${modelName}' is not allowed for this API key`, type: "permission_error" },
         });
         return;
       }
@@ -834,6 +895,15 @@ app.post(
         res.status(400).json({
           type: "error",
           error: { type: "invalid_request_error", message: "model is required" },
+        });
+        return;
+      }
+
+      // Check model restriction
+      if (!isModelAllowedForRequest(req.auth, modelName)) {
+        res.status(403).json({
+          type: "error",
+          error: { type: "permission_error", message: `Model '${modelName}' is not allowed for this API key` },
         });
         return;
       }

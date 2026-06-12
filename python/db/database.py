@@ -1018,3 +1018,173 @@ async def reset_coding_session_stats(user_id: int) -> None:
             (user_id,),
         )
         await db.commit()
+
+
+# ============================================================
+# Model Restrictions CRUD
+# ============================================================
+
+
+def _normalize_models(models_str: str) -> list[str]:
+    """Normalize comma-separated model names into a sorted list."""
+    return sorted(m.strip() for m in models_str.split(",") if m.strip())
+
+
+async def get_model_restriction(user_id: int, api_key_id: int | None = None) -> dict | None:
+    """Get a single model restriction by user_id and api_key_id.
+
+    api_key_id=None means user-level restriction.
+    """
+    async with await get_connection() as db:
+        if api_key_id is None:
+            cursor = await db.execute(
+                "SELECT * FROM model_restrictions WHERE user_id = ? AND api_key_id IS NULL",
+                (user_id,),
+            )
+        else:
+            cursor = await db.execute(
+                "SELECT * FROM model_restrictions WHERE user_id = ? AND api_key_id = ?",
+                (user_id, api_key_id),
+            )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+
+async def get_model_restrictions_for_user(user_id: int) -> list[dict]:
+    """Get all model restrictions for a user (user-level first, then key-level)."""
+    async with await get_connection() as db:
+        cursor = await db.execute(
+            "SELECT * FROM model_restrictions WHERE user_id = ? ORDER BY api_key_id IS NULL DESC, api_key_id ASC",
+            (user_id,),
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+
+async def set_model_restriction(
+    user_id: int,
+    api_key_id: int | None,
+    mode: str,
+    models: str,
+) -> dict:
+    """Create or update a model restriction. mode: 'whitelist' or 'blacklist'."""
+    normalized = ",".join(_normalize_models(models))
+    now = datetime.now(timezone.utc).isoformat()
+
+    async with await get_connection() as db:
+        # Check existing
+        if api_key_id is None:
+            cursor = await db.execute(
+                "SELECT id FROM model_restrictions WHERE user_id = ? AND api_key_id IS NULL",
+                (user_id,),
+            )
+        else:
+            cursor = await db.execute(
+                "SELECT id FROM model_restrictions WHERE user_id = ? AND api_key_id = ?",
+                (user_id, api_key_id),
+            )
+        existing = await cursor.fetchone()
+
+        if existing:
+            await db.execute(
+                """
+                UPDATE model_restrictions
+                SET mode = ?, models = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (mode, normalized, now, existing["id"]),
+            )
+        else:
+            await db.execute(
+                """
+                INSERT INTO model_restrictions (user_id, api_key_id, mode, models, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (user_id, api_key_id, mode, normalized, now, now),
+            )
+        await db.commit()
+
+    # Return the upserted record
+    result = await get_model_restriction(user_id, api_key_id)
+    return result or {}
+
+
+async def delete_model_restriction(user_id: int, api_key_id: int | None) -> bool:
+    """Delete a model restriction by user_id and api_key_id."""
+    async with await get_connection() as db:
+        if api_key_id is None:
+            cursor = await db.execute(
+                "DELETE FROM model_restrictions WHERE user_id = ? AND api_key_id IS NULL",
+                (user_id,),
+            )
+        else:
+            cursor = await db.execute(
+                "DELETE FROM model_restrictions WHERE user_id = ? AND api_key_id = ?",
+                (user_id, api_key_id),
+            )
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+def _apply_restriction(model_name: str, mode: str, models_list: list[str]) -> bool:
+    """Apply a single restriction to a model name.
+
+    whitelist: allow only if model is in the list
+    blacklist: deny if model is in the list
+    Empty list: whitelist → deny all, blacklist → allow all
+    """
+    if mode == "whitelist":
+        return model_name in models_list if models_list else False
+    else:  # blacklist
+        return model_name not in models_list if models_list else True
+
+
+async def check_model_allowed(user_id: int, api_key_id: int | None, model_name: str, is_admin: bool = False) -> bool:
+    """Check if a model is allowed for the given user/key combination.
+
+    Logic:
+    1. If key-level restriction exists → apply it (even for admin)
+    2. Else if user-level restriction exists → apply it (admin bypasses user-level)
+    3. No restriction → deny for non-admin, allow for admin
+    """
+    # Check key-level first
+    key_restriction = await get_model_restriction(user_id, api_key_id) if api_key_id else None
+    if key_restriction:
+        models_list = _normalize_models(key_restriction.get("models", ""))
+        return _apply_restriction(model_name, key_restriction["mode"], models_list)
+
+    # Check user-level
+    user_restriction = await get_model_restriction(user_id)
+    if user_restriction:
+        if is_admin:
+            return True  # Admin bypasses user-level restriction
+        models_list = _normalize_models(user_restriction.get("models", ""))
+        return _apply_restriction(model_name, user_restriction["mode"], models_list)
+
+    # No restriction → admin allowed, non-admin denied
+    return is_admin
+
+
+async def get_allowed_models(
+    user_id: int,
+    api_key_id: int | None,
+    all_models: list[str],
+    is_admin: bool = False,
+) -> list[str]:
+    """Get the list of allowed models for a user/key, mirroring check_model_allowed logic."""
+    # Key-level
+    key_restriction = await get_model_restriction(user_id, api_key_id) if api_key_id else None
+    if key_restriction:
+        models_list = _normalize_models(key_restriction.get("models", ""))
+        return [m for m in all_models if _apply_restriction(m, key_restriction["mode"], models_list)]
+
+    # User-level
+    user_restriction = await get_model_restriction(user_id)
+    if user_restriction:
+        if is_admin:
+            return list(all_models)  # Admin bypasses
+        models_list = _normalize_models(user_restriction.get("models", ""))
+        return [m for m in all_models if _apply_restriction(m, user_restriction["mode"], models_list)]
+
+    # No restriction → admin gets all, non-admin gets nothing
+    return list(all_models) if is_admin else []

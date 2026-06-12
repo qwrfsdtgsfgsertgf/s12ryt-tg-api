@@ -20,6 +20,13 @@ import {
   setSetting,
   batchUpsertModelPrices,
   getModelPricesByProvider,
+  getKeysByUser,
+  getUserByTgId,
+  getModelRestrictionsForUser,
+  getModelRestriction,
+  setModelRestriction,
+  deleteModelRestriction,
+  getAllCachedModelNames,
   type Provider,
   type User,
   type ApiKey,
@@ -1112,7 +1119,8 @@ const ADMIN_USER_MENU_TEXT =
   "2. 停用用戶\n" +
   "3. 刪除用戶\n" +
   "4. 編輯用戶 TG ID\n" +
-  "5. 移除用戶 API Key\n\n" +
+  "5. 移除用戶 API Key\n" +
+  "6. 模型限制管理\n\n" +
   "請輸入編號選擇操作（/cancel 結束）：";
 
 async function adminUserConversation(
@@ -1288,8 +1296,184 @@ async function adminUserConversation(
       continue;
     }
 
+    if (choice === "6") {
+      // ── 模型限制管理 ──
+      const users = getUsers(config.ADMIN_ID);
+      if (users.length === 0) {
+        await ctx.reply("📭 沒有可管理的使用者。");
+        continue;
+      }
+      const lines = users.map(
+        (u, i) =>
+          `${i + 1}. ${u.username ? "@" + u.username : "無名"} (TG: ${u.tg_user_id}) — ${u.is_active ? "✅" : "⛔"}`
+      );
+      await ctx.reply(
+        `📋 請選擇要管理模型限制的使用者（輸入編號）：\n\n${lines.join("\n")}`
+      );
+      ctx = await conversation.wait();
+      const userIndex = parseInt(ctx.msg?.text?.trim() ?? "", 10);
+      const selectedUser = users[userIndex - 1];
+      if (!selectedUser) {
+        await ctx.reply("❌ 無效的選擇。");
+        continue;
+      }
+
+      // Show current restrictions for this user
+      const restrictions = getModelRestrictionsForUser(selectedUser.id);
+      const userKeys = getKeysByUser(selectedUser.id);
+      let infoMsg = `📋 用戶 ${selectedUser.username ? "@" + selectedUser.username : selectedUser.tg_user_id} 的模型限制：\n\n`;
+
+      // User-level restriction
+      const userRestriction = restrictions.find((r) => r.api_key_id === null);
+      if (userRestriction) {
+        infoMsg += `🔹 用戶級別：模式=${userRestriction.mode}，模型=${userRestriction.models || "(空)"}\n`;
+      } else {
+        infoMsg += `🔹 用戶級別：未設定（預設拒絕所有模型）\n`;
+      }
+
+      // Key-level restrictions
+      for (const key of userKeys) {
+        const keyRestriction = restrictions.find((r) => r.api_key_id === key.id);
+        const keyLabel = `sk-...${key.key.slice(-6)}`;
+        if (keyRestriction) {
+          infoMsg += `🔸 Key ${keyLabel}：模式=${keyRestriction.mode}，模型=${keyRestriction.models || "(空)"}\n`;
+        } else {
+          infoMsg += `🔸 Key ${keyLabel}：未設定（繼承用戶級別）\n`;
+        }
+      }
+
+      infoMsg += `\n請選擇操作：\n1. 設定用戶級別限制\n2. 設定 API Key 級別限制\n3. 刪除限制\n4. 返回`;
+
+      await ctx.reply(infoMsg);
+      ctx = await conversation.wait();
+      const subChoice = ctx.msg?.text?.trim() ?? "";
+
+      if (subChoice === "4" || subChoice === "/cancel") {
+        continue;
+      }
+
+      if (subChoice === "1") {
+        // Set user-level restriction
+        await ctx.reply(
+          `請輸入模式（whitelist=白名單 / blacklist=黑名單）：`
+        );
+        ctx = await conversation.wait();
+        const mode = ctx.msg?.text?.trim().toLowerCase() ?? "";
+        if (mode !== "whitelist" && mode !== "blacklist") {
+          await ctx.reply("❌ 無效的模式，請輸入 whitelist 或 blacklist。");
+          continue;
+        }
+
+        const allModels = getAllCachedModelNames();
+        await ctx.reply(
+          `📋 可用模型（共 ${allModels.length} 個）：\n${allModels.join(", ")}\n\n` +
+          `請輸入模型名稱（逗號分隔），或輸入 * 表示所有模型：`
+        );
+        ctx = await conversation.wait();
+        const modelInput = ctx.msg?.text?.trim() ?? "";
+        const models = modelInput === "*" ? allModels.join(",") : modelInput;
+
+        try {
+          setModelRestriction(selectedUser.id, null, mode as "whitelist" | "blacklist", models);
+          await ctx.reply("✅ 已設定用戶級別模型限制。");
+        } catch (err) {
+          await ctx.reply(`❌ 設定失敗：${(err as Error).message}`);
+        }
+        continue;
+      }
+
+      if (subChoice === "2") {
+        // Set key-level restriction
+        if (userKeys.length === 0) {
+          await ctx.reply("📭 該使用者沒有 API Key。");
+          continue;
+        }
+        const keyLines = userKeys.map(
+          (k, i) => `${i + 1}. sk-...${k.key.slice(-6)} ${k.is_active ? "✅" : "⛔"}`
+        );
+        await ctx.reply(`請選擇 API Key：\n\n${keyLines.join("\n")}`);
+        ctx = await conversation.wait();
+        const keyIndex = parseInt(ctx.msg?.text?.trim() ?? "", 10);
+        const selectedKey = userKeys[keyIndex - 1];
+        if (!selectedKey) {
+          await ctx.reply("❌ 無效的選擇。");
+          continue;
+        }
+
+        await ctx.reply(
+          `請輸入模式（whitelist=白名單 / blacklist=黑名單）：`
+        );
+        ctx = await conversation.wait();
+        const mode = ctx.msg?.text?.trim().toLowerCase() ?? "";
+        if (mode !== "whitelist" && mode !== "blacklist") {
+          await ctx.reply("❌ 無效的模式，請輸入 whitelist 或 blacklist。");
+          continue;
+        }
+
+        const allModels = getAllCachedModelNames();
+        await ctx.reply(
+          `📋 可用模型（共 ${allModels.length} 個）：\n${allModels.join(", ")}\n\n` +
+          `請輸入模型名稱（逗號分隔），或輸入 * 表示所有模型：`
+        );
+        ctx = await conversation.wait();
+        const modelInput = ctx.msg?.text?.trim() ?? "";
+        const models = modelInput === "*" ? allModels.join(",") : modelInput;
+
+        try {
+          setModelRestriction(selectedUser.id, selectedKey.id, mode as "whitelist" | "blacklist", models);
+          await ctx.reply("✅ 已設定 API Key 級別模型限制。");
+        } catch (err) {
+          await ctx.reply(`❌ 設定失敗：${(err as Error).message}`);
+        }
+        continue;
+      }
+
+      if (subChoice === "3") {
+        // Delete restriction
+        const deleteOpts: string[] = [];
+        const deleteTargets: Array<{ apiKeyId: number | null; label: string }> = [];
+
+        const userRestriction = restrictions.find((r) => r.api_key_id === null);
+        if (userRestriction) {
+          deleteTargets.push({ apiKeyId: null, label: "用戶級別限制" });
+          deleteOpts.push(`${deleteOpts.length + 1}. 用戶級別限制`);
+        }
+        for (let i = 0; i < userKeys.length; i++) {
+          const k = userKeys[i];
+          const keyRestriction = restrictions.find((r) => r.api_key_id === k.id);
+          if (keyRestriction) {
+            deleteTargets.push({ apiKeyId: k.id, label: `Key sk-...${k.key.slice(-6)}` });
+            deleteOpts.push(`${deleteOpts.length + 1}. Key sk-...${k.key.slice(-6)}`);
+          }
+        }
+        if (deleteOpts.length === 0) {
+          await ctx.reply("📭 沒有可刪除的限制。");
+          continue;
+        }
+        await ctx.reply(`請選擇要刪除的限制：\n\n${deleteOpts.join("\n")}`);
+        ctx = await conversation.wait();
+        const delIndex = parseInt(ctx.msg?.text?.trim() ?? "", 10);
+        if (delIndex < 1 || delIndex > deleteOpts.length) {
+          await ctx.reply("❌ 無效的選擇。");
+          continue;
+        }
+
+        const target = deleteTargets[delIndex - 1];
+        try {
+          deleteModelRestriction(selectedUser.id, target.apiKeyId);
+          await ctx.reply(`✅ 已刪除模型限制（${target.label}）。`);
+        } catch (err) {
+          await ctx.reply(`❌ 刪除失敗：${(err as Error).message}`);
+        }
+        continue;
+      }
+
+      await ctx.reply("❌ 無效的選擇。");
+      continue;
+    }
+
     // Invalid choice
-    await ctx.reply("❌ 請輸入 1-5 選擇操作，或 /cancel 結束。");
+    await ctx.reply("❌ 請輸入 1-6 選擇操作，或 /cancel 結束。");
   }
 }
 

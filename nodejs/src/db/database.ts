@@ -176,6 +176,22 @@ function createTables(db: SqlJsDatabase): void {
     }
   }
 
+  db.run(`
+    CREATE TABLE IF NOT EXISTS model_restrictions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      api_key_id INTEGER REFERENCES api_keys(id) ON DELETE CASCADE,
+      mode TEXT NOT NULL CHECK(mode IN ('whitelist', 'blacklist')) DEFAULT 'whitelist',
+      models TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(user_id, api_key_id)
+    );
+  `);
+
+  // Index for fast lookup
+  db.run(`CREATE INDEX IF NOT EXISTS idx_model_restrictions_user ON model_restrictions(user_id, api_key_id)`);
+
   // Migration: openai → openai_chat (split api_type)
   const migrationRow = db.exec(
     "SELECT value FROM settings WHERE key = 'migration_openai_split'"
@@ -1182,4 +1198,196 @@ export function resetCodingSessionStats(userId: number): void {
      WHERE user_id = ?`,
     [userId]
   );
+}
+
+// ===========================================================================
+// Model Restrictions (per user / per API key)
+// ===========================================================================
+
+export interface ModelRestriction {
+  id: number;
+  user_id: number;
+  api_key_id: number | null;
+  mode: "whitelist" | "blacklist";
+  models: string;       // comma-separated
+  created_at: string;
+  updated_at: string;
+}
+
+/**
+ * Get model restriction for a specific user or API key.
+ * api_key_id = null → user-level; api_key_id = number → key-level.
+ */
+export function getModelRestriction(
+  userId: number,
+  apiKeyId: number | null,
+): ModelRestriction | null {
+  if (apiKeyId !== null) {
+    return queryOne(
+      "SELECT * FROM model_restrictions WHERE user_id = ? AND api_key_id = ?",
+      [userId, apiKeyId],
+    ) as unknown as ModelRestriction | null;
+  }
+  return queryOne(
+    "SELECT * FROM model_restrictions WHERE user_id = ? AND api_key_id IS NULL",
+    [userId],
+  ) as unknown as ModelRestriction | null;
+}
+
+/**
+ * Get ALL restrictions for a user (both user-level and key-level).
+ */
+export function getModelRestrictionsForUser(
+  userId: number,
+): ModelRestriction[] {
+  return queryAll(
+    "SELECT * FROM model_restrictions WHERE user_id = ? ORDER BY api_key_id IS NULL DESC, api_key_id ASC",
+    [userId],
+  ) as unknown as ModelRestriction[];
+}
+
+/**
+ * Set (upsert) model restriction.
+ * mode: 'whitelist' = only these models allowed; 'blacklist' = these models blocked.
+ */
+export function setModelRestriction(
+  userId: number,
+  apiKeyId: number | null,
+  mode: "whitelist" | "blacklist",
+  models: string,
+): void {
+  const modelsStr = models
+    .split(",")
+    .map((m) => m.trim())
+    .filter(Boolean)
+    .join(",");
+
+  const existing = getModelRestriction(userId, apiKeyId);
+  if (existing) {
+    runSql(
+      `UPDATE model_restrictions SET mode = ?, models = ?, updated_at = datetime('now') WHERE id = ?`,
+      [mode, modelsStr, existing.id],
+    );
+  } else {
+    runSql(
+      `INSERT INTO model_restrictions (user_id, api_key_id, mode, models) VALUES (?, ?, ?, ?)`,
+      [userId, apiKeyId, mode, modelsStr],
+    );
+  }
+}
+
+/**
+ * Delete a model restriction.
+ */
+export function deleteModelRestriction(
+  userId: number,
+  apiKeyId: number | null,
+): boolean {
+  const existing = getModelRestriction(userId, apiKeyId);
+  if (!existing) return false;
+  runSql("DELETE FROM model_restrictions WHERE id = ?", [existing.id]);
+  return true;
+}
+
+/**
+ * Check if a specific model is allowed for the given user/apiKey.
+ * Returns true if allowed, false if denied.
+ *
+ * Logic:
+ * 1. If apiKeyId is provided, check key-level restriction first.
+ *    - If key-level exists → apply it (ignore user-level).
+ * 2. If no key-level, check user-level restriction.
+ *    - If user-level exists → apply it.
+ * 3. If no restriction at all → default deny (return false) for non-admin.
+ *
+ * For admin users (tgUserId matches ADMIN_ID), skip user-level restrictions
+ * but still apply key-level if set.
+ */
+export function checkModelAllowed(
+  userId: number,
+  apiKeyId: number | null,
+  modelName: string,
+  isAdmin: boolean,
+): boolean {
+  // 1. Try key-level restriction (always applies, even for admin)
+  if (apiKeyId !== null) {
+    const keyRestriction = getModelRestriction(userId, apiKeyId);
+    if (keyRestriction) {
+      return applyRestriction(keyRestriction, modelName);
+    }
+  }
+
+  // 2. Admin bypasses user-level restrictions
+  if (isAdmin) return true;
+
+  // 3. Check user-level restriction
+  const userRestriction = getModelRestriction(userId, null);
+  if (userRestriction) {
+    return applyRestriction(userRestriction, modelName);
+  }
+
+  // 4. No restriction found → default deny for non-admin
+  return false;
+}
+
+function applyRestriction(
+  restriction: ModelRestriction,
+  modelName: string,
+): boolean {
+  const models = restriction.models.split(",").map((m) => m.trim()).filter(Boolean);
+  if (models.length === 0) return false; // empty list → deny all
+
+  if (restriction.mode === "whitelist") {
+    return models.includes(modelName);
+  } else {
+    // blacklist
+    return !models.includes(modelName);
+  }
+}
+
+/**
+ * Get the list of allowed models for a user/apiKey from the full model list.
+ * Used by /v1/models endpoint.
+ */
+export function getAllowedModels(
+  userId: number,
+  apiKeyId: number | null,
+  allModels: string[],
+  isAdmin: boolean,
+): string[] {
+  // 1. Try key-level restriction
+  if (apiKeyId !== null) {
+    const keyRestriction = getModelRestriction(userId, apiKeyId);
+    if (keyRestriction) {
+      return filterModelsByRestriction(keyRestriction, allModels);
+    }
+  }
+
+  // 2. Admin bypasses user-level
+  if (isAdmin) return allModels;
+
+  // 3. User-level restriction
+  const userRestriction = getModelRestriction(userId, null);
+  if (userRestriction) {
+    return filterModelsByRestriction(userRestriction, allModels);
+  }
+
+  // 4. No restriction → deny all for non-admin
+  return [];
+}
+
+function filterModelsByRestriction(
+  restriction: ModelRestriction,
+  allModels: string[],
+): string[] {
+  const restrictedModels = new Set(
+    restriction.models.split(",").map((m) => m.trim()).filter(Boolean),
+  );
+  if (restrictedModels.size === 0) return [];
+
+  if (restriction.mode === "whitelist") {
+    return allModels.filter((m) => restrictedModels.has(m));
+  } else {
+    return allModels.filter((m) => !restrictedModels.has(m));
+  }
 }

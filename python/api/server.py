@@ -17,6 +17,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from .middleware import AuthMiddleware
 from . import providers as prov
 from .usage_tracker import extract_usage, calculate_cost, record_usage
+from config import Config
 from .responses import (
     convert_responses_input_to_messages,
     convert_chat_completion_to_responses,
@@ -97,6 +98,37 @@ PROVIDER_MODULES = {
     "anthropic": prov.anthropic,
     "google": prov.google,
 }
+
+
+# ---------------------------------------------------------------------------
+# Model restriction helpers
+# ---------------------------------------------------------------------------
+
+async def _is_model_allowed_for_request(request: Request, model_name: str) -> bool:
+    """Check if the requested model is allowed based on auth & restrictions.
+
+    Returns True for:
+    - No auth (public endpoints)
+    - coding-mode (virtual model)
+    - Model passes restriction check
+    """
+    user_id = getattr(request.state, "user_id", None)
+    api_key_id = getattr(request.state, "api_key_id", None)
+
+    # No auth or coding-mode → always allowed
+    if not user_id or not api_key_id:
+        return True
+    if model_name == "coding-mode":
+        return True
+
+    # Look up user to determine admin status
+    from db.database import get_user_by_id, check_model_allowed
+    user = await get_user_by_id(user_id)
+    if not user:
+        return False
+    is_admin = (user["tg_user_id"] == Config.ADMIN_ID)
+
+    return await check_model_allowed(user_id, api_key_id, model_name, is_admin)
 
 
 # ---------------------------------------------------------------------------
@@ -426,10 +458,25 @@ async def health():
 @app.get("/v1/models")
 async def list_models(request: Request):
     """List all available models aggregated from enabled providers (cached).
-    Always includes 'coding-mode' virtual model."""
-    from db.database import get_provider_cache
+    Always includes 'coding-mode' virtual model. Filters by model restrictions if auth present."""
+    from db.database import get_provider_cache, get_user_by_id, get_allowed_models
 
     cache = get_provider_cache()
+    all_model_names = list(cache.keys())
+
+    # Check auth for model restriction filtering
+    user_id = getattr(request.state, "user_id", None)
+    api_key_id = getattr(request.state, "api_key_id", None)
+
+    if user_id and api_key_id:
+        # Determine admin status
+        user = await get_user_by_id(user_id)
+        is_admin = bool(user and user["tg_user_id"] == Config.ADMIN_ID)
+        allowed = await get_allowed_models(user_id, api_key_id, all_model_names, is_admin)
+        allowed_set = set(allowed)
+    else:
+        allowed_set = set(all_model_names)  # No auth → show all
+
     models: list[dict[str, Any]] = []
 
     # Always include the coding-mode virtual model
@@ -441,12 +488,13 @@ async def list_models(request: Request):
     })
 
     for model_name, cached in cache.items():
-        models.append({
-            "id": model_name,
-            "object": "model",
-            "created": int(time.time()),
-            "owned_by": cached.provider_type,
-        })
+        if model_name in allowed_set:
+            models.append({
+                "id": model_name,
+                "object": "model",
+                "created": int(time.time()),
+                "owned_by": cached.provider_type,
+            })
 
     return {"object": "list", "data": models}
 
@@ -472,6 +520,13 @@ async def chat_completions(request: Request):
         return JSONResponse(
             status_code=400,
             content={"error": {"message": "model is required", "type": "invalid_request_error"}},
+        )
+
+    # Model restriction check
+    if not await _is_model_allowed_for_request(request, model_name):
+        return JSONResponse(
+            status_code=403,
+            content={"error": {"message": f"Model '{model_name}' is not allowed for this API key", "type": "permission_error"}},
         )
 
     original_model = model_name  # remember for coding-mode detection
@@ -578,6 +633,13 @@ async def responses_endpoint(request: Request):
         return JSONResponse(
             status_code=400,
             content={"error": {"message": "model is required", "type": "invalid_request_error"}},
+        )
+
+    # Model restriction check
+    if not await _is_model_allowed_for_request(request, model_name):
+        return JSONResponse(
+            status_code=403,
+            content={"error": {"message": f"Model '{model_name}' is not allowed for this API key", "type": "permission_error"}},
         )
 
     original_model = model_name  # remember for coding-mode detection
@@ -820,6 +882,13 @@ async def anthropic_messages_endpoint(request: Request):
         return JSONResponse(
             status_code=400,
             content={"type": "error", "error": {"type": "invalid_request_error", "message": "model is required"}},
+        )
+
+    # Model restriction check
+    if not await _is_model_allowed_for_request(request, model_name):
+        return JSONResponse(
+            status_code=403,
+            content={"type": "error", "error": {"type": "permission_error", "message": f"Model '{model_name}' is not allowed for this API key"}},
         )
 
     original_model = model_name  # remember for coding-mode detection
