@@ -171,6 +171,12 @@ vi.mock("../src/db/database.js", () => {
       dailyCostLimit: 0, monthlyCostLimit: 0,
       expiresAt: 0,
     })),
+    getCachedEffectiveLimits: vi.fn(() => ({
+      rpm: 0, tpm: 0, concurrency: 0,
+      dailyTokenLimit: 0, monthlyTokenLimit: 0,
+      dailyCostLimit: 0, monthlyCostLimit: 0,
+      expiresAt: 0,
+    })),
     getDailyUsage: vi.fn(() => ({ totalTokens: 0, totalCost: 0 })),
     getMonthlyUsage: vi.fn(() => ({ totalTokens: 0, totalCost: 0 })),
   };

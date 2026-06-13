@@ -321,6 +321,14 @@ function createTables(db: SqlJsDatabase): void {
     console.log("[db] Migration complete: single api_key → JSON array");
   }
 
+  // -------------------------------------------------------------------------
+  // Performance indexes — speeds up quota queries (hottest path: per-request)
+  // -------------------------------------------------------------------------
+  db.run(`CREATE INDEX IF NOT EXISTS idx_usage_api_key_created ON usage(api_key_id, created_at)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_usage_created_at ON usage(created_at)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_api_keys_user_id ON api_keys(user_id)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_users_group_id ON users(group_id)`);
+
   saveDb();
 }
 
@@ -1566,6 +1574,7 @@ export function addUserGroup(data: UserGroupInput): void {
       data.monthly_cost_limit ?? 0,
     ] as SqlValue[]
   );
+  invalidateEffectiveLimitsCache();
 }
 
 export function updateUserGroup(id: number, data: Partial<UserGroupInput>): void {
@@ -1590,6 +1599,7 @@ export function updateUserGroup(id: number, data: Partial<UserGroupInput>): void
   values.push(id);
 
   runSql(`UPDATE user_groups SET ${fields.join(", ")} WHERE id = ?`, values);
+  invalidateEffectiveLimitsCache();
 }
 
 export function deleteUserGroup(id: number): void {
@@ -1604,6 +1614,7 @@ export function deleteUserGroup(id: number): void {
     runSql("UPDATE users SET group_id = ? WHERE group_id = ?", [defaultGroup.id, id]);
   }
   runSql("DELETE FROM user_groups WHERE id = ?", [id]);
+  invalidateEffectiveLimitsCache();
 }
 
 // --- User limits management ---
@@ -1614,6 +1625,7 @@ export function getUserWithLimits(id: number): UserWithLimits | undefined {
 
 export function setUserGroup(userId: number, groupId: number): void {
   runSql("UPDATE users SET group_id = ? WHERE id = ?", [groupId, userId]);
+  invalidateEffectiveLimitsCache(userId);
 }
 
 export interface UserOverridesInput {
@@ -1647,6 +1659,7 @@ export function setUserOverrides(userId: number, overrides: UserOverridesInput):
   values.push(userId);
 
   runSql(`UPDATE users SET ${fields.join(", ")} WHERE id = ?`, values);
+  invalidateEffectiveLimitsCache(userId);
 }
 
 // --- API Key limits management ---
@@ -1686,6 +1699,8 @@ export function setApiKeyOverrides(apiKeyId: number, overrides: ApiKeyOverridesI
   values.push(apiKeyId);
 
   runSql(`UPDATE api_keys SET ${fields.join(", ")} WHERE id = ?`, values);
+  // API key overrides affect any user that holds this key — clear entire cache
+  invalidateEffectiveLimitsCache();
 }
 
 // --- Effective limits calculation ---
@@ -1708,32 +1723,99 @@ function pickLimit(
 /**
  * Calculate effective limits for a given user + API key.
  * Priority: apiKey override > user override > user group limit > 0 (unlimited).
+ *
+ * Uses a single JOIN query instead of 3 separate SELECTs.
  */
 export function getEffectiveLimits(userId: number, apiKeyId: number | null): EffectiveLimits {
-  const user = getUserWithLimits(userId);
-  let group: UserGroup | undefined;
-  if (user?.group_id) {
-    group = getUserGroupById(user.group_id);
-  }
-  if (!group) {
-    group = getDefaultUserGroup();
-  }
+  const row = queryOne(
+    `SELECT
+       u.rpm_override AS u_rpm, u.tpm_override AS u_tpm,
+       u.concurrency_override AS u_conc, u.daily_token_override AS u_dt,
+       u.monthly_token_override AS u_mt, u.daily_cost_override AS u_dc,
+       u.monthly_cost_override AS u_mc, u.expires_at AS u_exp,
+       COALESCE(g.rpm_limit, dg.rpm_limit) AS g_rpm,
+       COALESCE(g.tpm_limit, dg.tpm_limit) AS g_tpm,
+       COALESCE(g.concurrency_limit, dg.concurrency_limit) AS g_conc,
+       COALESCE(g.daily_token_limit, dg.daily_token_limit) AS g_dt,
+       COALESCE(g.monthly_token_limit, dg.monthly_token_limit) AS g_mt,
+       COALESCE(g.daily_cost_limit, dg.daily_cost_limit) AS g_dc,
+       COALESCE(g.monthly_cost_limit, dg.monthly_cost_limit) AS g_mc,
+       ak.rpm_override AS ak_rpm, ak.tpm_override AS ak_tpm,
+       ak.concurrency_override AS ak_conc, ak.daily_token_override AS ak_dt,
+       ak.monthly_token_override AS ak_mt, ak.daily_cost_override AS ak_dc,
+       ak.monthly_cost_override AS ak_mc, ak.expires_at AS ak_exp
+     FROM users u
+     LEFT JOIN user_groups g ON u.group_id = g.id
+     LEFT JOIN user_groups dg ON dg.is_default = 1
+     LEFT JOIN api_keys ak ON ak.id = ?
+     WHERE u.id = ?`,
+    [apiKeyId, userId],
+  );
 
-  let apiKey: ApiKeyWithLimits | undefined;
-  if (apiKeyId !== null) {
-    apiKey = getApiKeyWithLimits(apiKeyId);
+  if (!row) {
+    // User not found — return unlimited defaults
+    return {
+      rpm: 0, tpm: 0, concurrency: 0,
+      dailyTokenLimit: 0, monthlyTokenLimit: 0,
+      dailyCostLimit: 0, monthlyCostLimit: 0,
+      expiresAt: null,
+    };
   }
 
   return {
-    rpm: pickLimit(apiKey?.rpm_override, user?.rpm_override, group?.rpm_limit),
-    tpm: pickLimit(apiKey?.tpm_override, user?.tpm_override, group?.tpm_limit),
-    concurrency: pickLimit(apiKey?.concurrency_override, user?.concurrency_override, group?.concurrency_limit),
-    dailyTokenLimit: pickLimit(apiKey?.daily_token_override, user?.daily_token_override, group?.daily_token_limit),
-    monthlyTokenLimit: pickLimit(apiKey?.monthly_token_override, user?.monthly_token_override, group?.monthly_token_limit),
-    dailyCostLimit: pickLimit(apiKey?.daily_cost_override, user?.daily_cost_override, group?.daily_cost_limit),
-    monthlyCostLimit: pickLimit(apiKey?.monthly_cost_override, user?.monthly_cost_override, group?.monthly_cost_limit),
-    expiresAt: apiKey?.expires_at ?? user?.expires_at ?? null,
+    rpm: pickLimit(row.ak_rpm as number | null, row.u_rpm as number | null, row.g_rpm as number | null),
+    tpm: pickLimit(row.ak_tpm as number | null, row.u_tpm as number | null, row.g_tpm as number | null),
+    concurrency: pickLimit(row.ak_conc as number | null, row.u_conc as number | null, row.g_conc as number | null),
+    dailyTokenLimit: pickLimit(row.ak_dt as number | null, row.u_dt as number | null, row.g_dt as number | null),
+    monthlyTokenLimit: pickLimit(row.ak_mt as number | null, row.u_mt as number | null, row.g_mt as number | null),
+    dailyCostLimit: pickLimit(row.ak_dc as number | null, row.u_dc as number | null, row.g_dc as number | null),
+    monthlyCostLimit: pickLimit(row.ak_mc as number | null, row.u_mc as number | null, row.g_mc as number | null),
+    expiresAt: (row.ak_exp as string | null) ?? (row.u_exp as string | null) ?? null,
   };
+}
+
+// --- Effective limits TTL cache (60s) ---
+// Avoids repeated DB queries for the same user+key within the TTL window.
+
+const EFFECTIVE_LIMITS_TTL = 60_000; // 60 seconds
+const effectiveLimitsCache = new Map<string, { limits: EffectiveLimits; expiresAt: number }>();
+
+function effectiveLimitsCacheKey(userId: number, apiKeyId: number | null): string {
+  return `${userId}:${apiKeyId ?? "null"}`;
+}
+
+/**
+ * Cached version of getEffectiveLimits.
+ * Checks in-memory cache first, falls back to DB query on miss.
+ */
+export function getCachedEffectiveLimits(userId: number, apiKeyId: number | null): EffectiveLimits {
+  const key = effectiveLimitsCacheKey(userId, apiKeyId);
+  const cached = effectiveLimitsCache.get(key);
+  const now = Date.now();
+  if (cached && cached.expiresAt > now) {
+    return cached.limits;
+  }
+  const limits = getEffectiveLimits(userId, apiKeyId);
+  effectiveLimitsCache.set(key, { limits, expiresAt: now + EFFECTIVE_LIMITS_TTL });
+  return limits;
+}
+
+/**
+ * Invalidate the effective limits cache.
+ * Call after any mutation to user groups, user overrides, or API key overrides.
+ * @param userId If provided, invalidates only entries for this user. Otherwise clears all.
+ */
+export function invalidateEffectiveLimitsCache(userId?: number): void {
+  if (userId === undefined) {
+    effectiveLimitsCache.clear();
+    return;
+  }
+  const prefix = `${userId}:`;
+  for (const key of effectiveLimitsCache.keys()) {
+    if (key.startsWith(prefix)) {
+      effectiveLimitsCache.delete(key);
+    }
+  }
 }
 
 // --- Quota queries (aggregate from usage table) ---

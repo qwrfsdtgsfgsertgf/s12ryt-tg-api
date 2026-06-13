@@ -12,7 +12,7 @@
 
 import type { Request, Response, NextFunction } from "express";
 import { config } from "../config.js";
-import { getEffectiveLimits, type EffectiveLimits } from "../db/database.js";
+import { getCachedEffectiveLimits, type EffectiveLimits } from "../db/database.js";
 
 // ---------------------------------------------------------------------------
 // In-memory tracking structures
@@ -125,13 +125,16 @@ export function rateLimitMiddleware(req: Request, res: Response, next: NextFunct
 
   let limits: EffectiveLimits;
   try {
-    limits = getEffectiveLimits(Number(auth.userId), Number(auth.apiKeyId));
+    limits = getCachedEffectiveLimits(Number(auth.userId), Number(auth.apiKeyId));
   } catch (err) {
     // If we can't read limits, allow the request (fail-open)
     console.error("[rateLimiter] Failed to get effective limits:", err);
     next();
     return;
   }
+
+  // Share limits with downstream middleware (avoids duplicate DB query)
+  res.locals.effectiveLimits = limits;
 
   // --- Check expiry ---
   if (limits.expiresAt) {

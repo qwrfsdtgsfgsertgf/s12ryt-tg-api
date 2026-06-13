@@ -36,7 +36,7 @@ let mockDailyUsage = { totalTokens: 0, totalCost: 0 };
 let mockMonthlyUsage = { totalTokens: 0, totalCost: 0 };
 
 vi.mock("../src/db/database.js", () => ({
-  getEffectiveLimits: vi.fn(() => ({ ...mockLimits })),
+  getCachedEffectiveLimits: vi.fn(() => ({ ...mockLimits })),
   getDailyUsage: vi.fn(() => ({ ...mockDailyUsage })),
   getMonthlyUsage: vi.fn(() => ({ ...mockMonthlyUsage })),
 }));
@@ -67,6 +67,7 @@ function makeRes(): Response & {
     _statusCode: 0,
     _jsonBody: null as unknown,
     _ended: false,
+    locals: {} as Record<string, unknown>,
     status(code: number) {
       this._statusCode = code;
       return this;

@@ -33,7 +33,7 @@ let mockLimits = {
 };
 
 vi.mock("../src/db/database.js", () => ({
-  getEffectiveLimits: vi.fn(() => ({ ...mockLimits })),
+  getCachedEffectiveLimits: vi.fn(() => ({ ...mockLimits })),
 }));
 
 // Import after mocks are set
@@ -62,6 +62,7 @@ function makeRes(): Response & {
     _statusCode: 0,
     _jsonBody: null as unknown,
     _ended: false,
+    locals: {} as Record<string, unknown>,
     status(code: number) {
       this._statusCode = code;
       return this;
