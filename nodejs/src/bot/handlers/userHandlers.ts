@@ -73,7 +73,7 @@ async function keyConversation(
   ctx: MyContext
 ): Promise<void> {
   const tgId = ctx.from!.id;
-  ensureUserExists(tgId, ctx.from!.username);
+  await conversation.external(() => { ensureUserExists(tgId, ctx.from!.username); });
 
   while (true) {
     await ctx.reply(KEY_MENU_TEXT);
@@ -88,9 +88,9 @@ async function keyConversation(
       const activeKeys = keys.filter((k) => Number(k.is_active) === 1);
 
       if (activeKeys.length === 0) {
-        const { key } = addApiKey(tgId);
+        const { key } = await conversation.external(() => addApiKey(tgId));
         await ctx.reply(
-          `✅ 已自動建立 key：\`${key}\`\n\n` + KEY_MENU_TEXT,
+          `✅ 已自動建立 key：\`${key}\``,
           { parse_mode: "Markdown" }
         );
       } else {
@@ -98,7 +98,7 @@ async function keyConversation(
           .map((k, i) => `${i + 1}. \`${k.key}\``)
           .join("\n");
         await ctx.reply(
-          `您的 key：\n${lines}\n\n` + KEY_MENU_TEXT,
+          `您的 key：\n${lines}`,
           { parse_mode: "Markdown" }
         );
       }
@@ -107,9 +107,9 @@ async function keyConversation(
 
     if (choice === "2") {
       // ── 新增 Key ──
-      const { key } = addApiKey(tgId);
+      const { key } = await conversation.external(() => addApiKey(tgId));
       await ctx.reply(
-        `✅ 新增 key：\`${key}\`\n\n` + KEY_MENU_TEXT,
+        `✅ 新增 key：\`${key}\``,
         { parse_mode: "Markdown" }
       );
       continue;
@@ -122,7 +122,7 @@ async function keyConversation(
       );
 
       if (activeKeys.length === 0) {
-        await ctx.reply("您目前沒有可刪除的 key。\n\n" + KEY_MENU_TEXT);
+        await ctx.reply("您目前沒有可刪除的 key。");
         continue;
       }
 
@@ -149,7 +149,7 @@ async function keyConversation(
         );
 
       if (indices.length === 0) {
-        await ctx.reply("❌ 無效的選擇。\n\n" + KEY_MENU_TEXT);
+        await ctx.reply("❌ 無效的選擇。");
         continue;
       }
 
@@ -157,18 +157,18 @@ async function keyConversation(
       let deleted = 0;
       for (const idx of uniqueIndices) {
         const key = activeKeys[Number(idx) - 1];
-        deleteApiKey(key.id);
+        await conversation.external(() => { deleteApiKey(key.id); });
         deleted++;
       }
 
       await ctx.reply(
-        `✅ 已成功刪除 ${deleted} 個 key。\n\n` + KEY_MENU_TEXT
+        `✅ 已成功刪除 ${deleted} 個 key。`
       );
       continue;
     }
 
     // 無效選項
-    await ctx.reply("❌ 請輸入 1-3 選擇操作。\n\n" + KEY_MENU_TEXT);
+    await ctx.reply("❌ 請輸入 1-3 選擇操作。");
   }
 }
 
@@ -263,7 +263,7 @@ async function codingConversation(
         const sOutCost = codingConfig.session_output_cost || 0;
         const sReqs = codingConfig.session_requests || 0;
 
-        setCodingConfig(user.id, { isActive: 0 });
+        await conversation.external(() => { setCodingConfig(user.id, { isActive: 0 }); });
 
         if (sReqs > 0) {
           const totalCost = sInCost + sOutCost;
@@ -288,33 +288,30 @@ async function codingConversation(
               `   輸入費用：$${sInCost.toFixed(6)}\n` +
               `   輸出費用：$${sOutCost.toFixed(6)}\n` +
               `   總費用：$${totalCost.toFixed(6)}` +
-              modelBreakdown +
-              "\n\n" +
-              CODING_MENU_TEXT
+              modelBreakdown
           );
         } else {
           await ctx.reply(
-            "🔴 Coding 模式已關閉。\n\n📊 本次 Session 無請求記錄。\n\n" +
-              CODING_MENU_TEXT
+            "🔴 Coding 模式已關閉。\n\n📊 本次 Session 無請求記錄。"
           );
         }
       } else {
         // 開啟
         if (codingConfig && codingConfig.fallback_models) {
-          setCodingConfig(user.id, { isActive: 1 });
-          resetCodingSessionStats(user.id);
+          await conversation.external(() => {
+            setCodingConfig(user.id, { isActive: 1 });
+            resetCodingSessionStats(user.id);
+          });
           const list = codingConfig.fallback_list
             .map((m: string, i: number) => `   ${i + 1}. ${m}`)
             .join("\n");
           await ctx.reply(
-            `🟢 Coding 模式已開啟！\n\n📋 當前 Fallback 模型鏈：\n${list}\n\n最大重試次數：${codingConfig.max_retries}\n\n` +
-              CODING_MENU_TEXT
+            `🟢 Coding 模式已開啟！\n\n📋 當前 Fallback 模型鏈：\n${list}\n\n最大重試次數：${codingConfig.max_retries}`
           );
         } else {
-          setCodingConfig(user.id, { isActive: 1 });
+          await conversation.external(() => { setCodingConfig(user.id, { isActive: 1 }); });
           await ctx.reply(
-            "🟢 Coding 模式已開啟，但尚未設定 Fallback 模型。\n請選擇 2 設定 Fallback 模型鏈。\n\n" +
-              CODING_MENU_TEXT
+            "🟢 Coding 模式已開啟，但尚未設定 Fallback 模型。\n請選擇 2 設定 Fallback 模型鏈。"
           );
         }
       }
@@ -405,10 +402,12 @@ async function codingConversation(
       const finalFallback =
         fallbackModels ?? (currentConfig?.fallback_models ?? "");
 
-      setCodingConfig(user.id, {
-        isActive: 1,
-        fallbackModels: finalFallback,
-        maxRetries,
+      await conversation.external(() => {
+        setCodingConfig(user.id, {
+          isActive: 1,
+          fallbackModels: finalFallback,
+          maxRetries,
+        });
       });
 
       const finalList = finalFallback
@@ -423,14 +422,13 @@ async function codingConversation(
         "✅ Coding 模式設定完成！\n\n" +
           `📋 Fallback 模型鏈：\n${listText}\n\n` +
           `最大重試次數：${maxRetries}\n` +
-          "狀態：🟢 已開啟\n\n" +
-          CODING_MENU_TEXT
+          "狀態：🟢 已開啟"
       );
       continue;
     }
 
     // 無效選項
-    await ctx.reply("❌ 請輸入 1 或 2 選擇操作。\n\n" + CODING_MENU_TEXT);
+    await ctx.reply("❌ 請輸入 1 或 2 選擇操作。");
   }
 }
 
@@ -472,7 +470,7 @@ async function modelCatchConversation(conversation: MyConversation, ctx: MyConte
 
   await urlCtx.reply("⏳ 正在嘗試抓取模型列表（不帶 Key）...");
 
-  const { models, needsAuth } = await fetchModelsNoAuth(url);
+  const { models, needsAuth } = await conversation.external(() => fetchModelsNoAuth(url));
 
   if (needsAuth) {
     await urlCtx.reply(
@@ -487,9 +485,9 @@ async function modelCatchConversation(conversation: MyConversation, ctx: MyConte
     await keyCtx.reply("⏳ 正在使用 Key 重新抓取模型列表...");
 
     // Try openai_chat format first (most common)
-    let fetchedModels = await fetchProviderModels(url, apiKey, "openai_chat");
+    let fetchedModels = await conversation.external(() => fetchProviderModels(url, apiKey, "openai_chat"));
     if (!fetchedModels.length) {
-      fetchedModels = await fetchProviderModels(url, apiKey, "google");
+      fetchedModels = await conversation.external(() => fetchProviderModels(url, apiKey, "google"));
     }
 
     if (!fetchedModels.length) {
