@@ -42,9 +42,11 @@ def main():
     from bot.handlers.user_handlers import register_user_handlers
     from bot.handlers.admin_handlers import register_admin_handlers
     from bot.handlers.limit_handlers import register_limit_handlers
+    from bot.handlers.update_handlers import register_update_handlers
     register_user_handlers(application)
     register_admin_handlers(application)
     register_limit_handlers(application)
+    register_update_handlers(application)
     logger.info("已註冊所有 Bot 處理器")
 
     # 指令日誌 — group -1 在所有 group 0 handler 之前執行，不會阻擋後續處理
@@ -89,6 +91,9 @@ def main():
             BotCommand("sub_url", "修改 API 接口地址"),
             BotCommand("api_test", "測試 API 協議連通性"),
             BotCommand("limits", "權限管理（用戶組/限制/配額）"),
+            BotCommand("version", "查看程式版本"),
+            BotCommand("update", "檢查並更新程式"),
+            BotCommand("restart", "重啟進程"),
         ]
         try:
             await application.bot.set_my_commands(user_commands + admin_commands)

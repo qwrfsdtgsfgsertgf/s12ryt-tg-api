@@ -13,6 +13,7 @@ import { startServer } from "./api/server.js";
 import { registerUserHandlers } from "./bot/handlers/userHandlers.js";
 import { registerAdminHandlers } from "./bot/handlers/adminHandlers.js";
 import { registerLimitHandlers } from "./bot/handlers/limitHandlers.js";
+import { registerUpdateHandlers } from "./bot/handlers/updateHandlers.js";
 
 import { Bot, Context, session } from "grammy";
 import type { BotCommand } from "grammy/types";
@@ -62,6 +63,9 @@ async function setBotCommands(bot: MyBot): Promise<void> {
     { command: "sub_url", description: "修改 API 接口地址" },
     { command: "api_test", description: "測試 API 協議連通性" },
     { command: "limits", description: "權限管理（分組/限制/配額）" },
+    { command: "version", description: "查看程式版本" },
+    { command: "update", description: "檢查並更新程式" },
+    { command: "restart", description: "重啟進程" },
   ];
 
   try {
@@ -129,6 +133,7 @@ async function main(): Promise<void> {
   registerUserHandlers(bot);
   registerAdminHandlers(bot);
   registerLimitHandlers(bot);
+  registerUpdateHandlers(bot);
 
   // 3.5 Set bot commands menu
   await setBotCommands(bot);
