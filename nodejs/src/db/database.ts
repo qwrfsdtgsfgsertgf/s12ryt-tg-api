@@ -1778,6 +1778,7 @@ export function getEffectiveLimits(userId: number, apiKeyId: number | null): Eff
 // Avoids repeated DB queries for the same user+key within the TTL window.
 
 const EFFECTIVE_LIMITS_TTL = 60_000; // 60 seconds
+const EFFECTIVE_LIMITS_CACHE_MAX = 512; // prevent unbounded memory growth
 const effectiveLimitsCache = new Map<string, { limits: EffectiveLimits; expiresAt: number }>();
 
 function effectiveLimitsCacheKey(userId: number, apiKeyId: number | null): string {
@@ -1787,16 +1788,25 @@ function effectiveLimitsCacheKey(userId: number, apiKeyId: number | null): strin
 /**
  * Cached version of getEffectiveLimits.
  * Checks in-memory cache first, falls back to DB query on miss.
+ * Uses simple LRU eviction when cache exceeds EFFECTIVE_LIMITS_CACHE_MAX entries.
  */
 export function getCachedEffectiveLimits(userId: number, apiKeyId: number | null): EffectiveLimits {
   const key = effectiveLimitsCacheKey(userId, apiKeyId);
   const cached = effectiveLimitsCache.get(key);
   const now = Date.now();
   if (cached && cached.expiresAt > now) {
+    // LRU: move to end (most recently used) by re-inserting
+    effectiveLimitsCache.delete(key);
+    effectiveLimitsCache.set(key, cached);
     return cached.limits;
   }
   const limits = getEffectiveLimits(userId, apiKeyId);
   effectiveLimitsCache.set(key, { limits, expiresAt: now + EFFECTIVE_LIMITS_TTL });
+  // Evict oldest entry if over capacity
+  if (effectiveLimitsCache.size > EFFECTIVE_LIMITS_CACHE_MAX) {
+    const oldestKey = effectiveLimitsCache.keys().next().value;
+    if (oldestKey !== undefined) effectiveLimitsCache.delete(oldestKey);
+  }
   return limits;
 }
 

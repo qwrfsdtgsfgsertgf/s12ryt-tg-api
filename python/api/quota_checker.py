@@ -52,8 +52,11 @@ class QuotaCheckMiddleware(BaseHTTPMiddleware):
             logger.exception("[quota_checker] Failed to get effective limits")
             return await call_next(request)
 
-        daily = await get_daily_usage(user_id, api_key_id)
-        monthly = await get_monthly_usage(user_id, api_key_id)
+        # Only query usage when relevant limits are set (> 0 means limited)
+        need_daily = limits["daily_token_limit"] > 0 or limits["daily_cost_limit"] > 0
+        need_monthly = limits["monthly_token_limit"] > 0 or limits["monthly_cost_limit"] > 0
+        daily = await get_daily_usage(user_id, api_key_id) if need_daily else {"total_tokens": 0, "total_cost": 0.0}
+        monthly = await get_monthly_usage(user_id, api_key_id) if need_monthly else {"total_tokens": 0, "total_cost": 0.0}
 
         # --- Daily token quota ---
         daily_token_limit = limits["daily_token_limit"]

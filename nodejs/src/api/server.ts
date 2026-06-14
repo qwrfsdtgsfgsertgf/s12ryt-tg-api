@@ -31,6 +31,15 @@ import { getProviders, lookupModelCached, rebuildProviderCache, onProviderCacheR
 import { config } from "../config.js";
 
 // ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/** Format a Date as HH:MM:SS for log prefixing. */
+function formatTimestamp(date: Date = new Date()): string {
+  return date.toLocaleTimeString("en-GB", { hour12: false });
+}
+
+// ---------------------------------------------------------------------------
 // App setup
 // ---------------------------------------------------------------------------
 
@@ -449,8 +458,7 @@ app.post(
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const body = req.body;
-      const now = new Date();
-      console.log(`[${now.getHours().toString().padStart(2,"0")}:${now.getMinutes().toString().padStart(2,"0")}:${now.getSeconds().toString().padStart(2,"0")}] POST /v1/chat/completions model=${body.model ?? "?"} stream=${body.stream === true}`);
+      console.log(`[${formatTimestamp()}] POST /v1/chat/completions model=${body.model ?? "?"} stream=${body.stream === true}`);
 
       const modelName: string = body.model ?? "";
       if (!modelName) {
@@ -471,8 +479,7 @@ app.post(
       // Dispatch with coding mode fallback
       const originalModel = modelName;
       let dispatch: DispatchResult;
-      const auth = req.auth as any;
-      const apiKeyId = auth?.apiKeyId as number | undefined;
+      const apiKeyId = req.auth ? parseInt(req.auth.apiKeyId, 10) : undefined;
       try {
         dispatch = await dispatchWithFallback(modelName, body, apiKeyId);
       } catch (err: any) {
@@ -522,7 +529,7 @@ app.post(
                 });
                 // Coding session stats
                 if (isCodingMode && auth.userId) {
-                  try { incrementCodingSessionStats(parseInt(auth.userId), streamUsage.input_tokens, streamUsage.output_tokens, cost.input_cost, cost.output_cost, actualModel); } catch {}
+                  try { incrementCodingSessionStats(parseInt(auth.userId), streamUsage.input_tokens, streamUsage.output_tokens, cost.input_cost, cost.output_cost, actualModel); } catch (e) { console.error("[coding-stats] Failed to increment:", e); }
                 }
               }
             } catch (err) {
@@ -558,7 +565,7 @@ app.post(
             });
             // Coding session stats
             if (isCodingMode && auth.userId) {
-              try { incrementCodingSessionStats(parseInt(auth.userId), usage.input_tokens, usage.output_tokens, cost.input_cost, cost.output_cost, actualModel); } catch {}
+              try { incrementCodingSessionStats(parseInt(auth.userId), usage.input_tokens, usage.output_tokens, cost.input_cost, cost.output_cost, actualModel); } catch (e) { console.error("[coding-stats] Failed to increment:", e); }
             }
           }
         } catch (err) {
@@ -585,8 +592,7 @@ app.post(
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const body = req.body;
-      const now = new Date();
-      console.log(`[${now.getHours().toString().padStart(2,"0")}:${now.getMinutes().toString().padStart(2,"0")}:${now.getSeconds().toString().padStart(2,"0")}] POST /v1/responses model=${body.model ?? "?"} stream=${body.stream === true}`);
+      console.log(`[${formatTimestamp()}] POST /v1/responses model=${body.model ?? "?"} stream=${body.stream === true}`);
 
       // Validate required fields
       const modelName: string = body.model ?? "";
@@ -754,8 +760,7 @@ app.post(
       // Dispatch with coding mode fallback
       const originalModelResp = modelName;
       let dispatch: DispatchResult;
-      const authResp = req.auth as any;
-      const apiKeyIdResp = authResp?.apiKeyId as number | undefined;
+      const apiKeyIdResp = req.auth ? parseInt(req.auth.apiKeyId, 10) : undefined;
       try {
         dispatch = await dispatchWithFallback(modelName, chatBody as Record<string, any>, apiKeyIdResp);
       } catch (err: any) {
@@ -820,7 +825,7 @@ app.post(
                   model: actualModel,
                 });
                 if (isCodingModeResp && auth.userId) {
-                  try { incrementCodingSessionStats(parseInt(auth.userId), streamUsage.input_tokens, streamUsage.output_tokens, cost.input_cost, cost.output_cost, actualModel); } catch {}
+                  try { incrementCodingSessionStats(parseInt(auth.userId), streamUsage.input_tokens, streamUsage.output_tokens, cost.input_cost, cost.output_cost, actualModel); } catch (e) { console.error("[coding-stats] Failed to increment:", e); }
                 }
               }
             } catch (err) {
@@ -863,7 +868,7 @@ app.post(
               model: actualModel,
             });
             if (isCodingModeResp && auth.userId) {
-              try { incrementCodingSessionStats(parseInt(auth.userId), usage.input_tokens, usage.output_tokens, cost.input_cost, cost.output_cost, actualModel); } catch {}
+              try { incrementCodingSessionStats(parseInt(auth.userId), usage.input_tokens, usage.output_tokens, cost.input_cost, cost.output_cost, actualModel); } catch (e) { console.error("[coding-stats] Failed to increment:", e); }
             }
           }
         } catch (err) {
@@ -890,8 +895,7 @@ app.post(
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const body = req.body;
-      const now = new Date();
-      console.log(`[${now.getHours().toString().padStart(2,"0")}:${now.getMinutes().toString().padStart(2,"0")}:${now.getSeconds().toString().padStart(2,"0")}] POST /v1/messages model=${body.model ?? "?"} stream=${body.stream === true}`);
+      console.log(`[${formatTimestamp()}] POST /v1/messages model=${body.model ?? "?"} stream=${body.stream === true}`);
 
       // Validate required fields
       const modelName: string = body.model ?? "";
@@ -938,8 +942,7 @@ app.post(
       // Dispatch with coding mode fallback
       const originalModelMsg = modelName;
       let dispatch: DispatchResult;
-      const authMsg = req.auth as any;
-      const apiKeyIdMsg = authMsg?.apiKeyId as number | undefined;
+      const apiKeyIdMsg = req.auth ? parseInt(req.auth.apiKeyId, 10) : undefined;
       try {
         dispatch = await dispatchWithFallback(modelName, chatBody as Record<string, any>, apiKeyIdMsg);
       } catch (err: any) {
@@ -994,7 +997,7 @@ app.post(
                   model: actualModel,
                 });
                 if (isCodingModeMsg && auth.userId) {
-                  try { incrementCodingSessionStats(parseInt(auth.userId), streamUsage.input_tokens, streamUsage.output_tokens, cost.input_cost, cost.output_cost, actualModel); } catch {}
+                  try { incrementCodingSessionStats(parseInt(auth.userId), streamUsage.input_tokens, streamUsage.output_tokens, cost.input_cost, cost.output_cost, actualModel); } catch (e) { console.error("[coding-stats] Failed to increment:", e); }
                 }
               }
             } catch (err) {
@@ -1032,7 +1035,7 @@ app.post(
               model: actualModel,
             });
             if (isCodingModeMsg && auth.userId) {
-              try { incrementCodingSessionStats(parseInt(auth.userId), usage.input_tokens, usage.output_tokens, cost.input_cost, cost.output_cost, actualModel); } catch {}
+              try { incrementCodingSessionStats(parseInt(auth.userId), usage.input_tokens, usage.output_tokens, cost.input_cost, cost.output_cost, actualModel); } catch (e) { console.error("[coding-stats] Failed to increment:", e); }
             }
           }
         } catch (err) {
