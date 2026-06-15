@@ -152,7 +152,7 @@
 
   // --- Modal ---
   function showModal(title, bodyHTML, actions = []) {
-    $("#modal-title").textContent = title;
+    $("#modal-title").innerHTML = title;
     $("#modal-body").innerHTML = bodyHTML;
 
     // 清除舊 actions
@@ -768,9 +768,10 @@
                     <code style="margin-left:8px;">${esc(p.base_url)}</code>
                   </div>
                 </div>
-                <div style="display:flex;gap:6px;">
+                <div style="display:flex;gap:6px;flex-wrap:wrap;">
                   <button class="btn-icon" onclick="window._editProvider(${p.id})">編輯</button>
                   <button class="btn-icon" onclick="window._providerPrices(${p.id},'${esc(p.name)}')">定價</button>
+                  <button class="btn-icon" onclick="window._testModel(${p.id})">${ic.flask} 測試</button>
                   <button class="btn-icon danger" onclick="window._delProvider(${p.id},'${esc(p.name)}')">刪除</button>
                 </div>
               </div>
@@ -801,9 +802,96 @@
         });
       };
       window._providerPrices = (id, name) => showProviderPrices(id, name);
+      window._testModel = (id) => {
+        const p = providers.find((x) => x.id === id);
+        if (p) showModelTest(p);
+      };
     } catch (err) {
       body.innerHTML = `<div class="empty-state"><div class="icon">${ic.alert}</div><div class="title">載入失敗</div><p>${esc(err.message)}</p></div>`;
     }
+  }
+
+  function showModelTest(p) {
+    const models = p.models_list || [];
+    const apiType = p.api_type;
+
+    const bodyHTML = `
+      <div style="margin-bottom:16px;">
+        <label style="display:block;font-size:13px;color:var(--text-secondary);margin-bottom:6px;">選擇模型</label>
+        ${models.length > 0
+          ? `<select id="mt-model" class="form-input" style="width:100%;">${models.map(m => `<option value="${esc(m)}">${esc(m)}</option>`).join("")}</select>`
+          : `<input id="mt-model-input" class="form-input" style="width:100%;" placeholder="輸入模型名稱" value="">`
+        }
+      </div>
+      <div style="margin-bottom:16px;">
+        <label style="display:block;font-size:13px;color:var(--text-secondary);margin-bottom:6px;">測試訊息</label>
+        <textarea id="mt-message" class="form-input" style="width:100%;min-height:60px;resize:vertical;" placeholder="輸入測試訊息">Hello!</textarea>
+      </div>
+      <div style="margin-bottom:12px;display:flex;gap:8px;align-items:center;">
+        <span class="badge badge-info">${esc(apiType)}</span>
+        <span style="font-size:12px;color:var(--text-muted);">將使用第一個 API Key 發送請求</span>
+      </div>
+      <div id="mt-result" style="min-height:40px;"></div>
+    `;
+
+    showModal(`${ic.flask} 測試模型 — ${esc(p.name)}`, bodyHTML, [
+      {
+        label: "發送測試",
+        class: "btn-primary",
+        close: false,
+        onClick: async (modalBody) => {
+          const selectEl = modalBody.querySelector("#mt-model");
+          const inputEl = modalBody.querySelector("#mt-model-input");
+          let model = selectEl ? selectEl.value : (inputEl ? inputEl.value.trim() : "");
+          const message = modalBody.querySelector("#mt-message").value.trim() || "Hello!";
+
+          if (!model) {
+            toast("請選擇或輸入模型名稱", "error");
+            return;
+          }
+
+          const resultDiv = modalBody.querySelector("#mt-result");
+          resultDiv.innerHTML = loading("正在發送測試請求...");
+
+          try {
+            const data = await API.post(`/web/api/admin/providers/${p.id}/test-model`, { model, message });
+
+            if (data.success) {
+              resultDiv.innerHTML = `
+                <div class="test-result test-success">
+                  <div class="test-result-header">
+                    <span>${ic.check} 測試成功</span>
+                    <span class="test-latency">${data.latencyMs}ms</span>
+                  </div>
+                  <div class="test-result-body">${esc(data.content || "(空回應)")}</div>
+                </div>
+              `;
+            } else {
+              resultDiv.innerHTML = `
+                <div class="test-result test-error">
+                  <div class="test-result-header">
+                    <span>${ic.alert} 測試失敗${data.status ? " (HTTP " + data.status + ")" : ""}</span>
+                    <span class="test-latency">${data.latencyMs}ms</span>
+                  </div>
+                  <div class="test-result-body">${esc(data.error || "未知錯誤")}</div>
+                  ${data.url ? `<div class="test-result-meta">${ic.link} ${esc(data.url)}</div>` : ""}
+                </div>
+              `;
+            }
+          } catch (err) {
+            resultDiv.innerHTML = `
+              <div class="test-result test-error">
+                <div class="test-result-header">
+                  <span>${ic.alert} 請求失敗</span>
+                </div>
+                <div class="test-result-body">${esc(err.message)}</div>
+              </div>
+            `;
+          }
+        },
+      },
+      { label: "關閉", class: "btn-secondary", close: true },
+    ]);
   }
 
   function showProviderForm(p = null) {
@@ -1764,65 +1852,141 @@
 
   async function pageApiTest() {
     if (!state.user?.isAdmin) { location.hash = "#/dashboard"; return; }
-    const body = setPage("API 協議測試", "偵測 API 端點支援的協議類型");
+    const body = setPage("API 協議測試", "用真實模型測試 API 端點支援的所有協議");
     body.innerHTML = `
       <div class="card">
-        <div class="card-title">${ic.flask} API 協議偵測</div>
+        <div class="card-title">${ic.flask} API 協議測試</div>
+        <div class="hint" style="margin-bottom:12px;">輸入 Base URL 和 API Key，先抓取模型列表（或手動輸入），再對 4 種協議逐一發送真實請求。</div>
         <div class="form-group">
           <label>Base URL</label>
           <input type="url" id="at-url" placeholder="https://api.openai.com/v1">
         </div>
         <div class="form-group">
-          <label>API Key（可選，填入可提高偵測準確度）</label>
+          <label>API Key</label>
           <input type="text" id="at-key" placeholder="sk-xxx">
         </div>
-        <button class="btn btn-primary" id="btn-api-test">開始偵測</button>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px;">
+          <button class="btn btn-primary" id="btn-fetch-models">${ic.search} 抓取模型</button>
+          <span id="at-model-count" class="hint"></span>
+        </div>
+        <div class="form-group" id="at-model-group">
+          <label>測試模型</label>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+            <select id="at-model" style="flex:1;min-width:200px;">
+              <option value="">（請先抓取模型，或直接在手動輸入框輸入）</option>
+            </select>
+            <input type="text" id="at-model-manual" placeholder="或手動輸入模型名稱" style="flex:1;min-width:200px;">
+          </div>
+        </div>
+        <div class="form-group">
+          <label>測試訊息</label>
+          <input type="text" id="at-message" value="Hello!" placeholder="測試訊息">
+        </div>
+        <button class="btn btn-primary" id="btn-protocol-test">${ic.zap} 測試全部協議</button>
       </div>
       <div id="at-result" style="margin-top:16px;"></div>
     `;
 
-    $("#btn-api-test").onclick = async () => {
+    let fetchedModels = [];
+
+    // Step 1: Fetch models
+    $("#btn-fetch-models").onclick = async () => {
       const baseUrl = $("#at-url").value.trim();
       const apiKey = $("#at-key").value.trim();
       if (!baseUrl) { toast("請輸入 Base URL", "error"); return; }
+      if (!apiKey) { toast("請輸入 API Key", "error"); return; }
 
-      const btn = $("#btn-api-test");
-      const resultDiv = $("#at-result");
+      const btn = $("#btn-fetch-models");
       btn.disabled = true;
-      btn.textContent = "偵測中...";
-      resultDiv.innerHTML = loading();
+      btn.innerHTML = `${ic.refresh} 抓取中...`;
+      $("#at-model-count").textContent = "";
 
       try {
-        const data = await API.post("/web/api/admin/api-test", {
-          baseUrl, apiKey: apiKey || undefined,
+        const data = await API.post("/web/api/admin/model-catch", {
+          baseUrl, apiKey, apiType: "openai_chat",
         });
-        const det = data.result || data;
-        const protos = Object.entries(det.protocols || {});
-
-        let html = `<div class="card"><div class="card-title">${ic.flask} 偵測結果</div>`;
-        if (data.allUnreachable) {
-          html += `<div class="empty-state"><div class="icon">${ic.alert}</div><div class="title">所有端點無法連通</div><p>請檢查 URL 是否正確，或網路是否通暢</p></div>`;
+        fetchedModels = data.models || [];
+        if (fetchedModels.length === 0) {
+          toast("未抓取到模型，請手動輸入", "error");
+          $("#at-model-group").style.display = "";
+          $("#at-model").innerHTML = '<option value="">（無可用模型，請手動輸入）</option>';
         } else {
-          html += '<table class="table"><thead><tr><th>協議</th><th>支援</th><th>信心等級</th><th>說明</th></tr></thead><tbody>';
-          for (const [proto, info] of protos) {
-            const supportIcon = info.supported
-              ? `<span class="badge badge-success">${ic.check} 支援</span>`
-              : `<span class="badge badge-danger">${ic.x} 不支援</span>`;
-            const confClass = info.confidence === "high" ? "badge-success" : (info.confidence === "medium" ? "badge-warning" : "badge-muted");
-            html += `<tr><td><strong>${esc(proto)}</strong></td><td>${supportIcon}</td><td><span class="badge ${confClass}">${esc(info.confidence || "low")}</span></td><td style="font-size:12px;">${esc(info.reason || "")}</td></tr>`;
-          }
-          html += "</tbody></table>";
-          if (det.recommended) {
-            html += `<div style="margin-top:12px;padding:12px;background:var(--bg-accent);border-radius:8px;">${ic.target} <strong>推薦協議: ${esc(det.recommended)}</strong></div>`;
-          }
+          $("#at-model-group").style.display = "";
+          const sel = $("#at-model");
+          sel.innerHTML = fetchedModels.map((m) => {
+            const name = typeof m === "string" ? m : (m.id || m.name || JSON.stringify(m));
+            return `<option value="${esc(name)}">${esc(name)}</option>`;
+          }).join("");
+          $("#at-model-count").innerHTML = `${ic.clipboard} 抓到 <strong>${fetchedModels.length}</strong> 個模型`;
+        }
+        $("#btn-protocol-test").disabled = false;
+      } catch (err) {
+        toast(err.message, "error");
+        // Still allow manual input
+        $("#at-model-group").style.display = "";
+        $("#at-model").innerHTML = '<option value="">（抓取失敗，請手動輸入）</option>';
+        $("#btn-protocol-test").disabled = false;
+      } finally {
+        btn.disabled = false;
+        btn.innerHTML = `${ic.search} 抓取模型`;
+      }
+    };
+
+    // Step 2: Test all protocols
+    $("#btn-protocol-test").onclick = async () => {
+      const baseUrl = $("#at-url").value.trim();
+      const apiKey = $("#at-key").value.trim();
+      const model = $("#at-model-manual").value.trim() || $("#at-model").value.trim();
+      const message = $("#at-message").value.trim() || "Hello!";
+
+      if (!baseUrl) { toast("請輸入 Base URL", "error"); return; }
+      if (!apiKey) { toast("請輸入 API Key", "error"); return; }
+      if (!model) { toast("請選擇或輸入模型", "error"); return; }
+
+      const btn = $("#btn-protocol-test");
+      const resultDiv = $("#at-result");
+      btn.disabled = true;
+      btn.innerHTML = `${ic.refresh} 測試中...`;
+      resultDiv.innerHTML = loading("正在對 4 種協議發送測試請求...");
+
+      try {
+        const data = await API.post("/web/api/admin/protocol-test", {
+          baseUrl, apiKey, model, message,
+        });
+        const results = data.results || [];
+
+        let html = `<div class="card"><div class="card-title">${ic.chart} 測試結果 — ${esc(model)}</div>`;
+        html += '<div class="proto-grid">';
+        for (const r of results) {
+          const isSuccess = r.success;
+          const badge = isSuccess
+            ? `<span class="badge badge-success">${ic.check} 成功</span>`
+            : `<span class="badge badge-danger">${ic.x} 失敗</span>`;
+          const latency = r.latencyMs != null ? `<span class="proto-latency">${r.latencyMs}ms</span>` : "";
+          html += `
+            <div class="proto-card ${isSuccess ? "proto-success" : "proto-fail"}">
+              <div class="proto-header">
+                <div class="proto-name">${esc(r.protocol)}</div>
+                <div class="proto-status">${badge} ${latency}</div>
+              </div>
+              <div class="proto-body">${esc(isSuccess ? (r.content || "(無回應內容)") : (r.error || "未知錯誤"))}</div>
+            </div>
+          `;
+        }
+        html += "</div>";
+
+        if (data.recommended) {
+          html += `<div class="proto-recommend">${ic.target} <strong>推薦協議：${esc(data.recommended)}</strong>（最快成功回應）</div>`;
+        } else {
+          html += `<div class="empty-state" style="padding:16px;"><div class="icon">${ic.alert}</div><div class="title">所有協議測試失敗</div><p>請檢查 URL、API Key、模型名稱是否正確</p></div>`;
         }
         html += "</div>";
         resultDiv.innerHTML = html;
       } catch (err) {
-        resultDiv.innerHTML = `<div class="empty-state"><div class="icon">${ic.alert}</div><div class="title">偵測失敗</div><p>${esc(err.message)}</p></div>`;
+        resultDiv.innerHTML = `<div class="empty-state"><div class="icon">${ic.alert}</div><div class="title">測試失敗</div><p>${esc(err.message)}</p></div>`;
       } finally {
         btn.disabled = false;
-        btn.textContent = "開始偵測";
+        btn.innerHTML = `${ic.zap} 測試全部協議`;
       }
     };
   }
@@ -1880,9 +2044,9 @@
 
         let html = '<div class="card"><div class="card-title">抓取結果</div>';
         if (needsAuth) {
-          html += '<div class="empty-state"><div class="icon">${ic.lock}</div><div class="title">需要認證</div><p>此 API 需要提供有效的 API Key 才能取得模型列表</p></div>';
+          html += `<div class="empty-state"><div class="icon">${ic.lock}</div><div class="title">需要認證</div><p>此 API 需要提供有效的 API Key 才能取得模型列表</p></div>`;
         } else if (models.length === 0) {
-          html += '<div class="empty-state"><div class="icon">${ic.inbox}</div><div class="title">未找到模型</div></div>';
+          html += `<div class="empty-state"><div class="icon">${ic.inbox}</div><div class="title">未找到模型</div></div>`;
         } else {
           const modelList = models.map(m => m.id).join(",");
           html += `<p style="margin-bottom:12px;color:var(--text-secondary);">共 ${models.length} 個模型</p>`;

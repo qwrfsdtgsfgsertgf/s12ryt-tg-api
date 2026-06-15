@@ -784,3 +784,99 @@ input[type="checkbox"] {
   }
   .spinner { animation: spin 1.5s linear infinite; }
 }
+
+/* --- Model Test Result --- */
+.test-result {
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  margin-top: 8px;
+  border: 1px solid var(--border);
+  font-size: 13px;
+}
+.test-result.test-success {
+  border-color: var(--success);
+  background: var(--success-light);
+}
+.test-result.test-error {
+  border-color: var(--danger);
+  background: var(--danger-light);
+}
+.test-result-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+.test-result-header svg { width: 16px; height: 16px; vertical-align: -2px; }
+.test-latency {
+  font-size: 12px;
+  color: var(--text-muted);
+  font-weight: 400;
+  font-family: "JetBrains Mono", monospace;
+}
+.test-result-body {
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.6;
+  max-height: 300px;
+  overflow-y: auto;
+  color: var(--text-primary);
+}
+.test-result-meta {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--text-muted);
+  font-family: "JetBrains Mono", monospace;
+  word-break: break-all;
+}
+.test-result-meta svg { width: 12px; height: 12px; vertical-align: -1px; }
+
+/* Protocol Test Grid */
+.proto-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.proto-card {
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  background: var(--bg-accent);
+}
+.proto-card.proto-success { border-color: var(--success); background: var(--success-light); }
+.proto-card.proto-fail { border-color: var(--danger); background: var(--danger-light); opacity: 0.85; }
+.proto-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.proto-name { font-weight: 600; font-size: 14px; }
+.proto-status { display: flex; align-items: center; gap: 6px; }
+.proto-latency {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-family: "JetBrains Mono", monospace;
+}
+.proto-body {
+  font-size: 13px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 120px;
+  overflow-y: auto;
+}
+.proto-recommend {
+  margin-top: 12px;
+  padding: 12px 14px;
+  background: var(--success-light);
+  border: 1px solid var(--success);
+  border-radius: var(--radius);
+  font-size: 14px;
+}
+.proto-recommend svg { width: 18px; height: 18px; vertical-align: -3px; }

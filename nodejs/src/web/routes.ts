@@ -891,6 +891,145 @@ router.post("/api/admin/api-test", async (req: Request, res: Response) => {
 });
 
 // ---------------------------------------------------------------------------
+// Protocol Test — 用真實模型測試全部協議
+// ---------------------------------------------------------------------------
+
+/** POST /web/api/admin/protocol-test — 用真實模型測試 4 種 API 協議 */
+router.post("/api/admin/protocol-test", async (req: Request, res: Response) => {
+  const { baseUrl, apiKey, model, message } = req.body;
+  if (!baseUrl || typeof baseUrl !== "string") {
+    res.status(400).json({ error: "缺少 baseUrl" });
+    return;
+  }
+  if (!model || typeof model !== "string") {
+    res.status(400).json({ error: "缺少 model" });
+    return;
+  }
+  if (!apiKey || typeof apiKey !== "string") {
+    res.status(400).json({ error: "缺少 apiKey" });
+    return;
+  }
+
+  const msg = typeof message === "string" && message.trim() ? message : "Hello!";
+  const base = baseUrl.replace(/\/+$/, "");
+
+  // Helper: build request per protocol
+  type ProtoReq = { url: string; headers: Record<string, string>; body: Record<string, unknown> };
+  const buildReq = (proto: string): ProtoReq => {
+    switch (proto) {
+      case "openai_chat":
+        return {
+          url: `${base}/chat/completions`,
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+          body: { model, messages: [{ role: "user", content: msg }], max_tokens: 100 },
+        };
+      case "openai_response":
+        return {
+          url: `${base}/responses`,
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+          body: { model, input: msg, max_output_tokens: 100 },
+        };
+      case "anthropic": {
+        const anthropicBase = base.includes("/v1") ? base : `${base}/v1`;
+        return {
+          url: `${anthropicBase}/messages`,
+          headers: {
+            "Content-Type": "application/json",
+            "x-api-key": apiKey,
+            "anthropic-version": "2023-06-01",
+          },
+          body: { model, max_tokens: 100, messages: [{ role: "user", content: msg }] },
+        };
+      }
+      case "google":
+        return {
+          url: `${base}/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`,
+          headers: { "Content-Type": "application/json" },
+          body: { contents: [{ parts: [{ text: msg }] }] },
+        };
+      default:
+        return { url: "", headers: {}, body: {} };
+    }
+  };
+
+  // Helper: parse response content per protocol
+  const parseContent = (proto: string, data: any): string => {
+    switch (proto) {
+      case "openai_chat":
+        return data.choices?.[0]?.message?.content ?? "";
+      case "openai_response":
+        return data.output_text ?? data.output?.[0]?.content?.[0]?.text ?? "";
+      case "anthropic":
+        return Array.isArray(data.content) ? data.content.map((b: any) => b.text ?? "").join("") : "";
+      case "google":
+        return Array.isArray(data.candidates?.[0]?.content?.parts)
+          ? data.candidates[0].content.parts.map((p: any) => p.text ?? "").join("")
+          : "";
+      default:
+        return "";
+    }
+  };
+
+  const protocols = ["openai_chat", "openai_response", "anthropic", "google"];
+
+  // Test all protocols in parallel
+  const results = await Promise.all(
+    protocols.map(async (proto) => {
+      const req = buildReq(proto);
+      const t0 = Date.now();
+      try {
+        const resp = await fetch(req.url, {
+          method: "POST",
+          headers: req.headers,
+          body: JSON.stringify(req.body),
+          signal: AbortSignal.timeout(30_000),
+        });
+        const latencyMs = Date.now() - t0;
+
+        if (!resp.ok) {
+          const errorText = await resp.text().catch(() => "");
+          return {
+            protocol: proto,
+            success: false,
+            latencyMs,
+            status: resp.status,
+            error: `HTTP ${resp.status}: ${errorText.slice(0, 300)}`,
+          };
+        }
+
+        const data: any = await resp.json();
+        const content = parseContent(proto, data);
+        return {
+          protocol: proto,
+          success: true,
+          latencyMs,
+          status: resp.status,
+          content: content.slice(0, 500),
+        };
+      } catch (err) {
+        const latencyMs = Date.now() - t0;
+        return {
+          protocol: proto,
+          success: false,
+          latencyMs,
+          error: err instanceof Error ? err.message : String(err),
+        };
+      }
+    })
+  );
+
+  // Recommend: first successful protocol with lowest latency
+  const successful = results.filter((r) => r.success);
+  let recommended = "";
+  if (successful.length > 0) {
+    successful.sort((a, b) => (a.latencyMs || 0) - (b.latencyMs || 0));
+    recommended = successful[0].protocol;
+  }
+
+  res.json({ results, recommended });
+});
+
+// ---------------------------------------------------------------------------
 // Model Catch — 模型抓取
 // ---------------------------------------------------------------------------
 
@@ -977,6 +1116,136 @@ router.post("/api/admin/provider-pricing", async (req: Request, res: Response) =
   } catch (err) {
     console.error("[web] provider-pricing error:", err);
     res.status(500).json({ error: "定價查詢失敗：" + (err instanceof Error ? err.message : String(err)) });
+  }
+});
+
+/** POST /web/api/admin/providers/:id/test-model — 按供應商 api_type 發測試請求 */
+router.post("/api/admin/providers/:id/test-model", async (req: Request, res: Response) => {
+  const providerId = Number(req.params.id);
+  const { model, message } = req.body;
+
+  if (!model || typeof model !== "string") {
+    res.status(400).json({ error: "缺少 model 參數" });
+    return;
+  }
+  const msg = typeof message === "string" && message.trim() ? message : "Hello!";
+
+  const providers = getProviders(false);
+  const provider = providers.find((p) => p.id === providerId);
+  if (!provider) {
+    res.status(404).json({ error: "供應商不存在" });
+    return;
+  }
+
+  const keys = parseApiKeys(provider.api_key);
+  if (keys.length === 0) {
+    res.status(400).json({ error: "此供應商沒有設定 API Key" });
+    return;
+  }
+  const apiKey = keys[0];
+  const baseUrl = (provider.base_url || "").replace(/\/+$/, "");
+  const apiType = provider.api_type;
+
+  if (!baseUrl) {
+    res.status(400).json({ error: "供應商缺少 base_url" });
+    return;
+  }
+
+  let url: string;
+  let headers: Record<string, string>;
+  let body: Record<string, unknown>;
+
+  switch (apiType) {
+    case "openai_chat":
+      url = `${baseUrl}/chat/completions`;
+      headers = { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` };
+      body = { model, messages: [{ role: "user", content: msg }], max_tokens: 100 };
+      break;
+
+    case "openai_response":
+      url = `${baseUrl}/responses`;
+      headers = { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` };
+      body = { model, input: msg, max_output_tokens: 100 };
+      break;
+
+    case "anthropic": {
+      // baseUrl 可能含 /v1 也可能不含
+      const anthropicBase = baseUrl.includes("/v1") ? baseUrl : `${baseUrl}/v1`;
+      url = `${anthropicBase}/messages`;
+      headers = {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+      };
+      body = { model, max_tokens: 100, messages: [{ role: "user", content: msg }] };
+      break;
+    }
+
+    case "google":
+      url = `${baseUrl}/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
+      headers = { "Content-Type": "application/json" };
+      body = { contents: [{ parts: [{ text: msg }] }] };
+      break;
+
+    default:
+      res.status(400).json({ error: `不支援的 API 類型: ${apiType}` });
+      return;
+  }
+
+  const t0 = Date.now();
+  try {
+    const resp = await fetch(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(30_000),
+    });
+
+    const latencyMs = Date.now() - t0;
+
+    if (!resp.ok) {
+      const errorText = await resp.text().catch(() => "");
+      res.json({
+        success: false,
+        latencyMs,
+        status: resp.status,
+        error: `HTTP ${resp.status}: ${errorText.slice(0, 500)}`,
+        url,
+        apiType,
+      });
+      return;
+    }
+
+    const data: any = await resp.json();
+    let content = "";
+
+    switch (apiType) {
+      case "openai_chat":
+        content = data.choices?.[0]?.message?.content ?? "";
+        break;
+      case "openai_response":
+        content = data.output_text ?? data.output?.[0]?.content?.[0]?.text ?? "";
+        break;
+      case "anthropic":
+        content = Array.isArray(data.content)
+          ? data.content.map((b: any) => b.text ?? "").join("")
+          : "";
+        break;
+      case "google":
+        content = Array.isArray(data.candidates?.[0]?.content?.parts)
+          ? data.candidates[0].content.parts.map((p: any) => p.text ?? "").join("")
+          : "";
+        break;
+    }
+
+    res.json({ success: true, content, latencyMs, status: resp.status });
+  } catch (err) {
+    const latencyMs = Date.now() - t0;
+    res.json({
+      success: false,
+      latencyMs,
+      error: err instanceof Error ? err.message : String(err),
+    });
   }
 });
 
