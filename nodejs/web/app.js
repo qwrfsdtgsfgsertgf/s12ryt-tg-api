@@ -556,8 +556,11 @@
         <div class="card">
           <div class="card-title">${ic.code} Coding 模式設定</div>
           <div class="form-group">
-            <label class="checkbox-wrap">
-              <input type="checkbox" id="coding-active" ${cfg && Number(cfg.is_active) === 1 ? "checked" : ""}>
+            <label class="toggle-wrap">
+              <span class="toggle-switch">
+                <input type="checkbox" id="coding-active" ${cfg && Number(cfg.is_active) === 1 ? "checked" : ""}>
+                <span class="toggle-slider"></span>
+              </span>
               <span>啟用 Coding 模式</span>
             </label>
             <div class="hint">啟用後，API 報錯時會按 fallback 模型鏈自動重試</div>
@@ -952,8 +955,11 @@
         </div>
         ${isEdit ? `
           <div class="form-group">
-            <label class="checkbox-wrap">
-              <input type="checkbox" id="pf-enabled" ${Number(p.enabled) === 1 ? "checked" : ""}>
+            <label class="toggle-wrap">
+              <span class="toggle-switch">
+                <input type="checkbox" id="pf-enabled" ${Number(p.enabled) === 1 ? "checked" : ""}>
+                <span class="toggle-slider"></span>
+              </span>
               <span>啟用</span>
             </label>
           </div>
