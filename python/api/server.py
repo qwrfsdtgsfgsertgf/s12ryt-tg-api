@@ -18,6 +18,7 @@ from .middleware import AuthMiddleware
 from .rate_limiter import RateLimitMiddleware, record_token_usage
 from .quota_checker import QuotaCheckMiddleware
 from . import providers as prov
+from .thinking_parser import preprocess_thinking, parse_model_thinking_suffix
 from .usage_tracker import extract_usage, calculate_cost, record_usage
 from config import Config
 from .responses import (
@@ -416,15 +417,19 @@ async def _dispatch_with_fallback(
 
         for fb_model in fallback_models:
             try:
-                fb_type, fb_id, fb_config, fb_in_price, fb_out_price = await _resolve_model_full(fb_model)
+                # Parse thinking suffix from fallback model name (e.g. "o3(high)")
+                fb_real_model, fb_level = parse_model_thinking_suffix(fb_model)
+                fb_type, fb_id, fb_config, fb_in_price, fb_out_price = await _resolve_model_full(fb_real_model)
                 fb_module = PROVIDER_MODULES.get(fb_type)
                 if fb_module is None:
                     continue
 
-                fb_body = {**body, "model": fb_model}
-                logger.info("Coding mode: trying model %s", fb_model)
+                fb_body = {**body, "model": fb_real_model}
+                if fb_level:
+                    fb_body["thinking_effort"] = fb_level
+                logger.info("Coding mode: trying model %s", fb_real_model)
                 result = await fb_module.chat_completion(fb_body, fb_config)
-                return result, fb_model, fb_type, fb_id, fb_config, fb_in_price, fb_out_price
+                return result, fb_real_model, fb_type, fb_id, fb_config, fb_in_price, fb_out_price
             except Exception as fb_exc:
                 logger.warning("Coding mode model %s failed: %s", fb_model, fb_exc)
                 last_error = fb_exc
@@ -522,6 +527,9 @@ async def chat_completions(request: Request):
             status_code=400,
             content={"error": {"message": "Invalid JSON body", "type": "invalid_request_error"}},
         )
+
+    # Parse thinking level from model suffix or request params (e.g. "o3(high)")
+    preprocess_thinking(body)
 
     model_name = body.get("model", "")
     if not model_name:
@@ -636,6 +644,9 @@ async def responses_endpoint(request: Request):
             status_code=400,
             content={"error": {"message": "Invalid JSON body", "type": "invalid_request_error"}},
         )
+
+    # Parse thinking level from model suffix or request params (e.g. "o3(high)")
+    preprocess_thinking(body)
 
     model_name = body.get("model", "")
     if not model_name:
@@ -765,6 +776,10 @@ async def responses_endpoint(request: Request):
     if "tool_choice" in body:
         chat_body["tool_choice"] = body["tool_choice"]
 
+    # Preserve thinking_effort for provider injection (set by preprocess_thinking)
+    if body.get("thinking_effort") is not None:
+        chat_body["thinking_effort"] = body["thinking_effort"]
+
     is_stream = chat_body.get("stream", False)
 
     # 4. Resolve model -> provider with fallback support
@@ -886,6 +901,9 @@ async def anthropic_messages_endpoint(request: Request):
             status_code=400,
             content={"type": "error", "error": {"type": "invalid_request_error", "message": "Invalid JSON body"}},
         )
+
+    # Parse thinking level from model suffix or request params (e.g. "o3(high)")
+    preprocess_thinking(body)
 
     # 2. Validate required fields
     model_name: str = body.get("model", "")

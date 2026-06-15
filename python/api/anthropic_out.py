@@ -99,6 +99,10 @@ def convert_anthropic_input_to_messages(
     if tool_choice is not None:
         result["tool_choice"] = _convert_tool_choice(tool_choice)
 
+    # Preserve thinking_effort for provider injection
+    if body.get("thinking_effort") is not None:
+        result["thinking_effort"] = body["thinking_effort"]
+
     return result
 
 

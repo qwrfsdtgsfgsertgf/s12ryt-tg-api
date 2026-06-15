@@ -15,6 +15,7 @@ import {
   convertResponsesToChatCompletion,
   streamChatFromResponses,
 } from "../responses.js";
+import { injectForOpenAIResponse, type ThinkingLevel } from "../thinkingParser.js";
 
 const DEFAULT_TIMEOUT = 120_000;
 const MAX_RETRIES = 2;
@@ -55,6 +56,12 @@ export async function responsesApi(
   const timeout = providerConfig.timeout ?? DEFAULT_TIMEOUT;
   const extraHeaders = providerConfig.extraHeaders ?? {};
   const isStream = requestData.stream === true;
+
+  // Inject thinking parameters from unified thinking_effort field
+  if (requestData.thinking_effort) {
+    requestData.reasoning = { effort: requestData.thinking_effort };
+    delete requestData.thinking_effort;
+  }
 
   const url = `${baseUrl}/responses`;
   const headers: Record<string, string> = {
@@ -104,6 +111,11 @@ export async function chatCompletion(
   // Convert tools if present
   if (requestData.tools) {
     responsesBody.tools = convertChatToolsToResponsesTools(requestData.tools);
+  }
+
+  // Inject thinking parameters from unified thinking_effort field
+  if (requestData.thinking_effort) {
+    injectForOpenAIResponse(responsesBody, requestData.thinking_effort as ThinkingLevel);
   }
 
   // Send via responsesApi

@@ -5,6 +5,8 @@
  * Input/Output: Standard OpenAI chat completion format.
  */
 
+import { injectForOpenAIChat, type ThinkingLevel } from "../thinkingParser.js";
+
 const DEFAULT_TIMEOUT = 120_000;
 const MAX_RETRIES = 2;
 const RETRY_DELAY = 500; // ms
@@ -75,6 +77,13 @@ export async function chatCompletion(
     headers["api-key"] = apiKey;
   } else {
     headers["Authorization"] = `Bearer ${apiKey}`;
+  }
+
+  // --- thinking_effort → reasoning_effort ---
+  const thinkingLevel = (requestData as Record<string, unknown>).thinking_effort as ThinkingLevel | undefined;
+  if (thinkingLevel) {
+    injectForOpenAIChat(requestData as Record<string, unknown>, thinkingLevel);
+    delete (requestData as Record<string, unknown>).thinking_effort;
   }
 
   return doRequest(url, headers, requestData, timeout, isStream);

@@ -45,6 +45,7 @@ export function convertAnthropicInputToMessages(
   top_p?: number;
   stop?: string | string[];
   stream?: boolean;
+  thinking_effort?: string;
   tools?: any[];
   tool_choice?: any;
 } {
@@ -116,6 +117,7 @@ export function convertAnthropicInputToMessages(
     ...(body.top_p != null && { top_p: body.top_p }),
     ...(body.stop_sequences != null && { stop: body.stop_sequences }),
     ...(body.stream != null && { stream: body.stream }),
+    ...(body.thinking_effort != null && { thinking_effort: body.thinking_effort }),
     ...(openaiTools && { tools: openaiTools }),
     ...(openaiToolChoice && { tool_choice: openaiToolChoice }),
   };

@@ -13,6 +13,8 @@ from typing import Any, AsyncIterator
 
 import httpx
 
+from api.thinking_parser import inject_for_openai_chat
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT = 120.0
@@ -70,6 +72,11 @@ async def chat_completion(
         # Azure uses api-key header instead of Bearer
         headers.pop("Authorization", None)
         headers["api-key"] = api_key
+
+    # Inject reasoning_effort if thinking_effort is set (body is pass-through)
+    thinking_effort = request_data.pop("thinking_effort", None)
+    if thinking_effort is not None:
+        inject_for_openai_chat(request_data, thinking_effort)
 
     return await _do_request(url, headers, request_data, timeout, is_stream)
 

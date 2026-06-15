@@ -5,6 +5,7 @@
  */
 
 import { v4 as uuidv4 } from "uuid";
+import { injectForAnthropic, type ThinkingLevel } from "../thinkingParser.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -150,6 +151,11 @@ function toAnthropicRequest(openaiReq: ChatCompletionRequest): Record<string, an
       : [openaiReq.stop];
   }
   if (openaiReq.stream !== undefined) body.stream = openaiReq.stream;
+
+  // Inject thinking parameters from unified thinking_effort field
+  if (openaiReq.thinking_effort) {
+    injectForAnthropic(body, openaiReq.thinking_effort as ThinkingLevel);
+  }
 
   return body;
 }

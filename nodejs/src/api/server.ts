@@ -29,6 +29,7 @@ import {
 } from "./anthropic_out.js";
 import { getProviders, lookupModelCached, rebuildProviderCache, onProviderCacheRebuild, type Provider, getActiveCodingForApiKey, incrementCodingSessionStats, checkModelAllowed, getAllowedModels, getUserByTgId } from "../db/database.js";
 import { config } from "../config.js";
+import { preprocessThinking, parseModelThinkingSuffix } from "./thinkingParser.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -167,14 +168,17 @@ async function dispatchWithFallback(
 
     let lastError: any = new Error("coding-mode: no fallback models available");
 
-    for (const fbModel of codingConfig.fallback_list) {
+    for (const fbModelRaw of codingConfig.fallback_list) {
+      // Parse thinking suffix from fallback model name (e.g. "o3(high)")
+      const { model: fbModel, thinkingLevel: fbThinkingLevel } = parseModelThinkingSuffix(fbModelRaw);
       try {
         const fbResolved = lookupModelDb(fbModel);
         const fbModule = PROVIDER_MODULES[fbResolved.providerType];
         if (!fbModule) continue;
 
         console.log(`Coding mode: trying model ${fbModel}`);
-        const fbBody = { ...body, model: fbModel };
+        const fbBody: Record<string, any> = { ...body, model: fbModel };
+        if (fbThinkingLevel) fbBody.thinking_effort = fbThinkingLevel;
         const result = await fbModule.chatCompletion(fbBody, fbResolved.config);
 
         return {
@@ -458,6 +462,8 @@ app.post(
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const body = req.body;
+      // Parse thinking level from model suffix (e.g. "o3(high)") or body params
+      preprocessThinking(body);
       console.log(`[${formatTimestamp()}] POST /v1/chat/completions model=${body.model ?? "?"} stream=${body.stream === true}`);
 
       const modelName: string = body.model ?? "";
@@ -592,6 +598,8 @@ app.post(
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const body = req.body;
+      // Parse thinking level from model suffix (e.g. "o3(high)") or body params
+      preprocessThinking(body);
       console.log(`[${formatTimestamp()}] POST /v1/responses model=${body.model ?? "?"} stream=${body.stream === true}`);
 
       // Validate required fields
@@ -755,6 +763,11 @@ app.post(
         chatBody.tool_choice = body.tool_choice;
       }
 
+      // Preserve thinking_effort for provider injection (set by preprocessThinking)
+      if (body.thinking_effort !== undefined) {
+        chatBody.thinking_effort = body.thinking_effort;
+      }
+
       const isStream = chatBody.stream === true;
 
       // Dispatch with coding mode fallback
@@ -895,6 +908,8 @@ app.post(
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const body = req.body;
+      // Parse thinking level from model suffix (e.g. "claude-sonnet(high)") or body params
+      preprocessThinking(body);
       console.log(`[${formatTimestamp()}] POST /v1/messages model=${body.model ?? "?"} stream=${body.stream === true}`);
 
       // Validate required fields

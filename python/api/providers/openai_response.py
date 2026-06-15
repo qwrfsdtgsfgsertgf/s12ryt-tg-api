@@ -17,6 +17,8 @@ from typing import Any, AsyncIterator
 
 import httpx
 
+from api.thinking_parser import inject_for_openai_response
+
 from ..responses import (
     convert_messages_to_responses_input,
     convert_chat_tools_to_responses_tools,
@@ -49,6 +51,11 @@ async def responses_api(
     timeout = provider_config.get("timeout", DEFAULT_TIMEOUT)
     extra_headers = provider_config.get("extra_headers", {})
     is_stream = request_data.get("stream", False)
+
+    # Inject thinking params if thinking_effort is set
+    if request_data.get("thinking_effort") is not None:
+        request_data["reasoning"] = {"effort": request_data["thinking_effort"]}
+        del request_data["thinking_effort"]
 
     url = f"{base_url}/responses"
     headers = {
@@ -101,6 +108,10 @@ async def chat_completion(
         responses_body["tools"] = convert_chat_tools_to_responses_tools(
             request_data["tools"]
         )
+
+    # Inject reasoning params if thinking_effort is set
+    if request_data.get("thinking_effort") is not None:
+        inject_for_openai_response(responses_body, request_data["thinking_effort"])
 
     # Send via responses_api
     result = await responses_api(responses_body, provider_config)

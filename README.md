@@ -6,18 +6,44 @@
 
 ## 特色
 
+### API 代理核心
 - **多供應商聚合** — 統一管理 OpenAI / Anthropic / Google 等 AI API
 - **OpenAI 相容 API** — 對外暴露 `/v1/chat/completions`、`/v1/responses` 端點，可直接替換現有 OpenAI 客戶端
 - **Anthropic 相容 API** — 提供 `/v1/messages` 端點，相容 Anthropic Messages API 格式
 - **格式自動轉換** — 三種 API 格式（Chat Completions / Responses / Messages）之間自動雙向轉換，任一端點可路由到任意供應商
-- **API 協議自動偵測** — 新增供應商時自動 ping 各端點，顯示連通狀態輔助選擇類型
-- **Telegram Bot 管理** — 所有操作透過 Telegram Bot 完成，無需 Web 後台
+- **Thinking Effort（推理強度）** — 支援透過 model 名稱後綴（如 `o3(high)`）或請求參數（`reasoning_effort` / `thinking_effort`）指定推理強度（high / medium / low），自動映射到各供應商的原生格式
+- **API 協議自動偵測** — 新增供應商時自動 ping 各端點，以 HTTP 狀態碼 + 信心等級（high/medium/low）分析，並自動推薦最佳類型
+- **串流支援 (SSE)** — 支援 Server-Sent Events 即時串流回應
+
+### 計費與用量
 - **每模型獨立定價** — 自動從 [models.dev](https://models.dev) 獲取各模型定價（USD / 1M tokens），支援 per-model 計費
 - **Token 用量追蹤** — 自動記錄每個 API Key 的輸入/輸出 Token 數與費用
-- **串流支援 (SSE)** — 支援 Server-Sent Events 即時串流回應
-- **多金鑰負載均衡** — 每個供應商可設定多個 API Key，自動加權隨機選擇 + Circuit Breaker 故障轉移
-- **效能優化** — Provider routing 快取、API Key LRU 快取、用量寫入佇列批量刷入
+
+### 高可用性
+- **多金鑰負載均衡** — 每個供應商可設定多個 API Key（逗號分隔），自動加權隨機選擇 + Circuit Breaker 故障轉移（連續失敗 ≥3 次 → 60 秒冷卻排除）
+- **Coding Mode** — 用戶可設定 fallback 模型鏈，API 報錯時自動按順序重試下一個模型
+
+### 權限與安全
+- **權限管理系統** — 速率限制（RPM/TPM）、並發上限、配額管理（日/月 Token 與費用）、使用期限、用戶分組，API Key 可覆蓋用戶設定
+- **模型存取限制** — 用戶級別 + API Key 級別的白名單/黑名單控制，Key 級別覆蓋用戶級別
+- **API Key 認證** — `sk-s12ryt-{uuid-v7}` 格式，時間排序、唯一性保證
+
+### 管理
+- **Telegram Bot 管理** — 所有操作透過 Telegram Bot 完成，無需 Web 後台
+- **指令統合設計** — 選單式多輪對話，少量指令完成所有操作
+- **模型抓取** — `/model_catch` 指令可抓取任意 API 的模型列表
+- **內置更新系統** — `/update` 指令直接從 GitHub Release 更新程式（git pull + tarball 備援）
+
+### 效能
+- **Provider routing 快取** — 記憶體中維護 `model_name → provider` 映射，避免每次請求查 DB
+- **API Key LRU 快取** — 256 條目的 LRU cache，認證時省去 2 次 DB 查詢
+- **用量寫入佇列** — 每 5 秒或累積 100 筆批量刷入 DB（單一交易），降低 SQLite 寫入瓶頸
+- **權限查詢優化** — 單次 LEFT JOIN + 60s TTL 快取，每請求 DB 查詢從 ~10 降至 0-2
+
+### 工程
 - **雙語言實作** — Python (FastAPI + python-telegram-bot) 與 Node.js (Express + grammY)
+- **完整測試** — 304 個單元 + 整合測試全部通過
+- **CI/CD** — GitHub Actions 自動發布 Release（push to main 更新 `latest`，tag v*.*.* 建立 stable）
 
 ## 架構
 
@@ -38,6 +64,8 @@
 
 ## Bot 指令
 
+所有指令採用**選單式多輪對話**設計，一個指令即可完成多種操作。
+
 ### 一般用戶指令
 
 需為管理員加入的信任用戶才能使用。
@@ -46,10 +74,11 @@
 |------|------|
 | `/start` | 顯示歡迎訊息 |
 | `/url` | 取得目前 API 端點 URL |
-| `/key` | 取得現有 API Key（首次使用自動建立，格式：`sk-s12ryt-{uuid-v7}`） |
+| `/key` | API Key 管理（查看現有 / 新增 / 多選刪除），首次使用自動建立，格式 `sk-s12ryt-{uuid-v7}` |
 | `/usage` | 查看各 API Key 的 Token 用量與費用 |
-| `/key_add` | 新增一組 API Key |
-| `/key_del` | 刪除 API Key（支援多選，回覆 `1,2` 即可刪除多個） |
+| `/coding` | Coding 模式管理（開關 / 設定 fallback 模型鏈，API 報錯時自動重試下一個模型） |
+| `/model_catch` | 抓取任意 API 的模型列表（輸入 URL → 不帶 key 嘗試 → 401/403 再問 key） |
+| `/my_limits` | 查看自己的有效限制（RPM/TPM/並發/配額）與今日/月用量 |
 
 ### 管理員指令
 
@@ -57,17 +86,15 @@
 
 | 指令 | 說明 |
 |------|------|
-| `/add` | 新增 AI 供應商（多輪對話：名稱 → 端點 → Key（逗號分隔可多個）→ 自動偵測協議 → 選擇類型 → 模型 → 定價） |
-| `/del` | 刪除供應商（支援多選） |
-| `/list` | 列出所有供應商及其用量統計 |
-| `/edit` | 編輯供應商設定（多輪對話，API Key 欄位顯示金鑰數量） |
+| `/provider` | 供應商管理選單：**新增**（名稱 → 端點 → Key（逗號分隔多個）→ 自動偵測協議 → 模型 → 定價）/ **刪除**（多選）/ **編輯**（逐欄修改）/ **列表**（含用量統計） |
+| `/admin_user` | 用戶管理選單：**新增** / **停用**（多選，停用後通知）/ **刪除**（多選）/ **編輯** TG ID / **移除 API Key**（多選）/ **模型存取限制**（白名單/黑名單，用戶級 + Key 級） |
 | `/uu` | 查看所有用戶的 API Key 用量 |
-| `/admin_rm_userkey` | 移除任意用戶的 API Key（支援多選） |
 | `/sub_url` | 設定/覆蓋 API 端點 URL |
-| `/add_user` | 新增信任用戶 |
-| `/stop_user` | 停用信任用戶（支援多選，停用後會通知被停用戶） |
-| `/del_user` | 刪除信任用戶（支援多選） |
-| `/edit_user` | 編輯用戶的 Telegram ID |
+| `/api_test` | 測試 API 協議連通性（偵測 openai_chat / openai_response / anthropic / google，顯示信心等級 + 推薦） |
+| `/limits` | 權限管理選單：用戶分組 CRUD / 用戶限制設定 / API Key 限制設定（RPM/TPM/並發/日月配額/期限） |
+| `/version` | 查看當前程式版本（commit hash + tag + 日期） |
+| `/update` | 檢查 GitHub Release 更新並一鍵更新（git pull + tarball 備援） |
+| `/restart` | 重啟進程 |
 
 ## 快速開始
 
@@ -147,6 +174,56 @@ curl http://localhost:8000/v1/chat/completions \
 
 回應格式完全相容 OpenAI API，可直接搭配現有 OpenAI SDK 或任何相容用戶端使用。Token 用量會自動追蹤記錄。
 
+### Thinking Effort（推理強度）
+
+透過三種方式指定推理強度（`high` / `medium` / `low`），系統會自動映射到各供應商的原生格式：
+
+| 方式 | 範例 | 優先級 |
+|------|------|--------|
+| **Model 名稱後綴** | `"model": "o3(high)"` | 最高 |
+| **`reasoning_effort` 參數** | `"reasoning_effort": "high"` | 中 |
+| **`thinking_effort` 參數** | `"thinking_effort": "high"` | 最低 |
+
+> 後綴語法：在 model 名稱後加 `(level)`，如 `claude-sonnet-4(high)`、`o3-mini(medium)`、`gemini-2.5-flash(low)`。系統會自動剝離後綴還原真實 model 名稱。
+
+**各供應商映射：**
+
+| 供應商 | high | medium | low |
+|--------|------|--------|-----|
+| OpenAI Chat | `reasoning_effort: "high"` | `"medium"` | `"low"` |
+| OpenAI Responses | `reasoning: {effort: "high"}` | `"medium"` | `"low"` |
+| Anthropic | `thinking: {budget_tokens: 32048}` | `16000` | `5000` |
+| Google | `thinkingConfig: {thinkingBudget: 24576}` | `12288` | `0` |
+
+> Anthropic 供應商會自動確保 `max_tokens > budget_tokens`（必要時提升 max_tokens）。
+
+**範例 — 使用 model 後綴：**
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer sk-s12ryt-your-key-here" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "o3(high)",
+    "messages": [{"role": "user", "content": "証明費馬最後定理"}]
+  }'
+```
+
+**範例 — 使用請求參數：**
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer sk-s12ryt-your-key-here" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-sonnet-4",
+    "messages": [{"role": "user", "content": "分析這段程式碼的時間複雜度"}],
+    "thinking_effort": "high"
+  }'
+```
+
+此功能在所有三個端點（`/v1/chat/completions`、`/v1/responses`、`/v1/messages`）和 Coding Mode fallback 中均生效，跨格式轉換時也會保留設定。
+
 ## 效能優化
 
 | 優化項目 | 說明 |
@@ -157,6 +234,9 @@ curl http://localhost:8000/v1/chat/completions \
 | **Model Prices 單一交易** | `batch_upsert_model_prices` 在同一交易中完成所有 upsert |
 | **快取自動失效** | Provider 增刪改時自動重建快取（`process.nextTick` / `asyncio.ensure_future` 批次化） |
 | **Multi-Key 負載均衡** | 加權隨機選擇金鑰 + Circuit Breaker（連續失敗 ≥3 次 → 60 秒冷卻排除） |
+| **DB 複合索引** | usage / api_keys / users 表新增 4 個複合索引，查詢 O(n) → O(log n) |
+| **有效限制快取** | `getEffectiveLimits` 合併為單次 LEFT JOIN（原 3 次 SELECT）+ 60s TTL 快取 + 6 處失效點，每請求 DB 查詢從 ~10 降至 0-2 |
+| **中間件共享結果** | rateLimiter → quotaChecker 透過 `res.locals` / context 共享已查詢結果，避免重複查詢 |
 
 ## 支援的供應商
 
@@ -167,7 +247,7 @@ curl http://localhost:8000/v1/chat/completions \
 | Anthropic | `anthropic` | Anthropic Messages API | `x-api-key: {key}` 標頭 |
 | Google | `google` | Google Gemini API | `?key={key}` 查詢參數 |
 
-> 💡 新增供應商時，系統會自動偵測端點支援的 API 協議並顯示連通狀態（✅/❌），輔助你選擇正確的類型。三種 API 格式之間會自動轉換，你只需要關注上游供應商實際支援的協議。
+> 💡 新增供應商時，系統會自動偵測端點支援的 API 協議，以 HTTP 狀態碼 + 信心等級（high/medium/low）分析並推薦最佳類型。三種 API 格式之間會自動轉換，你只需要關注上游供應商實際支援的協議。
 
 ### 格式轉換矩陣
 
@@ -181,18 +261,25 @@ curl http://localhost:8000/v1/chat/completions \
 
 ```
 s12ryt-tg-api/
+├── .github/
+│   └── workflows/
+│       └── release.yml              # GitHub Actions 自動發布（tag → Release + assets）
 ├── python/                          # Python 版本
 │   ├── main.py                      # 程式進入點
 │   ├── config.py                    # 環境變數配置
+│   ├── updater.py                   # 自動更新工具（從 GitHub Releases 拉取最新版）
 │   ├── requirements.txt             # Python 依賴
 │   ├── .env.example                 # 環境變數範本
 │   ├── api/                         # API 代理伺服器
 │   │   ├── server.py                # FastAPI 路由定義
 │   │   ├── key_selector.py          # 多金鑰選擇 + Circuit Breaker
 │   │   ├── middleware.py            # 認證中間件
+│   │   ├── rate_limiter.py          # 速率限制中間件（RPM/TPM 配額管控）
+│   │   ├── quota_checker.py         # 配額檢查中間件（有效模型限制檢查 + 快取）
 │   │   ├── usage_tracker.py         # 用量追蹤
 │   │   ├── responses.py             # 回應格式處理
 │   │   ├── anthropic_out.py         # Anthropic 輸出轉換
+│   │   ├── thinking_parser.py       # Thinking Effort 推理強度解析與注入
 │   │   └── providers/               # 各供應商適配器
 │   │       ├── openai.py            #   openai_chat (Chat Completions)
 │   │       ├── openai_response.py   #   openai_response (Responses API)
@@ -202,26 +289,32 @@ s12ryt-tg-api/
 │   │   ├── filters.py               # 消息過濾器
 │   │   ├── keyboards.py             # 鍵盤 UI 元件
 │   │   ├── handlers/                # 指令處理器
-│   │   │   ├── admin_handlers.py
-│   │   │   ├── user_handlers.py
-│   │   │   └── model_fetcher.py
+│   │   │   ├── admin_handlers.py    #   管理員指令（/provider /admin_user 等）
+│   │   │   ├── user_handlers.py     #   用戶指令（/url /key /usage /coding 等）
+│   │   │   ├── model_fetcher.py     #   模型清單抓取
+│   │   │   ├── limit_handlers.py    #   模型限制管理（/limits /my_limits）
+│   │   │   └── update_handlers.py   #   版本更新（/version /update /restart）
 │   │   └── conversations/           # 多輪對話流程
 │   ├── db/                          # 資料庫
 │   │   ├── database.py              # SQLite 操作
 │   │   └── models.py                # 資料模型
-│   └── tests/                       # 測試
+│   └── tests/                       # 測試（219 tests）
 │
 ├── nodejs/                          # Node.js 版本
 │   ├── src/
 │   │   ├── index.ts                 # 程式進入點
 │   │   ├── config.ts                # 環境變數配置
+│   │   ├── updater.ts               # 自動更新工具（從 GitHub Releases 拉取最新版）
 │   │   ├── api/                     # API 代理伺服器
 │   │   │   ├── server.ts
 │   │   │   ├── keySelector.ts       # 多金鑰選擇 + Circuit Breaker
 │   │   │   ├── middleware.ts
+│   │   │   ├── rateLimiter.ts       # 速率限制中間件（RPM/TPM 配額管控）
+│   │   │   ├── quotaChecker.ts      # 配額檢查中間件（有效模型限制檢查 + 快取）
 │   │   │   ├── usageTracker.ts
 │   │   │   ├── responses.ts
 │   │   │   ├── anthropic_out.ts
+│   │   │   ├── thinkingParser.ts    # Thinking Effort 推理強度解析與注入
 │   │   │   └── providers/           # 各供應商適配器
 │   │   │       ├── openai.ts        #   openai_chat (Chat Completions)
 │   │   │       ├── openaiResponse.ts#   openai_response (Responses API)
@@ -231,9 +324,11 @@ s12ryt-tg-api/
 │   │   │   ├── filters.ts
 │   │   │   ├── keyboards.ts
 │   │   │   ├── handlers/
-│   │   │   │   ├── adminHandlers.ts
-│   │   │   │   ├── userHandlers.ts
-│   │   │   │   └── modelFetcher.ts
+│   │   │   │   ├── adminHandlers.ts #   管理員指令
+│   │   │   │   ├── userHandlers.ts  #   用戶指令
+│   │   │   │   ├── modelFetcher.ts  #   模型清單抓取
+│   │   │   │   ├── limitHandlers.ts #   模型限制管理
+│   │   │   │   └── updateHandlers.ts#   版本更新
 │   │   │   └── conversations/
 │   │   └── db/
 │   │       └── database.ts

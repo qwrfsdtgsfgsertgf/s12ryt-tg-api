@@ -15,6 +15,8 @@ from typing import Any, AsyncIterator
 
 import httpx
 
+from api.thinking_parser import inject_for_google
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT = 120.0
@@ -142,6 +144,10 @@ def _to_gemini_request(openai_req: dict[str, Any]) -> dict[str, Any]:
 
     if gen_config:
         body["generationConfig"] = gen_config
+
+    # Inject thinking params if thinking_effort is set
+    if openai_req.get("thinking_effort") is not None:
+        inject_for_google(body, openai_req["thinking_effort"])
 
     return body
 

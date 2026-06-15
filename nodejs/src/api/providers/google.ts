@@ -5,6 +5,7 @@
  */
 
 import { v4 as uuidv4 } from "uuid";
+import { injectForGoogle, type ThinkingLevel } from "../thinkingParser.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -151,6 +152,11 @@ function toGeminiRequest(
 
   if (Object.keys(genConfig).length > 0) {
     body.generationConfig = genConfig;
+  }
+
+  // --- thinking budget (Gemini thinkingConfig) ---
+  if (openaiReq.thinking_effort) {
+    injectForGoogle(body, openaiReq.thinking_effort as ThinkingLevel);
   }
 
   return body;

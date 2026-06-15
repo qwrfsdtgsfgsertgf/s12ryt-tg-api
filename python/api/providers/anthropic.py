@@ -15,6 +15,8 @@ from typing import Any, AsyncIterator
 
 import httpx
 
+from api.thinking_parser import inject_for_anthropic
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT = 120.0
@@ -150,6 +152,10 @@ def _to_anthropic_request(openai_req: dict[str, Any]) -> dict[str, Any]:
         body["stop_sequences"] = stop
     if "stream" in openai_req:
         body["stream"] = openai_req["stream"]
+
+    # Inject thinking params if thinking_effort is set
+    if openai_req.get("thinking_effort") is not None:
+        inject_for_anthropic(body, openai_req["thinking_effort"])
 
     return body
 
