@@ -87,6 +87,58 @@ const PROVIDER_MODULES: Record<string, any> = {
 };
 
 // ---------------------------------------------------------------------------
+// SSE helpers
+// ---------------------------------------------------------------------------
+
+/** Set standard SSE headers and flush.  Eliminates 4× duplication across routes. */
+function setupSSEHeaders(res: Response): void {
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  res.flushHeaders();
+}
+
+/**
+ * Calculate cost, record usage, and optionally increment coding session stats.
+ * Eliminates ~8× duplicated try/catch blocks across all route handlers.
+ */
+async function recordUsageAndCost(
+  auth: any,
+  providerId: string | number,
+  modelName: string,
+  inTokens: number,
+  outTokens: number,
+  inPrice: number | null,
+  outPrice: number | null,
+  isCodingMode: boolean = false,
+): Promise<void> {
+  if (inTokens <= 0 && outTokens <= 0) return;
+  try {
+    const cost = calculateCost(inPrice, outPrice, inTokens, outTokens);
+    if (!auth) return;
+    await recordUsage({
+      apiKeyId: auth.apiKeyId, userId: auth.userId,
+      providerId: String(providerId),
+      inputTokens: inTokens,
+      outputTokens: outTokens,
+      inputCost: cost.input_cost,
+      outputCost: cost.output_cost,
+      model: modelName,
+    });
+    if (isCodingMode && auth.userId) {
+      try {
+        incrementCodingSessionStats(parseInt(auth.userId), inTokens, outTokens, cost.input_cost, cost.output_cost, modelName);
+      } catch (e) {
+        console.error("[coding-stats] Failed to increment:", e);
+      }
+    }
+  } catch (err) {
+    console.error("Failed to record usage:", err);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Database-driven model resolution (optimized with in-memory cache)
 // ---------------------------------------------------------------------------
 
@@ -107,35 +159,19 @@ interface ResolvedProvider {
  * Selects best available API key from multi-key JSON array.
  */
 function lookupModelDb(modelName: string): ResolvedProvider {
-  const cached = lookupModelCached(modelName);
-  if (cached) {
-    const { key, keyIndex } = selectKey(cached.providerId, cached.apiKey);
-    return {
-      providerType: cached.providerType,
-      providerId: cached.providerId,
-      providerName: cached.providerName,
-      config: { baseUrl: cached.baseUrl, apiKey: key ?? cached.apiKey, _keyIndex: keyIndex },
-      inputPrice: cached.inputPrice,
-      outputPrice: cached.outputPrice,
-    };
-  }
+  const cached = lookupModelCached(modelName)
+    ?? (rebuildProviderCache(), lookupModelCached(modelName)); // rebuild + retry once on miss
+  if (!cached) throw new Error(`Unknown model: ${modelName}`);
 
-  // Cache miss — rebuild and retry once
-  rebuildProviderCache();
-  const retry = lookupModelCached(modelName);
-  if (retry) {
-    const { key, keyIndex } = selectKey(retry.providerId, retry.apiKey);
-    return {
-      providerType: retry.providerType,
-      providerId: retry.providerId,
-      providerName: retry.providerName,
-      config: { baseUrl: retry.baseUrl, apiKey: key ?? retry.apiKey, _keyIndex: keyIndex },
-      inputPrice: retry.inputPrice,
-      outputPrice: retry.outputPrice,
-    };
-  }
-
-  throw new Error(`Unknown model: ${modelName}`);
+  const { key, keyIndex } = selectKey(cached.providerId, cached.apiKey);
+  return {
+    providerType: cached.providerType,
+    providerId: cached.providerId,
+    providerName: cached.providerName,
+    config: { baseUrl: cached.baseUrl, apiKey: key ?? cached.apiKey, _keyIndex: keyIndex },
+    inputPrice: cached.inputPrice,
+    outputPrice: cached.outputPrice,
+  };
 }
 
 interface DispatchResult {
@@ -323,34 +359,44 @@ async function forwardStreamAndExtractUsage(
   const decoder = new TextDecoder();
   let inputTokens = 0;
   let outputTokens = 0;
+  let sseBuffer = "";
 
   for await (const chunk of stream) {
     write(chunk);
 
-    // Try to extract usage from SSE data lines
-    const text = decoder.decode(chunk, { stream: true });
-    for (const line of text.split("\n")) {
-      const trimmed = line.trim();
-      if (!trimmed.startsWith("data: ")) continue;
-      const payload = trimmed.slice(6).trim();
-      if (!payload || payload === "[DONE]") continue;
+    // Accumulate across TCP chunk boundaries to avoid losing split SSE lines
+    sseBuffer += decoder.decode(chunk, { stream: true });
+    const lines = sseBuffer.split("\n");
+    sseBuffer = lines.pop() ?? ""; // keep incomplete trailing line
 
-      try {
-        const parsed = JSON.parse(payload);
-        if (parsed.usage) {
-          if (parsed.usage.prompt_tokens) inputTokens = parsed.usage.prompt_tokens;
-          if (parsed.usage.completion_tokens) outputTokens = parsed.usage.completion_tokens;
-          // Fallback key names
-          if (!inputTokens && parsed.usage.input_tokens) inputTokens = parsed.usage.input_tokens;
-          if (!outputTokens && parsed.usage.output_tokens) outputTokens = parsed.usage.output_tokens;
-        }
-      } catch {
-        // Not JSON – skip
-      }
+    for (const line of lines) {
+      extractUsageFromSSE(line.trim());
     }
   }
 
+  // Flush decoder + remaining buffer
+  sseBuffer += decoder.decode();
+  for (const line of sseBuffer.split("\n")) {
+    extractUsageFromSSE(line.trim());
+  }
+
   return { input_tokens: inputTokens, output_tokens: outputTokens };
+
+  /** Parse a single SSE data line and update token counters in closure. */
+  function extractUsageFromSSE(trimmed: string): void {
+    if (!trimmed.startsWith("data: ")) return;
+    const payload = trimmed.slice(6).trim();
+    if (!payload || payload === "[DONE]") return;
+    try {
+      const parsed = JSON.parse(payload);
+      if (parsed.usage) {
+        if (parsed.usage.prompt_tokens) inputTokens = parsed.usage.prompt_tokens;
+        if (parsed.usage.completion_tokens) outputTokens = parsed.usage.completion_tokens;
+        if (!inputTokens && parsed.usage.input_tokens) inputTokens = parsed.usage.input_tokens;
+        if (!outputTokens && parsed.usage.output_tokens) outputTokens = parsed.usage.output_tokens;
+      }
+    } catch { /* not JSON – skip */ }
+  }
 }
 
 /**
@@ -374,10 +420,14 @@ async function extractUsageFromProviderStream(
 
   // Producer: consume providerStream, extract usage, push to queue
   const producer = (async () => {
+    let sseBuffer = "";
     for await (const chunk of providerStream) {
-      // Extract usage
-      const text = decoder.decode(chunk, { stream: true });
-      for (const line of text.split("\n")) {
+      // Accumulate across TCP chunk boundaries
+      sseBuffer += decoder.decode(chunk, { stream: true });
+      const lines = sseBuffer.split("\n");
+      sseBuffer = lines.pop() ?? ""; // keep incomplete trailing line
+
+      for (const line of lines) {
         const trimmed = line.trim();
         if (!trimmed.startsWith("data: ")) continue;
         const payload = trimmed.slice(6).trim();
@@ -400,6 +450,24 @@ async function extractUsageFromProviderStream(
         r({ value: chunkQueue.shift()!, done: false });
       }
     }
+    // Flush decoder + remaining buffer
+    sseBuffer += decoder.decode();
+    for (const line of sseBuffer.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith("data: ")) continue;
+      const payload = trimmed.slice(6).trim();
+      if (!payload || payload === "[DONE]") continue;
+      try {
+        const parsed = JSON.parse(payload);
+        if (parsed.usage) {
+          if (parsed.usage.prompt_tokens) inputTokens = parsed.usage.prompt_tokens;
+          if (parsed.usage.completion_tokens) outputTokens = parsed.usage.completion_tokens;
+          if (!inputTokens && parsed.usage.input_tokens) inputTokens = parsed.usage.input_tokens;
+          if (!outputTokens && parsed.usage.output_tokens) outputTokens = parsed.usage.output_tokens;
+        }
+      } catch { /* skip */ }
+    }
+
     streamDone = true;
     if (resolveHolder.fn) {
       const r = resolveHolder.fn;
@@ -510,13 +578,7 @@ app.post(
 
       // Streaming response
       if (isStream && result && typeof result[Symbol.asyncIterator] === "function") {
-        res.setHeader("Content-Type", "text/event-stream");
-        res.setHeader("Cache-Control", "no-cache");
-        res.setHeader("Connection", "keep-alive");
-        res.setHeader("X-Accel-Buffering", "no");
-        res.flushHeaders();
-
-        console.log(`[DEBUG] Entering streaming for /v1/chat/completions model=${actualModel}`);
+        setupSSEHeaders(res);
 
         try {
           let chunkCount = 0;
@@ -526,31 +588,8 @@ app.post(
           );
 
           // Record streaming usage
-          if (streamUsage.input_tokens > 0 || streamUsage.output_tokens > 0) {
-            try {
-              const cost = calculateCost(inputPrice, outputPrice, streamUsage.input_tokens, streamUsage.output_tokens);
-              const auth = req.auth;
-              if (auth) {
-                await recordUsage({
-                  apiKeyId: auth.apiKeyId, userId: auth.userId,
-                  providerId: String(providerId),
-                  inputTokens: streamUsage.input_tokens,
-                  outputTokens: streamUsage.output_tokens,
-                  inputCost: cost.input_cost,
-                  outputCost: cost.output_cost,
-                  model: actualModel,
-                });
-                // Coding session stats
-                if (isCodingMode && auth.userId) {
-                  try { incrementCodingSessionStats(parseInt(auth.userId), streamUsage.input_tokens, streamUsage.output_tokens, cost.input_cost, cost.output_cost, actualModel); } catch (e) { console.error("[coding-stats] Failed to increment:", e); }
-                }
-              }
-            } catch (err) {
-              console.error("Failed to record streaming usage:", err);
-            }
-          }
-
-          console.log(`[DEBUG] Stream finished for /v1/chat/completions model=${actualModel}`);
+          await recordUsageAndCost(req.auth, providerId, actualModel,
+            streamUsage.input_tokens, streamUsage.output_tokens, inputPrice, outputPrice, isCodingMode);
         } catch (err: any) {
           console.error("Stream error:", err);
         } finally {
@@ -563,24 +602,8 @@ app.post(
       if (result && typeof result === "object") {
         try {
           const usage = extractUsage(providerType, result);
-          const cost = calculateCost(inputPrice, outputPrice, usage.input_tokens, usage.output_tokens);
-
-          const auth = req.auth;
-          if (auth) {
-            await recordUsage({
-              apiKeyId: auth.apiKeyId, userId: auth.userId,
-              providerId: String(providerId),
-              inputTokens: usage.input_tokens,
-              outputTokens: usage.output_tokens,
-              inputCost: cost.input_cost,
-              outputCost: cost.output_cost,
-              model: actualModel,
-            });
-            // Coding session stats
-            if (isCodingMode && auth.userId) {
-              try { incrementCodingSessionStats(parseInt(auth.userId), usage.input_tokens, usage.output_tokens, cost.input_cost, cost.output_cost, actualModel); } catch (e) { console.error("[coding-stats] Failed to increment:", e); }
-            }
-          }
+          await recordUsageAndCost(req.auth, providerId, actualModel,
+            usage.input_tokens, usage.output_tokens, inputPrice, outputPrice, isCodingMode);
         } catch (err) {
           console.error("Failed to record usage:", err);
         }
@@ -656,36 +679,18 @@ app.post(
             const result = await openaiResponseProvider.responsesApi(body, _resolved.config);
 
             if (isStreamResp && result && Symbol.asyncIterator in Object(result)) {
-              res.setHeader("Content-Type", "text/event-stream");
-              res.setHeader("Cache-Control", "no-cache");
-              res.setHeader("Connection", "keep-alive");
-              res.setHeader("X-Accel-Buffering", "no");
-              res.flushHeaders();
+              setupSSEHeaders(res);
 
               try {
                 const streamUsage = await forwardStreamAndExtractUsage(
                   result as AsyncIterable<Uint8Array>,
                   (chunk) => { writeAndFlush(res, chunk); },
                 );
-                if (streamUsage.input_tokens > 0 || streamUsage.output_tokens > 0) {
-                  try {
-                    const cost = calculateCost(_resolved.inputPrice, _resolved.outputPrice, streamUsage.input_tokens, streamUsage.output_tokens);
-                    const auth = req.auth;
-                    if (auth) {
-                      await recordUsage({
-                        apiKeyId: auth.apiKeyId, userId: auth.userId,
-                        providerId: String(_resolved.providerId),
-                        inputTokens: streamUsage.input_tokens,
-                        outputTokens: streamUsage.output_tokens,
-                        inputCost: cost.input_cost,
-                        outputCost: cost.output_cost,
-                        model: modelName,
-                      });
-                    }
-                  } catch (err) {
-                    console.error("Failed to record streaming usage:", err);
-                  }
-                }
+                await recordUsageAndCost(
+                  req.auth, String(_resolved.providerId), modelName,
+                  streamUsage.input_tokens, streamUsage.output_tokens,
+                  _resolved.inputPrice, _resolved.outputPrice,
+                );
               } catch (err: any) {
                 console.error("Responses direct stream error:", err);
               } finally {
@@ -698,25 +703,11 @@ app.post(
               const _u = (result as any).usage ?? {};
               const _inT: number = _u.input_tokens ?? 0;
               const _outT: number = _u.output_tokens ?? 0;
-              try {
-                if (_inT > 0 || _outT > 0) {
-                  const cost = calculateCost(_resolved.inputPrice, _resolved.outputPrice, _inT, _outT);
-                  const auth = req.auth;
-                  if (auth) {
-                    await recordUsage({
-                      apiKeyId: auth.apiKeyId, userId: auth.userId,
-                      providerId: String(_resolved.providerId),
-                      inputTokens: _inT,
-                      outputTokens: _outT,
-                      inputCost: cost.input_cost,
-                      outputCost: cost.output_cost,
-                      model: modelName,
-                    });
-                  }
-                }
-              } catch (err) {
-                console.error("Failed to record usage:", err);
-              }
+              await recordUsageAndCost(
+                req.auth, String(_resolved.providerId), modelName,
+                _inT, _outT,
+                _resolved.inputPrice, _resolved.outputPrice,
+              );
               res.json(result);
               return;
             }
@@ -803,13 +794,7 @@ app.post(
 
       // Streaming: convert Chat Completions SSE → Responses API SSE
       if (isStream && result2 && typeof result2[Symbol.asyncIterator] === "function") {
-        res.setHeader("Content-Type", "text/event-stream");
-        res.setHeader("Cache-Control", "no-cache");
-        res.setHeader("Connection", "keep-alive");
-        res.setHeader("X-Accel-Buffering", "no");
-        res.flushHeaders();
-
-        console.log(`[DEBUG] Entering streaming for /v1/responses model=${actualModel}`);
+        setupSSEHeaders(res);
 
         try {
           let chunkCount = 0;
@@ -830,30 +815,8 @@ app.post(
           );
 
           // Record streaming usage
-          if (streamUsage.input_tokens > 0 || streamUsage.output_tokens > 0) {
-            try {
-              const cost = calculateCost(inputPrice, outputPrice, streamUsage.input_tokens, streamUsage.output_tokens);
-              const auth = req.auth;
-              if (auth) {
-                await recordUsage({
-                  apiKeyId: auth.apiKeyId, userId: auth.userId,
-                  providerId: String(providerId),
-                  inputTokens: streamUsage.input_tokens,
-                  outputTokens: streamUsage.output_tokens,
-                  inputCost: cost.input_cost,
-                  outputCost: cost.output_cost,
-                  model: actualModel,
-                });
-                if (isCodingModeResp && auth.userId) {
-                  try { incrementCodingSessionStats(parseInt(auth.userId), streamUsage.input_tokens, streamUsage.output_tokens, cost.input_cost, cost.output_cost, actualModel); } catch (e) { console.error("[coding-stats] Failed to increment:", e); }
-                }
-              }
-            } catch (err) {
-              console.error("Failed to record streaming usage:", err);
-            }
-          }
+          await recordUsageAndCost(req.auth, String(providerId), actualModel, streamUsage.input_tokens, streamUsage.output_tokens, inputPrice, outputPrice, isCodingModeResp);
 
-          console.log(`[DEBUG] Stream finished for /v1/responses model=${actualModel}`);
         } catch (err: any) {
           console.error("Responses stream error:", err);
         } finally {
@@ -874,23 +837,7 @@ app.post(
         // Extract usage and record
         try {
           const usage = extractUsage(providerType, result2);
-          const cost = calculateCost(inputPrice, outputPrice, usage.input_tokens, usage.output_tokens);
-
-          const auth = req.auth;
-          if (auth) {
-            await recordUsage({
-              apiKeyId: auth.apiKeyId, userId: auth.userId,
-              providerId: String(providerId),
-              inputTokens: usage.input_tokens,
-              outputTokens: usage.output_tokens,
-              inputCost: cost.input_cost,
-              outputCost: cost.output_cost,
-              model: actualModel,
-            });
-            if (isCodingModeResp && auth.userId) {
-              try { incrementCodingSessionStats(parseInt(auth.userId), usage.input_tokens, usage.output_tokens, cost.input_cost, cost.output_cost, actualModel); } catch (e) { console.error("[coding-stats] Failed to increment:", e); }
-            }
-          }
+          await recordUsageAndCost(req.auth, String(providerId), actualModel, usage.input_tokens, usage.output_tokens, inputPrice, outputPrice, isCodingModeResp);
         } catch (err) {
           console.error("Failed to record usage:", err);
         }
@@ -982,13 +929,7 @@ app.post(
 
       // Streaming: convert OpenAI SSE → Anthropic SSE
       if (isStream && result && typeof result[Symbol.asyncIterator] === "function") {
-        res.setHeader("Content-Type", "text/event-stream");
-        res.setHeader("Cache-Control", "no-cache");
-        res.setHeader("Connection", "keep-alive");
-        res.setHeader("X-Accel-Buffering", "no");
-        res.flushHeaders();
-
-        console.log(`[DEBUG] Entering streaming for /v1/messages model=${actualModel}`);
+        setupSSEHeaders(res);
 
         try {
           let chunkCount = 0;
@@ -1003,31 +944,7 @@ app.post(
             },
           );
 
-          // Record streaming usage
-          if (streamUsage.input_tokens > 0 || streamUsage.output_tokens > 0) {
-            try {
-              const cost = calculateCost(inputPrice, outputPrice, streamUsage.input_tokens, streamUsage.output_tokens);
-              const auth = req.auth;
-              if (auth) {
-                await recordUsage({
-                  apiKeyId: auth.apiKeyId, userId: auth.userId,
-                  providerId: String(providerId),
-                  inputTokens: streamUsage.input_tokens,
-                  outputTokens: streamUsage.output_tokens,
-                  inputCost: cost.input_cost,
-                  outputCost: cost.output_cost,
-                  model: actualModel,
-                });
-                if (isCodingModeMsg && auth.userId) {
-                  try { incrementCodingSessionStats(parseInt(auth.userId), streamUsage.input_tokens, streamUsage.output_tokens, cost.input_cost, cost.output_cost, actualModel); } catch (e) { console.error("[coding-stats] Failed to increment:", e); }
-                }
-              }
-            } catch (err) {
-              console.error("Failed to record streaming usage:", err);
-            }
-          }
-
-          console.log(`[DEBUG] Stream finished for /v1/messages model=${actualModel}`);
+          await recordUsageAndCost(req.auth, String(providerId), actualModel, streamUsage.input_tokens, streamUsage.output_tokens, inputPrice, outputPrice, isCodingModeMsg);
         } catch (err: any) {
           console.error("Anthropic stream error:", err);
         } finally {
@@ -1040,26 +957,9 @@ app.post(
       if (result && typeof result === "object") {
         const anthropicResult = convertChatCompletionToAnthropic(result, actualModel);
 
-        // Extract usage and record
         try {
           const usage = extractUsage(providerType, result);
-          const cost = calculateCost(inputPrice, outputPrice, usage.input_tokens, usage.output_tokens);
-
-          const auth = req.auth;
-          if (auth) {
-            await recordUsage({
-              apiKeyId: auth.apiKeyId, userId: auth.userId,
-              providerId: String(providerId),
-              inputTokens: usage.input_tokens,
-              outputTokens: usage.output_tokens,
-              inputCost: cost.input_cost,
-              outputCost: cost.output_cost,
-              model: actualModel,
-            });
-            if (isCodingModeMsg && auth.userId) {
-              try { incrementCodingSessionStats(parseInt(auth.userId), usage.input_tokens, usage.output_tokens, cost.input_cost, cost.output_cost, actualModel); } catch (e) { console.error("[coding-stats] Failed to increment:", e); }
-            }
-          }
+          await recordUsageAndCost(req.auth, String(providerId), actualModel, usage.input_tokens, usage.output_tokens, inputPrice, outputPrice, isCodingModeMsg);
         } catch (err) {
           console.error("Failed to record usage:", err);
         }

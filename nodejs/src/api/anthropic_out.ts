@@ -9,6 +9,8 @@
 
 import { v4 as uuidv4 } from "uuid";
 
+const sharedEncoder = new TextEncoder();
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -18,8 +20,7 @@ function genId(prefix: string): string {
 }
 
 function sseLine(event: string, data: unknown): Uint8Array {
-  const encoder = new TextEncoder();
-  return encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  return sharedEncoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 }
 
 // ---------------------------------------------------------------------------
@@ -394,10 +395,14 @@ export async function* streamAnthropicApi(
     return out;
   }
 
+  // SSE buffer: accumulate partial lines across TCP chunk boundaries
+  let sseBuffer = "";
+
   // Process the OpenAI SSE stream
   for await (const chunk of providerStream) {
-    const text = decoder.decode(chunk, { stream: true });
-    const lines = text.split("\n");
+    sseBuffer += decoder.decode(chunk, { stream: true });
+    const lines = sseBuffer.split("\n");
+    sseBuffer = lines.pop() ?? ""; // keep incomplete trailing line
 
     for (const line of lines) {
       const trimmed = line.trim();
@@ -587,6 +592,9 @@ export async function* streamAnthropicApi(
       }
     }
   }
+
+  // Flush remaining decoder bytes
+  sseBuffer += decoder.decode();
 
   // If we reach here without a finish_reason, still close gracefully
   for (const b of ensureMessageStarted()) yield b;

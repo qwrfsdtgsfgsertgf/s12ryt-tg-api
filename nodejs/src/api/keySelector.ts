@@ -8,13 +8,13 @@
  * Selection strategy:
  *   - Pick first non-suspended key
  *   - Track consecutive failures per (provider_id, key_index)
- *   - After 5 consecutive failures → suspend for 5 minutes
+ *   - After 3 consecutive failures → suspend for 60 seconds
  *   - On success → reset fail count
  */
 
 // ── Configuration ──────────────────────────────────────────────
-const MAX_CONSECUTIVE_FAILURES = 5;
-const SUSPEND_DURATION_MS = 300_000; // 5 minutes
+const MAX_CONSECUTIVE_FAILURES = 3;
+const SUSPEND_DURATION_MS = 60_000; // 60 seconds
 
 // ── In-memory state ────────────────────────────────────────────
 // { providerId: { keyIndex: { failCount, suspendedUntil } } }

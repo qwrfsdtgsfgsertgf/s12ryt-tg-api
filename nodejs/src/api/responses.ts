@@ -9,6 +9,9 @@
 
 import { v4 as uuidv4 } from "uuid";
 
+/** Shared TextEncoder instance — avoids per-call allocation. */
+const sharedEncoder = new TextEncoder();
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -274,15 +277,8 @@ export function convertChatCompletionToResponses(
 // Streaming: Chat Completions SSE → Responses API SSE
 // ---------------------------------------------------------------------------
 
-let seqCounter = 0;
-
-function nextSeq(): number {
-  return ++seqCounter;
-}
-
 function sseLine(event: string, data: unknown): Uint8Array {
-  const encoder = new TextEncoder();
-  return encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  return sharedEncoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 }
 
 /**
@@ -303,7 +299,7 @@ export async function* streamResponsesApi(
     top_p?: number;
   }
 ): AsyncGenerator<Uint8Array> {
-  seqCounter = 0;
+  let localSeq = 0;
   const now = Math.floor(Date.now() / 1000);
   const respId = genId("resp");
   const msgId = genId("msg");
@@ -348,14 +344,14 @@ export async function* streamResponsesApi(
   // Emit: response.created
   yield sseLine("response.created", {
     type: "response.created",
-    sequence_number: nextSeq(),
+    sequence_number: ++localSeq,
     response: { ...baseResponse },
   });
 
   // Emit: response.in_progress
   yield sseLine("response.in_progress", {
     type: "response.in_progress",
-    sequence_number: nextSeq(),
+    sequence_number: ++localSeq,
     response: { ...baseResponse },
   });
 
@@ -389,10 +385,13 @@ export async function* streamResponsesApi(
   // Track tool calls being built
   const toolCallBuffers: Map<number, { id: string; name: string; arguments: string }> = new Map();
 
-  for await (const chunk of providerStream) {
-    const text = decoder.decode(chunk, { stream: true });
+  // SSE buffer: accumulate partial lines across TCP chunk boundaries
+  let sseBuffer = "";
 
-    const lines = text.split("\n");
+  for await (const chunk of providerStream) {
+    sseBuffer += decoder.decode(chunk, { stream: true });
+    const lines = sseBuffer.split("\n");
+    sseBuffer = lines.pop() ?? ""; // keep incomplete trailing line
 
     for (const line of lines) {
       const trimmed = line.trim();
@@ -452,7 +451,7 @@ export async function* streamResponsesApi(
           outputItems.push(reasoningItem);
           yield sseLine("response.output_item.added", {
             type: "response.output_item.added",
-            sequence_number: nextSeq(),
+            sequence_number: ++localSeq,
             output_index: reasoningOutputIndex,
             item: reasoningItem,
           });
@@ -461,7 +460,7 @@ export async function* streamResponsesApi(
         reasoningText += delta.reasoning;
         yield sseLine("response.reasoning_summary_text.delta", {
           type: "response.reasoning_summary_text.delta",
-          sequence_number: nextSeq(),
+          sequence_number: ++localSeq,
           item_id: reasoningItemId,
           output_index: reasoningOutputIndex,
           summary_index: 0,
@@ -478,7 +477,7 @@ export async function* streamResponsesApi(
           outputItems.push(messageItem);
           yield sseLine("response.output_item.added", {
             type: "response.output_item.added",
-            sequence_number: nextSeq(),
+            sequence_number: ++localSeq,
             output_index: currentOutputIndex,
             item: messageItem,
           });
@@ -489,7 +488,7 @@ export async function* streamResponsesApi(
           textPartEmitted = true;
           yield sseLine("response.content_part.added", {
             type: "response.content_part.added",
-            sequence_number: nextSeq(),
+            sequence_number: ++localSeq,
             item_id: itemId,
             output_index: currentOutputIndex,
             content_index: 0,
@@ -500,7 +499,7 @@ export async function* streamResponsesApi(
         accumulatedText += delta.content;
         yield sseLine("response.output_text.delta", {
           type: "response.output_text.delta",
-          sequence_number: nextSeq(),
+          sequence_number: ++localSeq,
           item_id: itemId,
           output_index: currentOutputIndex,
           content_index: 0,
@@ -514,7 +513,7 @@ export async function* streamResponsesApi(
         if (reasoningItemEmitted) {
           yield sseLine("response.reasoning_summary_text.done", {
             type: "response.reasoning_summary_text.done",
-            sequence_number: nextSeq(),
+            sequence_number: ++localSeq,
             item_id: reasoningItemId,
             output_index: reasoningOutputIndex,
             summary_index: 0,
@@ -531,7 +530,7 @@ export async function* streamResponsesApi(
 
           yield sseLine("response.output_item.done", {
             type: "response.output_item.done",
-            sequence_number: nextSeq(),
+            sequence_number: ++localSeq,
             output_index: reasoningOutputIndex,
             item: completedReasoningItem,
           });
@@ -557,13 +556,13 @@ export async function* streamResponsesApi(
           outputItems.push(fcItem);
           yield sseLine("response.output_item.added", {
             type: "response.output_item.added",
-            sequence_number: nextSeq(),
+            sequence_number: ++localSeq,
             output_index: fcOutputIndex,
             item: fcItem,
           });
           yield sseLine("response.output_item.done", {
             type: "response.output_item.done",
-            sequence_number: nextSeq(),
+            sequence_number: ++localSeq,
             output_index: fcOutputIndex,
             item: fcItem,
           });
@@ -573,7 +572,7 @@ export async function* streamResponsesApi(
         if (textPartEmitted) {
           yield sseLine("response.output_text.done", {
             type: "response.output_text.done",
-            sequence_number: nextSeq(),
+            sequence_number: ++localSeq,
             item_id: itemId,
             output_index: currentOutputIndex,
             content_index: 0,
@@ -582,7 +581,7 @@ export async function* streamResponsesApi(
 
           yield sseLine("response.content_part.done", {
             type: "response.content_part.done",
-            sequence_number: nextSeq(),
+            sequence_number: ++localSeq,
             item_id: itemId,
             output_index: currentOutputIndex,
             content_index: 0,
@@ -594,7 +593,7 @@ export async function* streamResponsesApi(
         if (messageItemEmitted) {
           yield sseLine("response.output_item.done", {
             type: "response.output_item.done",
-            sequence_number: nextSeq(),
+            sequence_number: ++localSeq,
             output_index: currentOutputIndex,
             item: {
               type: "message",
@@ -638,14 +637,33 @@ export async function* streamResponsesApi(
 
         yield sseLine("response.completed", {
           type: "response.completed",
-          sequence_number: nextSeq(),
+          sequence_number: ++localSeq,
           response: completedResponse,
         });
 
-        const encoder = new TextEncoder();
-        yield encoder.encode("data: [DONE]\n\n");
+        yield sharedEncoder.encode("data: [DONE]\n\n");
         return;
       }
+    }
+  }
+
+  // Flush remaining decoder bytes
+  sseBuffer += decoder.decode();
+  // Process any remaining data in buffer (stream ended without trailing newline)
+  if (sseBuffer.trim()) {
+    const remainingLines = sseBuffer.split("\n");
+    for (const line of remainingLines) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith("data: ")) continue;
+      const data = trimmed.slice(6).trim();
+      if (data === "[DONE]") continue;
+      try {
+        const parsed = JSON.parse(data);
+        if (parsed.usage) {
+          totalInputTokens = parsed.usage.prompt_tokens ?? totalInputTokens;
+          totalOutputTokens = parsed.usage.completion_tokens ?? totalOutputTokens;
+        }
+      } catch { /* ignore */ }
     }
   }
 
@@ -700,12 +718,11 @@ export async function* streamResponsesApi(
 
   yield sseLine("response.completed", {
     type: "response.completed",
-    sequence_number: nextSeq(),
+    sequence_number: ++localSeq,
     response: completedResponse,
   });
 
-  const encoder = new TextEncoder();
-  yield encoder.encode("data: [DONE]\n\n");
+  yield sharedEncoder.encode("data: [DONE]\n\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -915,7 +932,6 @@ export async function* streamChatFromResponses(
 ): AsyncGenerator<Uint8Array> {
   const chatId = `chatcmpl-${uuidv4().replace(/-/g, "").slice(0, 24)}`;
   const created = Math.floor(Date.now() / 1000);
-  const textEncoder = new TextEncoder();
   const decoder = new TextDecoder();
 
   function chatChunk(
@@ -931,7 +947,7 @@ export async function* streamChatFromResponses(
       choices: [{ index: 0, delta, finish_reason: finishReason ?? null }],
     };
     if (usage) chunk.usage = usage;
-    return textEncoder.encode(`data: ${JSON.stringify(chunk)}\n\n`);
+    return sharedEncoder.encode(`data: ${JSON.stringify(chunk)}\n\n`);
   }
 
   let buffer = "";
@@ -956,7 +972,7 @@ export async function* streamChatFromResponses(
 
       const data = stripped.slice(6);
       if (data === "[DONE]") {
-        yield textEncoder.encode("data: [DONE]\n\n");
+        yield sharedEncoder.encode("data: [DONE]\n\n");
         return;
       }
 
@@ -1006,5 +1022,5 @@ export async function* streamChatFromResponses(
   }
 
   // Safety: emit DONE if stream ended without one
-  yield textEncoder.encode("data: [DONE]\n\n");
+  yield sharedEncoder.encode("data: [DONE]\n\n");
 }

@@ -48,6 +48,8 @@
  */
 
 import { Router, type Request, type Response } from "express";
+import path from "path";
+import fs from "fs";
 import {
   exchangeToken,
   destroySession,
@@ -492,7 +494,7 @@ router.get("/api/admin/users", (_req: Request, res: Response) => {
 });
 
 /** POST /web/api/admin/users — 新增用戶 */
-router.post("/web/api/admin/users", (req: Request, res: Response) => {
+router.post("/api/admin/users", (req: Request, res: Response) => {
   const { tgUserId, username } = req.body;
   if (!tgUserId || isNaN(parseInt(tgUserId, 10))) {
     res.status(400).json({ error: "需要有效的 tgUserId" });
@@ -1302,6 +1304,32 @@ router.post("/api/admin/restart", (req: Request, res: Response) => {
   } catch (err) {
     console.error("[web] restart error:", err);
     res.status(500).json({ error: "重啟失敗：" + (err instanceof Error ? err.message : String(err)) });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Favicon — suppress browser auto-request noise (204 No Content)
+// ---------------------------------------------------------------------------
+router.get("/favicon.ico", (_req: Request, res: Response) => {
+  res.status(204).end();
+});
+
+// ---------------------------------------------------------------------------
+// API 404 catch-all — return JSON for any unmatched /api/* route
+// ---------------------------------------------------------------------------
+router.use("/api", (_req: Request, res: Response) => {
+  res.status(404).json({ error: "未知的 API 端點" });
+});
+
+// ---------------------------------------------------------------------------
+// SPA fallback — serve index.html for non-API GET requests (deep linking)
+// ---------------------------------------------------------------------------
+router.get("*", (_req: Request, res: Response) => {
+  const indexPath = path.join(process.cwd(), "web", "index.html");
+  if (fs.existsSync(indexPath)) {
+    res.sendFile(indexPath);
+  } else {
+    res.status(404).send("Web 控制台檔案未找到");
   }
 });
 

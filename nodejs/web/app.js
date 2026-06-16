@@ -42,16 +42,35 @@
         opts.body = JSON.stringify(body);
       }
 
-      const resp = await fetch(path, opts);
+      // 超時 + 網路錯誤處理
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 30_000);
+      opts.signal = controller.signal;
+
+      let resp;
+      try {
+        resp = await fetch(path, opts);
+      } catch (netErr) {
+        clearTimeout(timer);
+        if (netErr.name === "AbortError") {
+          throw new Error("請求逾時，請稍後再試");
+        }
+        throw new Error("網路連線失敗，請檢查網路狀態");
+      }
+      clearTimeout(timer);
+
       const data = await resp.json().catch(() => ({}));
 
       if (!resp.ok) {
         const msg = data.error || `HTTP ${resp.status}`;
         if (resp.status === 401) {
-          // session 過期，清除並跳轉
           state.sessionToken = null;
           localStorage.removeItem("web_session");
           showLogin("登入已過期，請重新從 Bot 取得連結");
+          return new Promise(() => {}); // 停止執行，不觸發 caller 的 catch
+        }
+        if (resp.status === 404) {
+          throw new Error(`請求的資源不存在 (${path})，可能是版本過舊或端點已變更`);
         }
         throw new Error(msg);
       }
@@ -324,6 +343,10 @@
     return `<div class="loading"><div class="spinner"></div><p>${esc(msg)}</p></div>`;
   }
 
+  function errorState(msg, title = "載入失敗") {
+    return `<div class="empty-state"><div class="icon">${ic.alert}</div><div class="title">${esc(title)}</div><p>${esc(msg)}</p></div>`;
+  }
+
   function skeleton(rows = 4) {
     let html = '<div class="card" style="padding:16px;">';
     for (let i = 0; i < rows; i++) {
@@ -408,7 +431,7 @@
         </div>
       `;
     } catch (err) {
-      body.innerHTML = `<div class="empty-state"><div class="icon">${ic.alert}</div><div class="title">載入失敗</div><p>${esc(err.message)}</p></div>`;
+      body.innerHTML = errorState(err.message);
     }
   }
 
@@ -460,7 +483,7 @@
         });
       };
     } catch (err) {
-      body.innerHTML = `<div class="empty-state"><div class="icon">${ic.alert}</div><div class="title">載入失敗</div><p>${esc(err.message)}</p></div>`;
+      body.innerHTML = errorState(err.message);
     }
   }
 
@@ -534,7 +557,7 @@
         </div>
       `;
     } catch (err) {
-      body.innerHTML = `<div class="empty-state"><div class="icon">${ic.alert}</div><div class="title">載入失敗</div><p>${esc(err.message)}</p></div>`;
+      body.innerHTML = errorState(err.message);
     }
   }
 
@@ -623,7 +646,7 @@
         });
       }
     } catch (err) {
-      body.innerHTML = `<div class="empty-state"><div class="icon">${ic.alert}</div><div class="title">載入失敗</div><p>${esc(err.message)}</p></div>`;
+      body.innerHTML = errorState(err.message);
     }
   }
 
@@ -697,7 +720,7 @@
         </div>
       `;
     } catch (err) {
-      body.innerHTML = `<div class="empty-state"><div class="icon">${ic.alert}</div><div class="title">載入失敗</div><p>${esc(err.message)}</p></div>`;
+      body.innerHTML = errorState(err.message);
     }
   }
 
@@ -738,7 +761,7 @@
         </div>
       `;
     } catch (err) {
-      body.innerHTML = `<div class="empty-state"><div class="icon">${ic.alert}</div><div class="title">載入失敗</div><p>${esc(err.message)}</p></div>`;
+      body.innerHTML = errorState(err.message);
     }
   }
 
@@ -810,7 +833,7 @@
         if (p) showModelTest(p);
       };
     } catch (err) {
-      body.innerHTML = `<div class="empty-state"><div class="icon">${ic.alert}</div><div class="title">載入失敗</div><p>${esc(err.message)}</p></div>`;
+      body.innerHTML = errorState(err.message);
     }
   }
 
@@ -1299,7 +1322,7 @@
         });
       };
     } catch (err) {
-      body.innerHTML = `<div class="empty-state"><div class="icon">${ic.alert}</div><div class="title">載入失敗</div><p>${esc(err.message)}</p></div>`;
+      body.innerHTML = errorState(err.message);
     }
   }
 
@@ -1682,7 +1705,7 @@
         });
       };
     } catch (err) {
-      body.innerHTML = `<div class="empty-state"><div class="icon">${ic.alert}</div><div class="title">載入失敗</div><p>${esc(err.message)}</p></div>`;
+      body.innerHTML = errorState(err.message);
     }
   }
 
@@ -1810,7 +1833,7 @@
         ` : ""}
       `;
     } catch (err) {
-      body.innerHTML = `<div class="empty-state"><div class="icon">${ic.alert}</div><div class="title">載入失敗</div><p>${esc(err.message)}</p></div>`;
+      body.innerHTML = errorState(err.message);
     }
   }
 
@@ -1848,7 +1871,7 @@
         } catch (err) { toast(err.message, "error"); }
       };
     } catch (err) {
-      body.innerHTML = `<div class="empty-state"><div class="icon">${ic.alert}</div><div class="title">載入失敗</div><p>${esc(err.message)}</p></div>`;
+      body.innerHTML = errorState(err.message);
     }
   }
 
@@ -2196,7 +2219,7 @@
         });
       };
     } catch (err) {
-      body.innerHTML = `<div class="empty-state"><div class="icon">${ic.alert}</div><div class="title">載入失敗</div><p>${esc(err.message)}</p></div>`;
+      body.innerHTML = errorState(err.message);
     }
   }
 
