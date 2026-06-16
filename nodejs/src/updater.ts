@@ -11,13 +11,13 @@ import { spawn, execSync, type SpawnOptions } from "node:child_process";
 import {
   utimesSync,
   writeFileSync,
+  readFileSync,
   existsSync,
   readdirSync,
-  cpSync,
   rmSync,
-  mkdtempSync,
+  mkdirSync,
+  renameSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { closeDb } from "./db/database.js";
 
@@ -28,6 +28,25 @@ import { closeDb } from "./db/database.js";
 const GITHUB_OWNER = "s12ryt";
 const GITHUB_REPO = "s12ryt-tg-api";
 const GITHUB_API_BASE = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}`;
+
+// ========================
+// Blue-Green 更新常數
+// ========================
+
+/** 需要原子交換的項目（這些會被 staging 版本替換） */
+const SWAP_ITEMS = [
+  "src", "dist", "web", "tests", "scripts",
+  "node_modules", "package.json", "package-lock.json", "tsconfig.json",
+] as const;
+
+/** 暫存目錄名稱（新版本在此下載、安裝、編譯） */
+const STAGING_DIR = ".staging";
+
+/** 備份目錄前綴（舊版本保存於此，用於回滾） */
+const BACKUP_PREFIX = ".backup-";
+
+/** 最大保留備份數量 */
+const MAX_BACKUPS = 2;
 
 // ========================
 // 型別定義
@@ -75,10 +94,19 @@ export interface UpdateCheckResult {
 export interface UpdateResult {
   success: boolean;
   message: string;
-  /** 更新方式：git 或 tarball */
-  method?: "git" | "tarball";
+  /** 更新方式：blue-green、git 或 tarball */
+  method?: "git" | "tarball" | "blue-green";
   /** 更新後的 commit hash */
   newHash?: string;
+}
+
+export interface BackupInfo {
+  /** 備份目錄名稱（例如 ".backup-1718534400000"） */
+  name: string;
+  /** 備份建立時間戳（毫秒） */
+  timestamp: number;
+  /** 備份建立時間 */
+  createdAt: Date;
 }
 
 // ========================
@@ -213,7 +241,15 @@ export async function getLatestRelease(): Promise<ReleaseInfo | null> {
  */
 export function getCurrentVersion(): VersionInfo {
   if (!isGitRepo()) {
-    return { hash: "unknown", date: "", message: "", tag: null };
+    // Fallback: git 不可用時（tarball 安裝、Docker），從 package.json 讀版本
+    try {
+      const pkg = JSON.parse(
+        readFileSync(join(process.cwd(), "package.json"), "utf-8"),
+      );
+      return { hash: "unknown", date: "", message: "", tag: `v${pkg.version}` };
+    } catch {
+      return { hash: "unknown", date: "", message: "", tag: null };
+    }
   }
   return parseVersionInfo("HEAD");
 }
@@ -289,181 +325,290 @@ export function isWorkingDirClean(): boolean {
   return status.length === 0;
 }
 
+// ========================
+// Blue-Green 更新核心函數
+// ========================
+
 /**
- * 方法 1：透過 git pull 更新
+ * 下載 tarball 並解壓到暫存目錄
+ *
+ * GitHub tarball 結構：owner-repo-hash/nodejs/{src,dist,web,...}
+ * 提取 nodejs/ 子目錄內容到 staging 根目錄。
  */
-function updateViaGit(): UpdateResult {
-  try {
-    if (!isGitRepo()) {
-      return { success: false, message: "不是 git 倉庫，無法使用 git pull。" };
-    }
-    if (!isWorkingDirClean()) {
-      return {
-        success: false,
-        message: "工作目錄有未提交的更改，請先處理後再更新。",
-      };
-    }
-    execGit(["pull", "origin", "main"]);
-    const newHash = execGit(["rev-parse", "--short", "HEAD"]);
-    return {
-      success: true,
-      message: `git pull 更新成功！新版本：${newHash}`,
-      method: "git",
-      newHash,
-    };
-  } catch (err: any) {
-    return { success: false, message: `git pull 失敗：${err.message}` };
+async function downloadAndExtract(
+  tarballUrl: string,
+  stagingDir: string,
+): Promise<void> {
+  // 清理舊的暫存目錄
+  if (existsSync(stagingDir)) {
+    rmSync(stagingDir, { recursive: true, force: true });
   }
+  mkdirSync(stagingDir, { recursive: true });
+
+  const tmpDir = join(stagingDir, ".tmp");
+  mkdirSync(tmpDir, { recursive: true });
+
+  // Step 1: 下載 tarball
+  console.log(`[updater] 正在下載 ${tarballUrl}...`);
+  const resp = await fetch(tarballUrl, {
+    headers: { "User-Agent": `${GITHUB_OWNER}-${GITHUB_REPO}-updater` },
+    signal: AbortSignal.timeout(120_000),
+  });
+  if (!resp.ok) {
+    throw new Error(`下載失敗：HTTP ${resp.status}`);
+  }
+  const buffer = Buffer.from(await resp.arrayBuffer());
+  const tarballPath = join(tmpDir, "release.tar.gz");
+  writeFileSync(tarballPath, buffer);
+
+  // Step 2: 解壓縮
+  console.log("[updater] 正在解壓縮...");
+  execSync(`tar -xzf "${tarballPath}" -C "${tmpDir}"`, {
+    timeout: 60_000,
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+
+  // Step 3: 找到解壓後的根目錄（owner-repo-hash/）
+  const extractedName = readdirSync(tmpDir).find(
+    (d) => d !== "release.tar.gz" && existsSync(join(tmpDir, d)),
+  );
+  if (!extractedName) {
+    throw new Error("解壓縮失敗：找不到解壓目錄");
+  }
+  const extractedRoot = join(tmpDir, extractedName);
+
+  // Step 4: 找到 nodejs/ 子目錄
+  let sourceDir = extractedRoot;
+  const nodejsPath = join(extractedRoot, "nodejs");
+  if (existsSync(nodejsPath)) {
+    sourceDir = nodejsPath;
+  }
+
+  // Step 5: 將需要的項目移動到 staging 根目錄（同檔案系統 = renameSync 原子操作）
+  // 跳過 data/、.env、node_modules/、.git（這些不從 tarball 覆蓋）
+  const skipItems = new Set(["data", ".env", "node_modules", ".git"]);
+  for (const entry of readdirSync(sourceDir)) {
+    if (skipItems.has(entry)) continue;
+    renameSync(join(sourceDir, entry), join(stagingDir, entry));
+  }
+
+  // 清理暫存解壓目錄
+  rmSync(tmpDir, { recursive: true, force: true });
 }
 
 /**
- * 方法 2：透過下載 Release tarball 更新（備援方案）
+ * 原子交換：當前 → 備份，暫存 → 當前
  *
- * 下載 GitHub tarball → 解壓 → 複製原始碼（保留 data/ 目錄）
+ * Phase 1: 當前 SWAP_ITEMS → .backup-{timestamp}/
+ * Phase 2: 暫存 SWAP_ITEMS → 當前目錄
+ *
+ * Phase 2 失敗時嘗試回滾。
  */
-async function updateViaTarball(tarballUrl: string): Promise<UpdateResult> {
-  const tempDir = mkdtempSync(join(tmpdir(), "s12ryt-update-"));
+function atomicSwap(stagingDir: string): string {
+  const cwd = process.cwd();
+  const timestamp = Date.now();
+  const backupDir = `${BACKUP_PREFIX}${timestamp}`;
+  const backupPath = join(cwd, backupDir);
+  mkdirSync(backupPath, { recursive: true });
+
+  // Phase 1: 當前 → 備份
+  console.log(`[updater] Phase 1：備份當前版本到 ${backupDir}/...`);
+  const movedToBackup: string[] = [];
+  for (const item of SWAP_ITEMS) {
+    const currentPath = join(cwd, item);
+    if (existsSync(currentPath)) {
+      try {
+        renameSync(currentPath, join(backupPath, item));
+        movedToBackup.push(item);
+      } catch (e) {
+        console.warn(`[updater] 無法備份 ${item}：${(e as Error).message}`);
+      }
+    }
+  }
+
+  // Phase 2: 暫存 → 當前
+  console.log("[updater] Phase 2：部署新版本...");
+  const movedToCurrent: string[] = [];
+  for (const item of SWAP_ITEMS) {
+    const stagingPath = join(stagingDir, item);
+    if (existsSync(stagingPath)) {
+      try {
+        renameSync(stagingPath, join(cwd, item));
+        movedToCurrent.push(item);
+      } catch (e) {
+        console.error(`[updater] 無法部署 ${item}：${(e as Error).message}`);
+        // 嘗試回滾
+        console.error("[updater] 嘗試回滾...");
+        for (const restored of movedToCurrent) {
+          try {
+            renameSync(join(cwd, restored), join(stagingDir, restored));
+          } catch { /* ignore */ }
+        }
+        for (const backed of movedToBackup) {
+          try {
+            renameSync(join(backupPath, backed), join(cwd, backed));
+          } catch { /* ignore */ }
+        }
+        rmSync(backupPath, { recursive: true, force: true });
+        throw new Error(`原子交換失敗：無法部署 ${item}`);
+      }
+    }
+  }
+
+  // 清理空的暫存目錄
+  try {
+    rmSync(stagingDir, { recursive: true, force: true });
+  } catch { /* ignore */ }
+
+  return backupDir;
+}
+
+/**
+ * 清理舊備份，只保留最新的 MAX_BACKUPS 個
+ */
+function cleanOldBackups(): void {
+  const cwd = process.cwd();
+  try {
+    const entries = readdirSync(cwd);
+    const backups = entries
+      .filter((d) => d.startsWith(BACKUP_PREFIX))
+      .map((name) => {
+        const tsStr = name.slice(BACKUP_PREFIX.length);
+        const timestamp = parseInt(tsStr, 10);
+        return { name, timestamp: isNaN(timestamp) ? 0 : timestamp };
+      })
+      .sort((a, b) => b.timestamp - a.timestamp);
+
+    for (let i = MAX_BACKUPS; i < backups.length; i++) {
+      console.log(`[updater] 清理舊備份：${backups[i].name}`);
+      rmSync(join(cwd, backups[i].name), { recursive: true, force: true });
+    }
+  } catch { /* ignore */ }
+}
+
+/**
+ * 執行 Blue-Green 更新
+ *
+ * 流程：下載 → npm install → npm run build → 驗證 → 原子交換 → 清理
+ */
+export async function performBlueGreenUpdate(
+  tarballUrl: string,
+): Promise<UpdateResult> {
+  const cwd = process.cwd();
+  const stagingPath = join(cwd, STAGING_DIR);
 
   try {
-    // Step 1: 下載 tarball
-    const resp = await fetch(tarballUrl, {
-      headers: { "User-Agent": `${GITHUB_OWNER}-${GITHUB_REPO}-updater` },
-      signal: AbortSignal.timeout(60_000),
-    });
-    if (!resp.ok) {
-      throw new Error(`下載失敗：HTTP ${resp.status}`);
-    }
-    const buffer = Buffer.from(await resp.arrayBuffer());
-    const tarballPath = join(tempDir, "release.tar.gz");
-    writeFileSync(tarballPath, buffer);
+    // Step 1: 下載並解壓
+    await downloadAndExtract(tarballUrl, stagingPath);
+    console.log("[updater] 下載解壓完成");
 
-    // Step 2: 解壓縮
-    execSync(`tar -xzf "${tarballPath}" -C "${tempDir}"`, {
-      timeout: 30_000,
+    // Step 2: npm install（在暫存目錄中）
+    console.log("[updater] 正在安裝依賴 (npm install)...");
+    execSync("npm install", {
+      cwd: stagingPath,
+      timeout: 180_000,
       stdio: ["pipe", "pipe", "pipe"],
     });
 
-    // Step 3: 找到解壓後的目錄（GitHub tarball 會解壓為 owner-repo-hash/）
-    const extractedName = readdirSync(tempDir).find(
-      (d) => d !== "release.tar.gz" && existsSync(join(tempDir, d)),
-    );
-    if (!extractedName) {
-      throw new Error("解壓縮失敗：找不到解壓目錄");
-    }
-    const extractedPath = join(tempDir, extractedName);
+    // Step 3: 判斷啟動模式
+    const tsxMode = isTsxWatchMode();
+    console.log(`[updater] 啟動模式：${tsxMode ? "tsx watch" : "production"}`);
 
-    // Step 4: 複製檔案，保留 data/ 目錄
-    const cwd = process.cwd();
-    const entries = readdirSync(extractedPath);
-    for (const entry of entries) {
-      const srcPath = join(extractedPath, entry);
-      const destPath = join(cwd, entry);
-
-      if (entry === "nodejs" || entry === "python") {
-        // 這些目錄包含 data/ 子目錄，需要謹慎複製
-        syncDirPreservingData(srcPath, destPath);
-      } else if (entry === ".git" || entry === "data") {
-        // 跳過 .git 和根層 data 目錄
-        continue;
+    // Step 4: npm run build
+    // production 模式必須成功編譯（dist/index.js）；tsx watch 模式不需要 dist/
+    console.log("[updater] 正在編譯 (npm run build)...");
+    let buildFailed = false;
+    try {
+      execSync("npm run build", {
+        cwd: stagingPath,
+        timeout: 120_000,
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+    } catch {
+      buildFailed = true;
+      if (tsxMode) {
+        console.warn("[updater] 編譯失敗（tsx watch 模式，可忽略）");
       } else {
-        // 其他檔案/目錄：直接替換
-        if (existsSync(destPath)) {
-          rmSync(destPath, { recursive: true, force: true });
-        }
-        cpSync(srcPath, destPath, { recursive: true });
+        throw new Error(
+          "編譯失敗：production 模式（node dist/）需要 dist/，無法繼續",
+        );
       }
     }
 
-    // Step 5: 取得新版本資訊
-    let newHash = "unknown";
-    try {
-      newHash = execGit(["rev-parse", "--short", "HEAD"]);
-    } catch {
-      // 非 git 倉庫也沒關係
+    // Step 5: 驗證 — production 必須有 dist/index.js；tsx 模式必須有 src/index.ts
+    const hasDist = existsSync(join(stagingPath, "dist", "index.js"));
+    const hasSrc = existsSync(join(stagingPath, "src", "index.ts"));
+    const hasNodeModules = existsSync(join(stagingPath, "node_modules"));
+    const entryOk = tsxMode ? hasSrc : hasDist;
+    if (!hasNodeModules || !entryOk) {
+      throw new Error(
+        `驗證失敗：node_modules=${hasNodeModules}, ${tsxMode ? "src" : "dist"}=${entryOk}, buildFailed=${buildFailed}`,
+      );
     }
+    console.log("[updater] 驗證通過");
+
+    // Step 6: 原子交換
+    const backupName = atomicSwap(stagingPath);
+    console.log(`[updater] 交換完成，備份：${backupName}`);
+
+    // Step 7: 清理舊備份
+    cleanOldBackups();
 
     return {
       success: true,
-      message: `Tarball 下載更新成功！`,
-      method: "tarball",
-      newHash,
+      message: `Blue-Green 更新成功！`,
+      method: "blue-green",
     };
   } catch (err: any) {
-    return { success: false, message: `Tarball 更新失敗：${err.message}` };
-  } finally {
     // 清理暫存目錄
     try {
-      rmSync(tempDir, { recursive: true, force: true });
+      rmSync(stagingPath, { recursive: true, force: true });
     } catch { /* ignore */ }
+    return {
+      success: false,
+      message: `Blue-Green 更新失敗：${err.message}`,
+    };
   }
 }
 
 /**
- * 複製目錄內容，但保留 data/ 子目錄
- */
-function syncDirPreservingData(src: string, dest: string): void {
-  const entries = readdirSync(src);
-  for (const entry of entries) {
-    if (entry === "data") continue; // 保留 data/ 目錄
-    if (entry === "node_modules") continue; // 保留 node_modules/
-
-    const srcPath = join(src, entry);
-    const destPath = join(dest, entry);
-
-    if (existsSync(destPath)) {
-      rmSync(destPath, { recursive: true, force: true });
-    }
-    cpSync(srcPath, destPath, { recursive: true });
-  }
-}
-
-/**
- * 執行更新：先嘗試 git pull，失敗則下載 tarball
+ * 執行更新（Blue-Green 方式）
  */
 export async function performUpdate(): Promise<UpdateResult> {
-  // 方法 1: git pull
-  const gitResult = updateViaGit();
-  if (gitResult.success) return gitResult;
-
-  console.warn(`[updater] git pull 失敗，嘗試 tarball 下載...`);
-
-  // 方法 2: tarball 下載
-  // 取得最新 Release 的 tarball URL
   const release = await getLatestRelease();
-  if (release) {
-    const tarballResult = await updateViaTarball(release.tarballUrl);
-    if (tarballResult.success) return tarballResult;
+  const tarballUrl = release?.tarballUrl ?? `${GITHUB_API_BASE}/tarball/main`;
+  return performBlueGreenUpdate(tarballUrl);
+}
 
-    return {
-      success: false,
-      message: `兩種更新方式都失敗。\ngit: ${gitResult.message}\ntarball: ${tarballResult.message}`,
-    };
-  }
+/**
+ * 偵測是否運行在容器中
+ */
+function isContainer(): boolean {
+  // 環境變數明確指定
+  if (process.env.CONTAINER !== undefined)
+    return process.env.CONTAINER === "true";
+  // /.dockerenv 存在表示 Docker 容器
+  return existsSync("/.dockerenv");
+}
 
-  // 沒有 Release 可用，嘗試下載 main 分支的 tarball
-  try {
-    const branchTarballUrl = `${GITHUB_API_BASE}/tarball/main`;
-    const tarballResult = await updateViaTarball(branchTarballUrl);
-    if (tarballResult.success) return tarballResult;
-
-    return {
-      success: false,
-      message: `兩種更新方式都失敗。\ngit: ${gitResult.message}\ntarball: ${tarballResult.message}`,
-    };
-  } catch (err: any) {
-    return {
-      success: false,
-      message: `兩種更新方式都失敗。\ngit: ${gitResult.message}\ntarball: ${err.message}`,
-    };
-  }
+/**
+ * 偵測是否運行在 tsx watch 模式
+ */
+function isTsxWatchMode(): boolean {
+  const argvStr = process.argv.slice(1).join(" ");
+  return (
+    (argvStr.includes("tsx") && argvStr.includes("watch")) ||
+    process.env.TSX_WATCH === "true"
+  );
 }
 
 /**
  * 重啟進程
  *
- * 分兩種模式處理：
+ * 分三種模式處理：
  *   1. tsx watch 模式：觸發 entry file 的 mtime 變化，tsx watcher 會自動重啟
- *   2. 生產模式（node dist/...）：spawn 新進程（detached），然後 exit 舊進程
+ *   2. 容器模式：直接退出進程，依賴容器編排器（Docker restart policy / k8s）自動重啟
+ *   3. 生產模式（node dist/...）：spawn 新進程（detached），然後 exit 舊進程
  *
  * 延遲時間確保 Telegram 訊息能先送達。
  */
@@ -471,19 +616,17 @@ export function restartProcess(delayMs = 2000): void {
   console.log(`[updater] 將在 ${delayMs}ms 後重啟...`);
 
   setTimeout(() => {
-    const argvStr = process.argv.slice(1).join(" ");
-    const isWatch =
-      (argvStr.includes("tsx") && argvStr.includes("watch")) ||
-      process.env.TSX_WATCH === "true";
-
-    // 關閉資料庫（兩種模式都需要）
+    // 關閉資料庫（所有模式都需要）
     try {
       closeDb();
     } catch (e) {
       console.error("[updater] 關閉資料庫失敗：", e);
     }
 
-    if (isWatch) {
+    const tsxMode = isTsxWatchMode();
+    const container = isContainer();
+
+    if (tsxMode) {
       // tsx watch 模式：觸發 file change 讓 watcher 自動重啟
       console.log("[updater] tsx watch 模式：觸發 watcher 重啟...");
       try {
@@ -498,7 +641,15 @@ export function restartProcess(delayMs = 2000): void {
       return;
     }
 
-    // 生產模式：spawn 新的 detached 進程
+    if (container) {
+      // 容器模式：直接退出，依賴容器編排器自動重啟
+      // （detached spawn 在容器中不可靠，因為 PID 1 退出後整個容器終止）
+      console.log("[updater] 容器模式：退出進程，等待容器自動重啟...");
+      process.exit(0);
+      return;
+    }
+
+    // 生產模式（非容器）：spawn 新的 detached 進程
     console.log("[updater] 正在啟動新進程...");
     const child = spawn(
       process.execPath,
@@ -515,6 +666,95 @@ export function restartProcess(delayMs = 2000): void {
     console.log("[updater] 舊進程正在退出...");
     process.exit(0);
   }, delayMs);
+}
+
+/**
+ * 取得備份列表（按時間倒序）
+ */
+export function getBackupList(): BackupInfo[] {
+  const cwd = process.cwd();
+  try {
+    return readdirSync(cwd)
+      .filter((d) => d.startsWith(BACKUP_PREFIX))
+      .map((name) => {
+        const tsStr = name.slice(BACKUP_PREFIX.length);
+        const timestamp = parseInt(tsStr, 10);
+        return {
+          name,
+          timestamp: isNaN(timestamp) ? 0 : timestamp,
+          createdAt: new Date(isNaN(timestamp) ? 0 : timestamp),
+        };
+      })
+      .sort((a, b) => b.timestamp - a.timestamp);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * 回滾到最近的備份
+ *
+ * 當前版本保存為 pre-rollback 備份，最近備份還原為當前。
+ */
+export function performRollback(): { success: boolean; message: string } {
+  const cwd = process.cwd();
+  const backups = getBackupList();
+  if (backups.length === 0) {
+    return { success: false, message: "沒有可用的備份" };
+  }
+
+  const target = backups[0];
+  const targetPath = join(cwd, target.name);
+
+  // 當前版本 → pre-rollback 備份
+  const rollbackTs = Date.now();
+  const preRollbackDir = `${BACKUP_PREFIX}pre-rollback-${rollbackTs}`;
+  const preRollbackPath = join(cwd, preRollbackDir);
+  mkdirSync(preRollbackPath, { recursive: true });
+
+  for (const item of SWAP_ITEMS) {
+    const currentPath = join(cwd, item);
+    if (existsSync(currentPath)) {
+      try {
+        renameSync(currentPath, join(preRollbackPath, item));
+      } catch { /* ignore */ }
+    }
+  }
+
+  // 從備份還原
+  for (const item of SWAP_ITEMS) {
+    const backupItemPath = join(targetPath, item);
+    if (existsSync(backupItemPath)) {
+      try {
+        renameSync(backupItemPath, join(cwd, item));
+      } catch (e) {
+        console.error(`[updater] 無法還原 ${item}：${(e as Error).message}`);
+      }
+    }
+  }
+
+  // 清理已用完的備份目錄
+  try {
+    rmSync(targetPath, { recursive: true, force: true });
+  } catch { /* ignore */ }
+
+  cleanOldBackups();
+
+  return {
+    success: true,
+    message: `已回滾到備份（${target.createdAt.toLocaleString("zh-TW")}）`,
+  };
+}
+
+/**
+ * 回滾並重啟
+ */
+export function rollbackAndRestart(): { success: boolean; message: string } {
+  const result = performRollback();
+  if (result.success) {
+    restartProcess(2000);
+  }
+  return result;
 }
 
 /**
