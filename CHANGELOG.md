@@ -2,6 +2,27 @@
 
 所有版本變更記錄。本檔案由 `npm run release` 自動維護。
 
+## [1.3.0] - 2026-06-17
+
+### ✨ Features
+- add universal container startup file with auto mode detection (6015700)
+- add rollback support to Bot commands and Web console (f0f49ab)
+- implement Blue-Green update mechanism with atomic swap and rollback (b4f7e62)
+- integrate version fallback in Node.js and Python updaters (e73f0a7)
+- add version management system with release script and CI workflow (3361cb5)
+
+### 🐛 Bug Fixes
+- auto-create user record when admin generates first API key (9fb37a7)
+- add global /cancel interceptor to escape grammY conversations (6b002a1)
+- convert start.js to ESM to support type:module package.json (73d92ee)
+
+### ♻️ Refactor
+- replace as any with typed interface for GitHub API response (7337c45)
+- remove unused imports in bot handlers (dd60964)
+
+### ✅ Tests
+- add auth, web routes, and updater test suites (82 tests) (b858a40)
+
 ## [1.2.0] - 2025-06-16
 
 ### ✨ Features
