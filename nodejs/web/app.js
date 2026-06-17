@@ -414,6 +414,8 @@
     "/settings": pageSettings,
     "/api-test": pageApiTest,
     "/model-catch": pageModelCatch,
+    "/model-mapping": pageModelMapping,
+    "/api-logs": pageApiLogs,
     "/system": pageSystem,
   };
 
@@ -2302,6 +2304,209 @@
         btn.textContent = "抓取模型";
       }
     };
+  }
+
+  // =========================================================================
+  // Pages — Model Mapping (Admin)
+  // =========================================================================
+
+  async function pageModelMapping() {
+    if (!state.user?.isAdmin) { location.hash = "#/dashboard"; return; }
+    const body = setPage("模型映射", "管理每個供應商模型的顯示名稱");
+    body.innerHTML = loading();
+
+    try {
+      const [provData, mapData] = await Promise.all([
+        API.get("/web/api/admin/providers"),
+        API.get("/web/api/admin/model-mappings"),
+      ]);
+
+      const providers = provData.providers || [];
+      const mappings = mapData.mappings || [];
+      const mapByKey = new Map();
+      for (const m of mappings) {
+        mapByKey.set(`${m.provider_id}:${m.original_model}`, m.display_name);
+      }
+
+      if (providers.length === 0) {
+        body.innerHTML = `<div class="empty-state"><div class="icon">${ic.plug}</div><div class="title">尚無供應商</div><p>請先新增供應商</p></div>`;
+        return;
+      }
+
+      let rows = "";
+      for (const p of providers) {
+        const models = p.models_list || [];
+        for (const model of models) {
+          const key = `${p.id}:${model}`;
+          const current = mapByKey.get(key) || "";
+          rows += `
+            <tr>
+              <td class="mono" style="white-space:nowrap;">${esc(p.name)}/${esc(model)}</td>
+              <td><input type="text" class="table-input" data-pid="${p.id}" data-model="${esc(model)}" value="${esc(current)}" placeholder="${esc(model)}"></td>
+            </tr>`;
+        }
+      }
+
+      if (!rows) {
+        body.innerHTML = `<div class="empty-state"><div class="icon">${ic.inbox}</div><div class="title">無模型</div><p>供應商尚未設定任何模型</p></div>`;
+        return;
+      }
+
+      body.innerHTML = `
+        <div class="card">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+            <div style="color:var(--text-secondary);font-size:13px;">
+              設定自訂顯示名稱後，使用者將看到新名稱，但實際調用仍使用原始模型名。
+              <br>留空 = 使用原始名稱（不映射）。
+            </div>
+            <button class="btn btn-primary" id="btn-save-mapping">${ic.check} 保存</button>
+          </div>
+          <table class="table">
+            <thead>
+              <tr><th>供應商 / 模型名稱</th><th>顯示名稱</th></tr>
+            </thead>
+            <tbody>${rows}</tbody>
+          </table>
+        </div>`;
+
+      $("#btn-save-mapping").onclick = async () => {
+        const inputs = document.querySelectorAll(".table-input");
+        const payload = [];
+        for (const inp of inputs) {
+          const display = inp.value.trim();
+          const original = inp.dataset.model;
+          if (display && display !== original) {
+            payload.push({
+              provider_id: Number(inp.dataset.pid),
+              original_model: original,
+              display_name: display,
+            });
+          }
+        }
+
+        const btn = $("#btn-save-mapping");
+        btn.disabled = true;
+        btn.textContent = "保存中...";
+
+        try {
+          await API.put("/web/api/admin/model-mappings", { mappings: payload });
+          toast("模型映射已保存", "success");
+        } catch (err) {
+          toast("保存失敗：" + err.message, "error");
+        } finally {
+          btn.disabled = false;
+          btn.innerHTML = `${ic.check} 保存`;
+        }
+      };
+    } catch (err) {
+      body.innerHTML = errorState(err.message);
+    }
+  }
+
+  // =========================================================================
+  // Pages — API Logs (Admin)
+  // =========================================================================
+
+  async function pageApiLogs() {
+    if (!state.user?.isAdmin) { location.hash = "#/dashboard"; return; }
+    const body = setPage("API 日誌", "近期 50 條 API 調用記錄");
+    body.innerHTML = loading();
+
+    try {
+      const data = await API.get("/web/api/admin/api-logs");
+      const logs = data.logs || [];
+
+      if (logs.length === 0) {
+        body.innerHTML = `<div class="empty-state"><div class="icon">${ic.inbox}</div><div class="title">暫無日誌</div><p>當有 API 請求時，會自動記錄於此</p></div>`;
+        return;
+      }
+
+      let rows = "";
+      for (const log of logs) {
+        const statusClass = log.responseStatus >= 400 ? "badge-danger" : "badge-success";
+        const tokens = (log.inputTokens || 0) + (log.outputTokens || 0);
+        rows += `
+          <tr>
+            <td class="mono" style="white-space:nowrap;font-size:12px;">${esc(log.timestamp.replace("T", " ").slice(0, 19))}</td>
+            <td><span class="badge badge-muted" style="font-size:11px;">${esc(log.path)}</span></td>
+            <td class="mono">${esc(log.model)}</td>
+            <td>${esc(log.providerName)}</td>
+            <td class="mono">${esc(log.username)}</td>
+            <td style="text-align:right;">${tokens > 0 ? tokens : "-"}</td>
+            <td style="text-align:right;">${log.latencyMs}ms</td>
+            <td><span class="badge ${statusClass}">${log.responseStatus}</span></td>
+            <td><button class="btn-icon" data-log-id="${log.id}" title="查看詳情">${ic.eye}</button></td>
+          </tr>`;
+      }
+
+      body.innerHTML = `
+        <div class="card">
+          <div style="margin-bottom:12px;">
+            <button class="btn btn-ghost" id="btn-refresh-logs">${ic.refresh} 刷新</button>
+            <span style="margin-left:8px;color:var(--text-secondary);font-size:13px;">共 ${logs.length} 條（最多保存 50 條）</span>
+          </div>
+          <div style="overflow-x:auto;">
+            <table class="table">
+              <thead>
+                <tr>
+                  <th>時間</th><th>路徑</th><th>模型</th><th>供應商</th>
+                  <th>用戶</th><th style="text-align:right;">Tokens</th>
+                  <th style="text-align:right;">延遲</th><th>狀態</th><th></th>
+                </tr>
+              </thead>
+              <tbody>${rows}</tbody>
+            </table>
+          </div>
+        </div>`;
+
+      $("#btn-refresh-logs").onclick = () => pageApiLogs();
+
+      // Bind detail view buttons
+      document.querySelectorAll("[data-log-id]").forEach((btn) => {
+        btn.onclick = () => {
+          const id = Number(btn.dataset.logId);
+          const log = logs.find((l) => l.id === id);
+          if (!log) return;
+
+          const bodyJson = JSON.stringify(log.body, null, 2);
+          const errorHtml = log.error ? `<div style="margin-top:12px;padding:10px;background:var(--bg-danger);border-radius:6px;color:var(--text-danger);font-size:13px;">${ic.alert} ${esc(log.error)}</div>` : "";
+          const usageHtml = (log.inputTokens || log.outputTokens) ? `
+            <div style="display:flex;gap:16px;margin-top:12px;font-size:13px;">
+              <span>輸入 Tokens: <strong>${log.inputTokens || 0}</strong></span>
+              <span>輸出 Tokens: <strong>${log.outputTokens || 0}</strong></span>
+            </div>` : "";
+
+          showModal(
+            `API 請求詳情 #${log.id}`,
+            `<div style="margin-bottom:12px;font-size:13px;color:var(--text-secondary);">
+              <div>時間: ${esc(log.timestamp)}</div>
+              <div>路徑: <span class="mono">${esc(log.path)}</span></div>
+              <div>模型: <span class="mono">${esc(log.model)}</span> → <span class="mono">${esc(log.actualModel)}</span></div>
+              <div>供應商: ${esc(log.providerName)}</div>
+              <div>用戶: <span class="mono">${esc(log.username)}</span></div>
+              <div>狀態: ${log.responseStatus} | 延遲: ${log.latencyMs}ms</div>
+            </div>
+            ${usageHtml}
+            ${errorHtml}
+            <div style="margin-top:12px;">
+              <div style="font-weight:600;margin-bottom:6px;">請求體:</div>
+              <div style="display:flex;gap:8px;align-items:flex-start;">
+                <pre style="flex:1;background:var(--bg-tertiary);border-radius:6px;padding:12px;font-size:12px;overflow-x:auto;max-height:400px;white-space:pre-wrap;word-break:break-all;">${esc(bodyJson)}</pre>
+                <button class="copy-btn" id="btn-copy-log-body" title="複製">${ic.clipboard}</button>
+              </div>
+            </div>`,
+            [{ label: "關閉", class: "btn-ghost", onclick: closeModal }],
+          );
+
+          const copyBtn = $("#btn-copy-log-body");
+          if (copyBtn) {
+            copyBtn.onclick = () => copy(bodyJson);
+          }
+        };
+      });
+    } catch (err) {
+      body.innerHTML = errorState(err.message);
+    }
   }
 
   // =========================================================================
