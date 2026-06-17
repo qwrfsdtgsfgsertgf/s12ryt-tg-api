@@ -2,6 +2,12 @@
 
 所有版本變更記錄。本檔案由 `npm run release` 自動維護。
 
+## [1.4.1] - 2026-06-17
+
+### 🐛 Bug Fixes
+- print all update subprocess output to console (da442f1)
+- optimize npm install for low-memory containers in Blue-Green update (66344d8)
+
 ## [1.4.0] - 2026-06-17
 
 - 維護更新
