@@ -28,7 +28,7 @@ import {
   convertChatCompletionToAnthropic,
   streamAnthropicApi,
 } from "./anthropic_out.js";
-import { getProviders, lookupModelCached, rebuildProviderCache, onProviderCacheRebuild, type Provider, getActiveCodingForApiKey, incrementCodingSessionStats, checkModelAllowed, getAllowedModels, getUserByTgId } from "../db/database.js";
+import { getProviders, lookupModelCached, rebuildProviderCache, onProviderCacheRebuild, getAllCachedModelNames, type Provider, getActiveCodingForApiKey, incrementCodingSessionStats, checkModelAllowed, getAllowedModels, getUserByTgId } from "../db/database.js";
 import { config } from "../config.js";
 import { preprocessThinking, parseModelThinkingSuffix } from "./thinkingParser.js";
 import { addApiLog } from "./apiLogStore.js";
@@ -294,7 +294,7 @@ let cachedModelList: ModelEntry[] | null = null;
 function getAllModelsFromDb(): ModelEntry[] {
   if (cachedModelList) return cachedModelList;
 
-  const providers = getProviders(true);
+  const names = getAllCachedModelNames();
   const models: ModelEntry[] = [];
   const now = Math.floor(Date.now() / 1000);
 
@@ -306,20 +306,15 @@ function getAllModelsFromDb(): ModelEntry[] {
     owned_by: "system",
   });
 
-  for (const p of providers) {
-    const modelNames = p.models
-      .split(",")
-      .map((m) => m.trim())
-      .filter(Boolean);
-
-    for (const name of modelNames) {
-      models.push({
-        id: name,
-        object: "model",
-        created: now,
-        owned_by: p.api_type,
-      });
-    }
+  // Use cache keys (display names) as model IDs so model mappings are reflected
+  for (const displayName of names) {
+    const cached = lookupModelCached(displayName);
+    models.push({
+      id: displayName,
+      object: "model",
+      created: now,
+      owned_by: cached ? cached.providerType : "unknown",
+    });
   }
 
   cachedModelList = models;
