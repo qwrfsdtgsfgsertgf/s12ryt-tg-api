@@ -7,6 +7,8 @@ export interface Config {
   API_PORT: number;
   DATABASE_PATH: string;
   DEFAULT_API_URL: string;
+  CLOUDFLARE_TUNNEL: string;
+  CLOUDFLARE_TOKEN: string;
 }
 
 function requireEnv(key: string): string {
@@ -23,4 +25,6 @@ export const config: Config = {
   API_PORT: parseInt(process.env.API_PORT ?? "8000", 10),
   DATABASE_PATH: process.env.DATABASE_PATH ?? "./data/bot.db",
   DEFAULT_API_URL: process.env.DEFAULT_API_URL ?? "http://localhost:8000",
+  CLOUDFLARE_TUNNEL: process.env.CLOUDFLARE_TUNNEL ?? "",
+  CLOUDFLARE_TOKEN: process.env.CLOUDFLARE_TOKEN ?? "",
 };

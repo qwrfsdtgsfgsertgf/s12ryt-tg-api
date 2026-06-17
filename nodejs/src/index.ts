@@ -10,6 +10,7 @@
 import { config } from "./config.js";
 import { initDbAsync, closeDb } from "./db/database.js";
 import { startServer } from "./api/server.js";
+import { startTunnel, stopTunnel } from "./tunnel.js";
 import { registerUserHandlers } from "./bot/handlers/userHandlers.js";
 import { registerAdminHandlers } from "./bot/handlers/adminHandlers.js";
 import { registerLimitHandlers } from "./bot/handlers/limitHandlers.js";
@@ -181,6 +182,14 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
+  // 4.5 Start Cloudflare Tunnel (optional — only if CLOUDFLARE_TUNNEL is set)
+  try {
+    await startTunnel(config.API_PORT);
+  } catch (err: any) {
+    console.error(`[tunnel] Failed to start tunnel: ${err.message}`);
+    // Non-fatal — continue without tunnel
+  }
+
   // 5. Start Telegram Bot
   try {
     await bot.start({
@@ -204,6 +213,7 @@ async function main(): Promise<void> {
 function setupGracefulShutdown(): void {
   const shutdown = (signal: string) => {
     console.log(`\n[shutdown] Received ${signal}, exiting gracefully...`);
+    stopTunnel();
     closeDb();
     process.exit(0);
   };
