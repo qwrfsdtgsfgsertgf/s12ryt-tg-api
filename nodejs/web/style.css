@@ -613,6 +613,9 @@ input[type="checkbox"] {
   display: flex; gap: 8px; justify-content: flex-end;
   margin-top: 20px;
 }
+.mp-item:hover { background: var(--bg-hover); }
+.mp-item:nth-child(even) { background: rgba(128,128,128,0.04); }
+.mp-item:nth-child(even):hover { background: var(--bg-hover); }
 
 /* --- Key Display --- */
 .key-display {

@@ -209,6 +209,116 @@
     ]);
   }
 
+  // --- Model Picker (nested overlay for selecting from fetched models) ---
+  function showModelPicker(models, onConfirm, opts) {
+    var preSelected = opts && opts.preSelected ? opts.preSelected : null;
+    var confirmLabel = opts && opts.confirmLabel ? opts.confirmLabel : "確認添加";
+    var existing = $("#model-picker-overlay");
+    if (existing) existing.remove();
+
+    const overlay = document.createElement("div");
+    overlay.id = "model-picker-overlay";
+    overlay.className = "modal-overlay";
+    overlay.style.zIndex = "60";
+
+    overlay.innerHTML =
+      '<div class="modal" style="max-width:600px;">' +
+      '  <div class="modal-header">' +
+      '    <h3>選擇模型（共 ' + models.length + ' 個）</h3>' +
+      '    <button class="modal-close" id="mp-close" aria-label="關閉">&times;</button>' +
+      "  </div>" +
+      '  <div class="modal-body">' +
+      '    <input type="text" id="mp-search" placeholder="搜尋模型..." autocomplete="off" style="width:100%;margin-bottom:12px;">' +
+      '    <div style="display:flex;gap:8px;margin-bottom:12px;align-items:center;">' +
+      '      <button class="btn btn-ghost btn-sm" id="mp-select-all">全選</button>' +
+      '      <button class="btn btn-ghost btn-sm" id="mp-deselect-all">全不選</button>' +
+      '      <span style="margin-left:auto;color:var(--text-tertiary);font-size:13px;" id="mp-count">已選 0 個</span>' +
+      "    </div>" +
+      '    <div id="mp-list" style="max-height:350px;overflow-y:auto;border:1px solid var(--border);border-radius:8px;">' +
+      models
+        .map(function (m) {
+          var isChecked = preSelected ? (preSelected.indexOf(m) !== -1) : true;
+          return (
+            '<label class="mp-item" style="display:flex;align-items:center;gap:8px;padding:6px 10px;cursor:pointer;">' +
+            '<input type="checkbox" class="mp-checkbox" value="' + esc(String(m)) + '"' + (isChecked ? " checked" : "") + '>' +
+            '<span style="font-family:var(--mono);font-size:13px;word-break:break-all;">' + esc(String(m)) + "</span>" +
+            "</label>"
+          );
+        })
+        .join("") +
+      "    </div>" +
+      '    <div class="modal-actions">' +
+      '      <button class="btn btn-ghost" id="mp-cancel">取消</button>' +
+      '      <button class="btn btn-primary" id="mp-confirm">' + confirmLabel + '</button>' +
+      "    </div>" +
+      "  </div>" +
+      "</div>";
+
+    document.body.appendChild(overlay);
+
+    function updateCount() {
+      var checked = overlay.querySelectorAll(".mp-checkbox:checked").length;
+      $("#mp-count").textContent = "已選 " + checked + " 個";
+      var btn = $("#mp-confirm");
+      btn.textContent = checked > 0 ? confirmLabel + " (" + checked + ")" : confirmLabel;
+      btn.disabled = checked === 0;
+    }
+
+    function close() { overlay.remove(); }
+
+    // Search filter (real-time)
+    $("#mp-search").oninput = function (e) {
+      var q = e.target.value.toLowerCase();
+      overlay.querySelectorAll(".mp-item").forEach(function (item) {
+        var text = item.querySelector("span").textContent.toLowerCase();
+        item.style.display = text.indexOf(q) !== -1 ? "flex" : "none";
+      });
+    };
+
+    // Select all (visible only)
+    $("#mp-select-all").onclick = function () {
+      overlay.querySelectorAll(".mp-item").forEach(function (item) {
+        if (item.style.display !== "none") {
+          item.querySelector(".mp-checkbox").checked = true;
+        }
+      });
+      updateCount();
+    };
+
+    // Deselect all (visible only)
+    $("#mp-deselect-all").onclick = function () {
+      overlay.querySelectorAll(".mp-item").forEach(function (item) {
+        if (item.style.display !== "none") {
+          item.querySelector(".mp-checkbox").checked = false;
+        }
+      });
+      updateCount();
+    };
+
+    // Per-item change
+    overlay.querySelectorAll(".mp-checkbox").forEach(function (cb) {
+      cb.onchange = updateCount;
+    });
+
+    // Confirm
+    $("#mp-confirm").onclick = function () {
+      var selected = Array.from(overlay.querySelectorAll(".mp-checkbox:checked")).map(function (cb) {
+        return cb.value;
+      });
+      if (selected.length === 0) return;
+      close();
+      onConfirm(selected);
+    };
+
+    // Cancel / close
+    $("#mp-cancel").onclick = close;
+    $("#mp-close").onclick = close;
+    overlay.onclick = function (e) { if (e.target === overlay) close(); };
+
+    updateCount();
+    setTimeout(function () { $("#mp-search") && $("#mp-search").focus(); }, 50);
+  }
+
   // =========================================================================
   // Login Flow
   // =========================================================================
@@ -965,7 +1075,6 @@
         </div>
         <div class="form-group">
           <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px;">
-            <button class="btn btn-ghost btn-sm" id="btn-pf-detect-proto">${ic.search} 偵測協議</button>
             <button class="btn btn-ghost btn-sm" id="btn-pf-fetch-models">${ic.clipboard} 抓取模型</button>
             <button class="btn btn-ghost btn-sm" id="btn-pf-fetch-pricing">${ic.dollar} 抓取定價</button>
           </div>
@@ -1062,50 +1171,10 @@
       addBtn.onclick = () => addModelRow();
     }
 
-    // 綁定三個獨立按鈕
+    // 綁定獨立按鈕
     const resultDiv = $("#pf-detect-result");
 
-    // 1️⃣ 偵測協議
-    const btnProto = $("#btn-pf-detect-proto");
-    if (btnProto) {
-      btnProto.onclick = async () => {
-        const baseUrl = $("#pf-url").value.trim();
-        const apiKey = $("#pf-keys").value.trim();
-        if (!baseUrl) { toast("請先填入 Base URL", "error"); return; }
-        btnProto.disabled = true;
-        btnProto.innerHTML = ic.search + " 偵測中...";
-        resultDiv.innerHTML = `<span style="color:var(--text-tertiary);">正在偵測協議...</span>`;
-        try {
-          const data = await API.post("/web/api/admin/provider-detect", { baseUrl, apiKey });
-          const det = data.detection;
-          const lines = [];
-          const protos = Object.entries(det.protocols || {});
-          for (const [proto, info] of protos) {
-            const icon = info.supported ? ic.check : ic.x;
-            if (info.supported) {
-              lines.push(`${icon} <strong>${esc(proto)}</strong> — 信心: ${esc(info.confidence)} — ${esc(info.reason)}`);
-            } else {
-              lines.push(`${icon} <strong>${esc(proto)}</strong> — ${esc(info.reason)}`);
-            }
-          }
-          if (det.recommended) {
-            const sel = $("#pf-type");
-            if (sel) sel.value = det.recommended;
-            lines.push(`${ic.target} <strong>推薦類型已自動選擇: ${esc(det.recommended)}</strong>`);
-          }
-          resultDiv.innerHTML = lines.join("<br>") || '<span style="color:var(--text-tertiary);">未偵測到結果</span>';
-          toast("協議偵測完成", "success");
-        } catch (err) {
-          resultDiv.innerHTML = `<span style="color:var(--accent-red);">偵測失敗: ${esc(err.message)}</span>`;
-          toast(err.message, "error");
-        } finally {
-          btnProto.disabled = false;
-          btnProto.innerHTML = ic.search + " 偵測協議";
-        }
-      };
-    }
-
-    // 2️⃣ 抓取模型
+    // 抓取模型
     const btnModels = $("#btn-pf-fetch-models");
     if (btnModels) {
       btnModels.onclick = async () => {
@@ -1120,11 +1189,14 @@
         try {
           const data = await API.post("/web/api/admin/provider-models", { baseUrl, apiKey, apiType });
           if (data.models && data.models.length > 0) {
-            const container = $("#pf-models-container");
-            if (container) container.innerHTML = "";
-            data.models.forEach((modelId) => addModelRow(modelId));
-            resultDiv.innerHTML = `${ic.clipboard} 已填入 <strong>${data.models.length}</strong> 個模型`;
-            toast(`已填入 ${data.models.length} 個模型`, "success");
+            resultDiv.innerHTML = `${ic.clipboard} 抓取到 <strong>${data.models.length}</strong> 個模型，請選擇要添加的`;
+            showModelPicker(data.models, (selected) => {
+              const container = $("#pf-models-container");
+              if (container) container.innerHTML = "";
+              selected.forEach((modelId) => addModelRow(modelId));
+              resultDiv.innerHTML = `${ic.clipboard} 已填入 <strong>${selected.length}</strong> 個模型`;
+              toast(`已填入 ${selected.length} 個模型`, "success");
+            });
           } else {
             resultDiv.innerHTML = '<span style="color:var(--text-tertiary);">未抓取到任何模型</span>';
             toast("未抓取到模型", "info");
@@ -1663,7 +1735,7 @@
           <div class="table-wrap">
             <table>
               <thead>
-                <tr><th>ID</th><th>名稱</th><th>顯示名</th><th>RPM</th><th>TPM</th><th>並發</th><th>日Token</th><th>月Token</th><th>日費</th><th>月費</th><th>操作</th></tr>
+                <tr><th>ID</th><th>名稱</th><th>顯示名</th><th>每分鐘請求</th><th>每分鐘Token</th><th>並發</th><th>日Token</th><th>月Token</th><th>日費</th><th>月費</th><th>模型限制</th><th>操作</th></tr>
               </thead>
               <tbody>
                 ${groups.map((g) => `
@@ -1678,8 +1750,14 @@
                     <td>${g.monthly_token_limit ? fmtNum(g.monthly_token_limit) : "∞"}</td>
                     <td>${g.daily_cost_limit ? fmtCost(g.daily_cost_limit) : "∞"}</td>
                     <td>${g.monthly_cost_limit ? fmtCost(g.monthly_cost_limit) : "∞"}</td>
+                    <td>${(() => {
+                      const models = (g.allowed_models || "").split(",").map((m) => m.trim()).filter(Boolean);
+                      if (models.length === 0) return '<span style="color:var(--text-tertiary);">全部</span>';
+                      return esc(models.slice(0, 3).join(", ")) + (models.length > 3 ? ` <span class="badge">+${models.length - 3}</span>` : "");
+                    })()}</td>
                     <td style="display:flex;gap:4px;">
                       <button class="btn-icon" onclick="window._editGroup(${g.id})">編輯</button>
+                      ${g.is_default != 1 ? `<button class="btn-icon" onclick="window._setDefaultGroup(${g.id})">設為預設</button>` : ""}
                       ${g.is_default != 1 ? `<button class="btn-icon danger" onclick="window._delGroup(${g.id})">刪除</button>` : ""}
                     </td>
                   </tr>
@@ -1704,6 +1782,15 @@
           } catch (err) { toast(err.message, "error"); }
         });
       };
+      window._setDefaultGroup = (id) => {
+        confirm("確定將此分組設為預設？新用戶將自動加入此分組。", async () => {
+          try {
+            await API.put(`/web/api/admin/groups/${id}/default`);
+            toast("已設為預設", "success");
+            pageGroups();
+          } catch (err) { toast(err.message, "error"); }
+        });
+      };
     } catch (err) {
       body.innerHTML = errorState(err.message);
     }
@@ -1713,7 +1800,7 @@
     const isEdit = !!g;
     const fields = [
       ["name", "名稱（英文）"], ["display_name", "顯示名"],
-      ["rpm_limit", "RPM"], ["tpm_limit", "TPM"],
+      ["rpm_limit", "每分鐘請求數（0=不限）"], ["tpm_limit", "每分鐘Token數（0=不限）"],
       ["concurrency_limit", "並發"],
       ["daily_token_limit", "每日 Token"], ["monthly_token_limit", "每月 Token"],
       ["daily_cost_limit", "每日花費"], ["monthly_cost_limit", "每月花費"],
@@ -1726,7 +1813,13 @@
           <label>${label}</label>
           <input type="${key === "name" || key === "display_name" ? "text" : "number"}" id="gf-${key}" value="${g ? (g[key] ?? "") : ""}" ${key === "name" && isEdit ? "readonly" : ""}>
         </div>
-      `).join(""),
+      `).join("") + `
+        <div class="form-group">
+          <label>允許的模型（逗號分隔，留空 = 允許全部）</label>
+          <textarea id="gf-allowed_models" rows="3" placeholder="gpt-4o,claude-3.5-sonnet">${g ? esc(g.allowed_models || "") : ""}</textarea>
+          <button type="button" class="btn btn-ghost btn-sm" id="gf-pick-models" style="margin-top:4px;">${ic.clipboard} 從列表選擇</button>
+        </div>
+      `,
       [
         { label: "取消", class: "btn-ghost" },
         {
@@ -1739,6 +1832,7 @@
                 payload[key] = key === "name" || key === "display_name" ? val : parseFloat(val);
               }
             });
+            payload.allowed_models = mb.querySelector("#gf-allowed_models").value.trim();
             if (!payload.name) { toast("名稱為必填", "error"); return; }
             try {
               if (isEdit) {
@@ -1753,8 +1847,25 @@
         },
       ]
     );
-  }
 
+    // 綁定「從列表選擇」按鈕
+    const btnPickModels = $("#gf-pick-models");
+    if (btnPickModels) {
+      btnPickModels.onclick = async () => {
+        try {
+          const data = await API.get("/web/api/models");
+          const allModels = data.models || [];
+          const ta = $("#gf-allowed_models");
+          const current = ta.value.split(",").map((m) => m.trim()).filter(Boolean);
+          showModelPicker(allModels, (selected) => {
+            ta.value = selected.join(", ");
+          }, { preSelected: current, confirmLabel: "確認選擇" });
+        } catch (err) {
+          toast(err.message, "error");
+        }
+      };
+    }
+  }
   // =========================================================================
   // Pages — All Usage (Admin)
   // =========================================================================
