@@ -2,6 +2,15 @@
 
 所有版本變更記錄。本檔案由 `npm run release` 自動維護。
 
+## [1.7.1] - 2026-06-17
+
+### ✨ Features
+- integrate Cloudflare Tunnel for public API access (f029b41)
+
+### 📦 Other
+- add cloudflared dependency (10654c4)
+- Delete PLAN.md (f4be2af)
+
 ## [1.7.0] - 2026-06-17
 
 ### ✨ Features
