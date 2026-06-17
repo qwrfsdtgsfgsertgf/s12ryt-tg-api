@@ -698,6 +698,10 @@ input[type="checkbox"] {
   box-shadow: 0 0 10px var(--danger-glow);
 }
 
+/* --- Key Row (provider form) --- */
+.key-row { display: flex; gap: 8px; margin-bottom: 8px; align-items: center; }
+.key-row .pf-key-input { flex: 1; }
+
 /* --- Animations --- */
 @keyframes fadeIn {
   from { opacity: 0; }

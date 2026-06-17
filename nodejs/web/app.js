@@ -141,6 +141,7 @@
     settings: svg('<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/>'),
     flask: svg('<path d="M9 2v6l-5 9a3 3 0 0 0 2.6 4.5h10.8A3 3 0 0 0 20 17l-5-9V2"/><path d="M7 2h10"/><path d="M7.7 14h8.6"/>'),
     clipboard: svg('<path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><rect x="8" y="2" width="8" height="4" rx="1"/>'),
+    eye: svg('<path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>'),
     refresh: svg('<polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>'),
     download: svg('<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>'),
     alert: svg('<path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>'),
@@ -572,7 +573,11 @@
                     <td><code>${esc(k.keyPreview || k.key)}</code></td>
                     <td>${Number(k.is_active) === 1 ? '<span class="badge badge-success">啟用</span>' : '<span class="badge badge-danger">停用</span>'}</td>
                     <td>${fmtDate(k.created_at)}</td>
-                    <td><button class="btn-icon danger" onclick="window._delKey(${k.id})">刪除</button></td>
+                    <td style="display:flex;gap:4px;">
+                      <button class="btn-icon" onclick="window._viewKey(${k.id})" title="查看完整 Key">${ic.eye}</button>
+                      <button class="btn-icon" onclick="window._copyKey(${k.id})" title="複製完整 Key">${ic.clipboard}</button>
+                      <button class="btn-icon danger" onclick="window._delKey(${k.id})" title="刪除">${ic.x}</button>
+                    </td>
                   </tr>
                 `).join("")}
               </tbody>
@@ -581,6 +586,39 @@
       `;
 
       $("#btn-add-key").onclick = addKey;
+
+      window._viewKey = async (id) => {
+        try {
+          const data = await API.get(`/web/api/keys/${id}`);
+          const fullKey = data.key.key;
+          showModal(
+            "查看 API Key",
+            `
+              <p style="margin-bottom:12px;color:var(--text-secondary);">完整 API Key：</p>
+              <div class="key-display">
+                <span>${esc(fullKey)}</span>
+                <button class="copy-btn" id="modal-copy-key" title="複製">${ic.clipboard}</button>
+              </div>
+              <p style="margin-top:8px;color:var(--text-muted);font-size:12px;">建立時間：${fmtDate(data.key.created_at)}</p>
+            `,
+            [{ label: "關閉", class: "btn-primary" }]
+          );
+          const copyBtn = $("#modal-copy-key");
+          if (copyBtn) copyBtn.onclick = () => copy(fullKey);
+        } catch (err) {
+          toast(err.message, "error");
+        }
+      };
+
+      window._copyKey = async (id) => {
+        try {
+          const data = await API.get(`/web/api/keys/${id}`);
+          copy(data.key.key);
+        } catch (err) {
+          toast(err.message, "error");
+        }
+      };
+
       window._delKey = (id) => {
         confirm("確定要刪除這個 API Key？刪除後無法恢復。", async () => {
           try {
@@ -1032,7 +1070,7 @@
 
   function showProviderForm(p = null) {
     const isEdit = !!p;
-    const keys = p ? (p.api_keys || []).join(", ") : "";
+    const keys = p ? (p.api_keys || []) : [];
 
     // 建立一列模型行（含名稱、輸入價、輸出價、刪除鈕）
     function addModelRow(name = "", iprice = "", oprice = "") {
@@ -1044,6 +1082,19 @@
         '<input class="pf-model-name" type="text" placeholder="模型名稱" value="' + esc(String(name)) + '">' +
         '<input class="pf-model-iprice" type="number" step="0.01" placeholder="輸入 $" value="' + (iprice != null && iprice !== "" ? iprice : "") + '">' +
         '<input class="pf-model-oprice" type="number" step="0.01" placeholder="輸出 $" value="' + (oprice != null && oprice !== "" ? oprice : "") + '">' +
+        '<button type="button" class="btn-model-del" title="刪除">✕</button>';
+      row.querySelector(".btn-model-del").onclick = () => row.remove();
+      container.appendChild(row);
+    }
+
+    // 建立一列 API Key 輸入行（含刪除鈕）
+    function addKeyRow(value = "") {
+      const container = $("#pf-keys-container");
+      if (!container) return;
+      const row = document.createElement("div");
+      row.className = "key-row";
+      row.innerHTML =
+        '<input class="pf-key-input" type="text" placeholder="sk-xxx" value="' + esc(String(value)) + '">' +
         '<button type="button" class="btn-model-del" title="刪除">✕</button>';
       row.querySelector(".btn-model-del").onclick = () => row.remove();
       container.appendChild(row);
@@ -1070,8 +1121,17 @@
           <input type="url" id="pf-url" value="${p ? esc(p.base_url) : ""}" placeholder="https://api.openai.com/v1">
         </div>
         <div class="form-group">
-          <label>API Keys（逗號分隔多個）</label>
-          <textarea id="pf-keys" placeholder="sk-xxx,sk-yyy">${esc(keys)}</textarea>
+          <label>API Keys</label>
+          <div id="pf-keys-container"></div>
+          <button type="button" class="btn btn-ghost btn-sm" id="btn-pf-add-key" style="margin-top:4px;">+ 新增 Key</button>
+        </div>
+        <div class="form-group">
+          <label>Key 調度策略</label>
+          <select id="pf-key-strategy">
+            <option value="failover" ${p?.key_strategy === "round_robin" || p?.key_strategy === "random" ? "" : "selected"}>故障轉移（用到報錯才換下一個 Key）</option>
+            <option value="round_robin" ${p?.key_strategy === "round_robin" ? "selected" : ""}>輪詢（用完 Key1 換 Key2，依序循環）</option>
+            <option value="random" ${p?.key_strategy === "random" ? "selected" : ""}>隨機（完全隨機選取）</option>
+          </select>
         </div>
         <div class="form-group">
           <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px;">
@@ -1120,11 +1180,20 @@
               modelNames.push(mName);
             });
 
+            // 收集所有 API Keys（每列一個）
+            const keyInputs = modalBody.querySelectorAll(".key-row .pf-key-input");
+            const keysCollected = [];
+            keyInputs.forEach((input) => {
+              const v = input.value.trim();
+              if (v) keysCollected.push(v);
+            });
+
             const payload = {
               name: modalBody.querySelector("#pf-name").value.trim(),
               api_type: modalBody.querySelector("#pf-type").value,
               base_url: modalBody.querySelector("#pf-url").value.trim(),
-              api_key: modalBody.querySelector("#pf-keys").value.trim(),
+              api_key: keysCollected.join(","),
+              key_strategy: modalBody.querySelector("#pf-key-strategy").value,
               models: modelNames.join(","),
               model_prices: modelPrices,
             };
@@ -1165,6 +1234,19 @@
       addModelRow();
     }
 
+    // 預填 API Key 列（編輯模式）或新增一行空列（新增模式）
+    if (isEdit && keys.length > 0) {
+      keys.forEach((k) => addKeyRow(k));
+    } else {
+      addKeyRow();
+    }
+
+    // 綁定「+ 新增 Key」按鈕
+    const addKeyBtn = $("#btn-pf-add-key");
+    if (addKeyBtn) {
+      addKeyBtn.onclick = () => addKeyRow();
+    }
+
     // 綁定「+ 新增模型」按鈕
     const addBtn = $("#btn-pf-add-model");
     if (addBtn) {
@@ -1179,7 +1261,12 @@
     if (btnModels) {
       btnModels.onclick = async () => {
         const baseUrl = $("#pf-url").value.trim();
-        const apiKey = $("#pf-keys").value.trim();
+        const keyInputs = document.querySelectorAll(".key-row .pf-key-input");
+        let apiKey = "";
+        for (const input of keyInputs) {
+          const v = input.value.trim();
+          if (v) { apiKey = v; break; }
+        }
         const apiType = $("#pf-type").value;
         if (!baseUrl) { toast("請先填入 Base URL", "error"); return; }
         if (!apiKey) { toast("抓取模型需要 API Key", "error"); return; }
