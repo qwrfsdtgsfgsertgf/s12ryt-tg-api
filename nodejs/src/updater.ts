@@ -376,7 +376,7 @@ async function downloadAndExtract(
   console.log("[updater] 正在解壓縮...");
   execSync(`tar -xzf "${tarballPath}" -C "${tmpDir}"`, {
     timeout: 60_000,
-    stdio: ["pipe", "pipe", "pipe"],
+    stdio: "inherit",
   });
 
   // Step 3: 找到解壓後的根目錄（owner-repo-hash/）
@@ -527,11 +527,11 @@ function runNpmInstall(cwd: string, timeoutMs = 180_000): void {
     // 優先使用 npm ci（跳過依賴解析，更快更省記憶體）
     if (hasLockfile) {
       execFileSync("npm", ["ci", ...flags], {
-        cwd, timeout: timeoutMs, stdio: ["pipe", "pipe", "pipe"], env,
+        cwd, timeout: timeoutMs, stdio: "inherit", env,
       });
     } else {
       execFileSync("npm", ["install", ...flags], {
-        cwd, timeout: timeoutMs, stdio: ["pipe", "pipe", "pipe"], env,
+        cwd, timeout: timeoutMs, stdio: "inherit", env,
       });
     }
   } catch (err: any) {
@@ -539,7 +539,7 @@ function runNpmInstall(cwd: string, timeoutMs = 180_000): void {
     if (hasLockfile && !isOOMError(err)) {
       console.warn("[updater] npm ci 失敗，回退到 npm install...");
       execFileSync("npm", ["install", ...flags], {
-        cwd, timeout: timeoutMs, stdio: ["pipe", "pipe", "pipe"], env,
+        cwd, timeout: timeoutMs, stdio: "inherit", env,
       });
       return;
     }
@@ -584,7 +584,7 @@ export async function performBlueGreenUpdate(
       execFileSync("npm", ["run", "build"], {
         cwd: stagingPath,
         timeout: 120_000,
-        stdio: ["pipe", "pipe", "pipe"],
+        stdio: "inherit",
         env: buildNpmEnv(),
       });
     } catch {
