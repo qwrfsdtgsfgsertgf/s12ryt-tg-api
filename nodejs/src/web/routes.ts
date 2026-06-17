@@ -200,6 +200,26 @@ router.post("/api/keys", (req: Request, res: Response) => {
   }
 });
 
+/** GET /web/api/keys/:id — 查看單個 API Key 的完整值 */
+router.get("/api/keys/:id", (req: Request, res: Response) => {
+  const { tgUserId } = req.webAuth!;
+  const keyId = parseInt(req.params.id, 10);
+  if (isNaN(keyId)) {
+    res.status(400).json({ error: "無效的 Key ID" });
+    return;
+  }
+
+  // 驗證 key 確實屬於當前用戶
+  const userKeys = getKeysByUser(tgUserId);
+  const key = userKeys.find((k) => k.id === keyId);
+  if (!key) {
+    res.status(403).json({ error: "無權操作此 Key" });
+    return;
+  }
+
+  res.json({ key: { id: key.id, key: key.key, created_at: key.created_at } });
+});
+
 /** DELETE /web/api/keys/:id — 刪除 API Key */
 router.delete("/api/keys/:id", (req: Request, res: Response) => {
   const { tgUserId } = req.webAuth!;
@@ -338,7 +358,7 @@ router.get("/api/admin/providers", (_req: Request, res: Response) => {
 
 /** POST /web/api/admin/providers — 新增供應商 */
 router.post("/api/admin/providers", (req: Request, res: Response) => {
-  const { name, api_type, base_url, api_key, models, model_prices, input_price, output_price } = req.body;
+  const { name, api_type, base_url, api_key, models, model_prices, input_price, output_price, key_strategy } = req.body;
   if (!name || !api_type || !base_url) {
     res.status(400).json({ error: "缺少必要欄位: name, api_type, base_url" });
     return;
@@ -350,11 +370,13 @@ router.post("/api/admin/providers", (req: Request, res: Response) => {
       ? String(api_key).split(",").map((k: string) => k.trim()).filter(Boolean)
       : [];
     const modelsStr = models ? String(models) : "";
+    const strategy = key_strategy ? String(key_strategy) : "failover";
     addProvider({
       name,
       api_type,
       base_url: String(base_url).replace(/\/+$/, ""),
       api_key: JSON.stringify(keysArray),
+      key_strategy: strategy,
       models: modelsStr,
       input_price: input_price != null ? Number(input_price) : null,
       output_price: output_price != null ? Number(output_price) : null,
@@ -394,7 +416,7 @@ router.put("/api/admin/providers/:id", (req: Request, res: Response) => {
   }
 
   const data: Record<string, unknown> = {};
-  const { name, api_type, base_url, api_key, models, model_prices, enabled, input_price, output_price } = req.body;
+  const { name, api_type, base_url, api_key, models, model_prices, enabled, input_price, output_price, key_strategy } = req.body;
 
   if (name !== undefined) data.name = String(name);
   if (api_type !== undefined) data.api_type = String(api_type);
@@ -403,6 +425,7 @@ router.put("/api/admin/providers/:id", (req: Request, res: Response) => {
     const keysArray = String(api_key).split(",").map((k: string) => k.trim()).filter(Boolean);
     data.api_key = JSON.stringify(keysArray);
   }
+  if (key_strategy !== undefined) data.key_strategy = String(key_strategy);
   if (models !== undefined) data.models = String(models);
   if (enabled !== undefined) data.enabled = enabled ? 1 : 0;
   if (input_price !== undefined) data.input_price = input_price != null ? Number(input_price) : null;
