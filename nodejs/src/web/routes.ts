@@ -75,6 +75,7 @@ import {
   getBackupList,
   rollbackAndRestart,
 } from "../updater.js";
+import { getApiLogs } from "../api/apiLogStore.js";
 import {
   // providers
   getProviders, addProvider, updateProvider, deleteProvider,
@@ -98,6 +99,8 @@ import {
   getSetting, setSetting,
   // cache
   getAllCachedModelNames,
+  // model mappings
+  getModelMappings, replaceModelMappings,
 } from "../db/database.js";
 
 // ---------------------------------------------------------------------------
@@ -1377,6 +1380,48 @@ router.post("/api/admin/rollback", (_req: Request, res: Response) => {
     console.error("[web] rollback error:", err);
     res.status(500).json({ error: "回滾失敗：" + (err instanceof Error ? err.message : String(err)) });
   }
+});
+
+// --- Model Mappings ---
+
+/** GET /web/api/admin/model-mappings — 模型映射列表 */
+router.get("/api/admin/model-mappings", (_req: Request, res: Response) => {
+  res.json({ mappings: getModelMappings() });
+});
+
+/** PUT /web/api/admin/model-mappings — 批量替換模型映射 */
+router.put("/api/admin/model-mappings", (req: Request, res: Response) => {
+  const { mappings } = req.body;
+  if (!Array.isArray(mappings)) {
+    res.status(400).json({ error: "mappings 必須是陣列" });
+    return;
+  }
+
+  // Validate entries
+  const valid: Array<{ provider_id: number; original_model: string; display_name: string }> = [];
+  for (const m of mappings) {
+    const pid = Number(m.provider_id);
+    const original = String(m.original_model || "").trim();
+    const display = String(m.display_name || "").trim();
+    if (!Number.isFinite(pid) || !original || !display) continue;
+    // Skip mappings where display name equals original (no-op)
+    if (original === display) continue;
+    valid.push({ provider_id: pid, original_model: original, display_name: display });
+  }
+
+  try {
+    replaceModelMappings(valid);
+    res.json({ ok: true, count: valid.length });
+  } catch (err) {
+    res.status(500).json({ error: "保存失敗：" + (err instanceof Error ? err.message : String(err)) });
+  }
+});
+
+// --- API Logs ---
+
+/** GET /web/api/admin/api-logs — 近期 API 調用日誌 */
+router.get("/api/admin/api-logs", (_req: Request, res: Response) => {
+  res.json({ logs: getApiLogs() });
 });
 
 // ---------------------------------------------------------------------------
