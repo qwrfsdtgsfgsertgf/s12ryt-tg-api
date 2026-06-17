@@ -55,6 +55,7 @@ async function setBotCommands(bot: MyBot): Promise<void> {
     { command: "model_catch", description: "抓取 API 模型列表" },
     { command: "my_limits", description: "查看我的限制和用量" },
     { command: "web", description: "取得 Web 控制台登入連結" },
+    { command: "cancel", description: "取消當前進行中的操作" },
   ];
 
   // 管理員指令
@@ -112,6 +113,36 @@ async function main(): Promise<void> {
 
   // Install conversations plugin
   bot.use(conversations());
+
+  // -----------------------------------------------------------------------
+  // Global /cancel handler — MUST be after conversations() but before any
+  // createConversation() registration, so it intercepts /cancel BEFORE
+  // the conversation middleware can consume the update.
+  //
+  // Problem: when a conversation is active, ALL updates from that user are
+  // consumed by the conversation. Sub-functions (doAddProvider, etc.) that
+  // call conversation.wait() don't always check for /cancel, so the user
+  // gets stuck inside the conversation and other commands stop working.
+  //
+  // Fix: ctx.conversation.exit() force-clears all conversation session data,
+  // freeing the user from any stuck conversation.
+  // -----------------------------------------------------------------------
+  bot.use(async (ctx, next) => {
+    const text = ctx.msg?.text?.trim() ?? "";
+    const firstWord = text.split(/\s/)[0] ?? "";
+    if (firstWord === "/cancel" || firstWord.startsWith("/cancel@")) {
+      const active = await ctx.conversation.active();
+      const count = Object.values(active).reduce((s, n) => s + n, 0);
+      if (count > 0) {
+        await ctx.conversation.exit();
+        await ctx.reply("✅ 已取消當前操作。");
+      } else {
+        await ctx.reply("ℹ️ 目前沒有進行中的操作。");
+      }
+      return; // Do not call next() — update is fully handled
+    }
+    await next();
+  });
 
   // -----------------------------------------------------------------------
   // Command logging middleware — runs before all handlers
