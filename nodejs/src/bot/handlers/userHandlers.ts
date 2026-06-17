@@ -2,7 +2,6 @@ import { Bot, Context } from "grammy";
 import {
   type ConversationFlavor,
   type Conversation,
-  conversations,
   createConversation,
 } from "@grammyjs/conversations";
 import { config } from "../../config.js";

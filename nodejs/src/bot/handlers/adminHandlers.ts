@@ -5,7 +5,6 @@ import { webButton } from "./webHandlers.js";
 import {
   addProvider,
   getProviders,
-  getProviderById,
   updateProvider,
   deleteProvider,
   getUsers,
@@ -30,7 +29,6 @@ import {
   getAllCachedModelNames,
   type Provider,
   type User,
-  type ApiKey,
 } from "../../db/database.js";
 import { fetchProviderModels, fetchModelsPricing, detectApiProtocols, detectProtocolsNoAuth, type DetectionResult, type ProbeDetail, type FetchedModel } from "./modelFetcher.js";
 import { parseApiKeys, getFirstKey } from "../../api/keySelector.js";
