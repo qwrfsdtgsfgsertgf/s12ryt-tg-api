@@ -163,7 +163,7 @@ function lookupModelDb(modelName: string): ResolvedProvider {
     ?? (rebuildProviderCache(), lookupModelCached(modelName)); // rebuild + retry once on miss
   if (!cached) throw new Error(`Unknown model: ${modelName}`);
 
-  const { key, keyIndex } = selectKey(cached.providerId, cached.apiKey);
+  const { key, keyIndex } = selectKey(cached.providerId, cached.apiKey, cached.keyStrategy);
   return {
     providerType: cached.providerType,
     providerId: cached.providerId,

@@ -328,6 +328,14 @@ function createTables(db: SqlJsDatabase): void {
     console.log("[db] Migration complete: single api_key → JSON array");
   }
 
+  // Migration: add key_strategy column to providers table
+  try {
+    db.run(`ALTER TABLE providers ADD COLUMN key_strategy TEXT NOT NULL DEFAULT 'failover'`);
+    console.log("[db] Migration complete: providers.key_strategy column added");
+  } catch {
+    // Column already exists — ignore
+  }
+
   // -------------------------------------------------------------------------
   // Performance indexes — speeds up quota queries (hottest path: per-request)
   // -------------------------------------------------------------------------
@@ -446,6 +454,7 @@ interface CachedProvider {
   providerName: string;
   baseUrl: string;
   apiKey: string;
+  keyStrategy: string;
   inputPrice: number | null;
   outputPrice: number | null;
 }
@@ -487,6 +496,7 @@ export function rebuildProviderCache(): void {
         providerName: String(p.name),
         baseUrl: String(p.base_url),
         apiKey: String(p.api_key),
+        keyStrategy: String(p.key_strategy ?? "failover"),
         inputPrice,
         outputPrice,
       });
@@ -694,6 +704,7 @@ export interface Provider {
   api_type: "openai_chat" | "openai_response" | "anthropic" | "google";
   base_url: string;
   api_key: string;
+  key_strategy: string;
   models: string;
   enabled: number;
   input_price: number | null;
@@ -703,17 +714,18 @@ export interface Provider {
 }
 
 export function addProvider(
-  provider: Omit<Provider, "id" | "enabled" | "created_at" | "updated_at">
+  provider: Omit<Provider, "id" | "enabled" | "created_at" | "updated_at" | "key_strategy"> & { key_strategy?: string }
 ): void {
   console.log(`[db] addProvider: name=${provider.name}, type=${provider.api_type}, models=${provider.models}`);
   runSql(
-    `INSERT INTO providers (name, api_type, base_url, api_key, models, input_price, output_price)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO providers (name, api_type, base_url, api_key, key_strategy, models, input_price, output_price)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       provider.name,
       provider.api_type,
       provider.base_url,
       provider.api_key,
+      provider.key_strategy ?? "failover",
       provider.models,
       provider.input_price ?? null,
       provider.output_price ?? null,
