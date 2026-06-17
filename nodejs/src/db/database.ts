@@ -254,6 +254,13 @@ function createTables(db: SqlJsDatabase): void {
     }
   }
 
+  // Migration: add allowed_models column to user_groups table
+  try {
+    db.run("ALTER TABLE user_groups ADD COLUMN allowed_models TEXT NOT NULL DEFAULT ''");
+  } catch {
+    // Column already exists — ignore
+  }
+
   // Seed default group if none exists
   const defaultGroup = db.exec("SELECT id FROM user_groups WHERE is_default = 1 LIMIT 1");
   if (!defaultGroup.length) {
@@ -1370,15 +1377,15 @@ export function deleteModelRestriction(
  * Check if a specific model is allowed for the given user/apiKey.
  * Returns true if allowed, false if denied.
  *
- * Logic:
- * 1. If apiKeyId is provided, check key-level restriction first.
- *    - If key-level exists → apply it (ignore user-level).
- * 2. If no key-level, check user-level restriction.
- *    - If user-level exists → apply it.
- * 3. If no restriction at all → default deny (return false) for non-admin.
- *
- * For admin users (tgUserId matches ADMIN_ID), skip user-level restrictions
- * but still apply key-level if set.
+ * Priority:
+ * 1. Key-level restriction (model_restrictions with specific apiKeyId)
+ *    → If exists, apply it (whitelist/blacklist).
+ * 2. Admin bypass (admin always allowed, except key-level above).
+ * 3. User-level restriction (model_restrictions with apiKeyId = NULL)
+ *    → If exists, apply it.
+ * 4. Group-level allowed_models (user_groups.allowed_models)
+ *    → If non-empty, acts as whitelist for that model.
+ * 5. If no restriction at all → default allow (return true).
  */
 export function checkModelAllowed(
   userId: number,
@@ -1403,8 +1410,14 @@ export function checkModelAllowed(
     return applyRestriction(userRestriction, modelName);
   }
 
-  // 4. No restriction found → default deny for non-admin
-  return false;
+  // 4. Check group-level allowed_models (whitelist from user group)
+  const limits = getCachedEffectiveLimits(userId, apiKeyId);
+  if (limits.allowedModels.length > 0) {
+    return limits.allowedModels.includes(modelName);
+  }
+
+  // 5. No restriction found → default allow for non-admin
+  return true;
 }
 
 function applyRestriction(
@@ -1449,8 +1462,14 @@ export function getAllowedModels(
     return filterModelsByRestriction(userRestriction, allModels);
   }
 
-  // 4. No restriction → deny all for non-admin
-  return [];
+  // 4. Check group-level allowed_models (whitelist from user group)
+  const limits = getCachedEffectiveLimits(userId, apiKeyId);
+  if (limits.allowedModels.length > 0) {
+    return allModels.filter((m) => limits.allowedModels.includes(m));
+  }
+
+  // 5. No restriction found → allow all for non-admin
+  return allModels;
 }
 
 function filterModelsByRestriction(
@@ -1485,6 +1504,7 @@ export interface UserGroup {
   daily_cost_limit: number;
   monthly_cost_limit: number;
   is_default: number;
+  allowed_models: string;
   created_at: string;
   updated_at: string;
 }
@@ -1525,6 +1545,7 @@ export interface EffectiveLimits {
   dailyCostLimit: number;
   monthlyCostLimit: number;
   expiresAt: string | null;
+  allowedModels: string[];
 }
 
 // --- User Groups CRUD ---
@@ -1555,13 +1576,14 @@ export interface UserGroupInput {
   monthly_token_limit?: number;
   daily_cost_limit?: number;
   monthly_cost_limit?: number;
+  allowed_models?: string;
 }
 
 export function addUserGroup(data: UserGroupInput): void {
   runSql(
     `INSERT INTO user_groups (name, display_name, rpm_limit, tpm_limit, concurrency_limit,
-      daily_token_limit, monthly_token_limit, daily_cost_limit, monthly_cost_limit)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      daily_token_limit, monthly_token_limit, daily_cost_limit, monthly_cost_limit, allowed_models)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       data.name,
       data.display_name ?? null,
@@ -1572,6 +1594,7 @@ export function addUserGroup(data: UserGroupInput): void {
       data.monthly_token_limit ?? 0,
       data.daily_cost_limit ?? 0,
       data.monthly_cost_limit ?? 0,
+      data.allowed_models ?? "",
     ] as SqlValue[]
   );
   invalidateEffectiveLimitsCache();
@@ -1583,7 +1606,8 @@ export function updateUserGroup(id: number, data: Partial<UserGroupInput>): void
 
   const allowedFields: (keyof UserGroupInput)[] = [
     "name", "display_name", "rpm_limit", "tpm_limit", "concurrency_limit",
-    "daily_token_limit", "monthly_token_limit", "daily_cost_limit", "monthly_cost_limit"
+    "daily_token_limit", "monthly_token_limit", "daily_cost_limit", "monthly_cost_limit",
+    "allowed_models"
   ];
 
   for (const key of allowedFields) {
@@ -1614,6 +1638,14 @@ export function deleteUserGroup(id: number): void {
     runSql("UPDATE users SET group_id = ? WHERE group_id = ?", [defaultGroup.id, id]);
   }
   runSql("DELETE FROM user_groups WHERE id = ?", [id]);
+  invalidateEffectiveLimitsCache();
+}
+
+export function setDefaultUserGroup(id: number): void {
+  const group = getUserGroupById(id);
+  if (!group) throw new Error("User group not found");
+  runSql("UPDATE user_groups SET is_default = 0");
+  runSql("UPDATE user_groups SET is_default = 1 WHERE id = ?", [id]);
   invalidateEffectiveLimitsCache();
 }
 
@@ -1740,6 +1772,7 @@ export function getEffectiveLimits(userId: number, apiKeyId: number | null): Eff
        COALESCE(g.monthly_token_limit, dg.monthly_token_limit) AS g_mt,
        COALESCE(g.daily_cost_limit, dg.daily_cost_limit) AS g_dc,
        COALESCE(g.monthly_cost_limit, dg.monthly_cost_limit) AS g_mc,
+       COALESCE(NULLIF(g.allowed_models, ''), NULLIF(dg.allowed_models, '')) AS g_models,
        ak.rpm_override AS ak_rpm, ak.tpm_override AS ak_tpm,
        ak.concurrency_override AS ak_conc, ak.daily_token_override AS ak_dt,
        ak.monthly_token_override AS ak_mt, ak.daily_cost_override AS ak_dc,
@@ -1759,6 +1792,7 @@ export function getEffectiveLimits(userId: number, apiKeyId: number | null): Eff
       dailyTokenLimit: 0, monthlyTokenLimit: 0,
       dailyCostLimit: 0, monthlyCostLimit: 0,
       expiresAt: null,
+      allowedModels: [],
     };
   }
 
@@ -1771,6 +1805,8 @@ export function getEffectiveLimits(userId: number, apiKeyId: number | null): Eff
     dailyCostLimit: pickLimit(row.ak_dc as number | null, row.u_dc as number | null, row.g_dc as number | null),
     monthlyCostLimit: pickLimit(row.ak_mc as number | null, row.u_mc as number | null, row.g_mc as number | null),
     expiresAt: (row.ak_exp as string | null) ?? (row.u_exp as string | null) ?? null,
+    allowedModels: ((row.g_models as string | null) ?? "")
+      .split(",").map((m) => m.trim()).filter(Boolean),
   };
 }
 

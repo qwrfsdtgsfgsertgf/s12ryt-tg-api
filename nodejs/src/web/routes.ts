@@ -93,7 +93,7 @@ import {
   getEffectiveLimits, getUserWithLimits, setUserGroup, setUserOverrides,
   getApiKeyWithLimits, setApiKeyOverrides, invalidateEffectiveLimitsCache,
   // groups
-  getUserGroups, addUserGroup, updateUserGroup, deleteUserGroup, getDefaultUserGroup,
+  getUserGroups, addUserGroup, updateUserGroup, deleteUserGroup, getDefaultUserGroup, setDefaultUserGroup,
   // settings
   getSetting, setSetting,
   // cache
@@ -832,6 +832,23 @@ router.delete("/api/admin/groups/:id", (req: Request, res: Response) => {
     } else {
       res.status(500).json({ error: msg });
     }
+  }
+});
+
+/** PUT /web/api/admin/groups/:id/default — 設為預設分組 */
+router.put("/api/admin/groups/:id/default", (req: Request, res: Response) => {
+  const id = parseInt(req.params.id, 10);
+  if (isNaN(id)) {
+    res.status(400).json({ error: "無效的 ID" });
+    return;
+  }
+  try {
+    setDefaultUserGroup(id);
+    res.json({ ok: true });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "設定預設分組失敗";
+    console.error("[web] setDefaultUserGroup error:", err);
+    res.status(500).json({ error: msg });
   }
 });
 
