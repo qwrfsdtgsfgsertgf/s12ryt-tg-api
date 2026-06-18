@@ -56,6 +56,11 @@ function getProxyDispatcher(): Dispatcher | null {
 // GitHub 鏡像
 // ========================
 
+/** GitHub 鏡像備用列表（直連失敗時按順序自動嘗試，前綴代理模式） */
+const GITHUB_MIRRORS = [
+  "https://ghproxy.com",
+];
+
 /**
  * 如果設定了 GITHUB_MIRROR，對 GitHub URL 加上前綴。
  *
@@ -66,6 +71,16 @@ export function applyMirror(url: string): string {
   const mirror = process.env.GITHUB_MIRROR;
   if (!mirror) return url;
   return `${mirror}/${url}`;
+}
+
+/**
+ * 取得所有 GitHub 鏡像列表（含用戶自訂 + 內建）
+ * 用於診斷
+ */
+export function getGithubMirrors(): string[] {
+  const userMirror = process.env.GITHUB_MIRROR;
+  if (userMirror) return [userMirror, ...GITHUB_MIRRORS];
+  return [...GITHUB_MIRRORS];
 }
 
 // ========================
@@ -142,6 +157,50 @@ export async function fetchWithRetry(
   }
 
   throw lastError ?? new Error("fetchWithRetry: 不明錯誤");
+}
+
+/**
+ * GitHub 專用 fetch：直連失敗時自動切換內建鏡像。
+ *
+ * 策略：
+ *   1. 如果設定了 GITHUB_MIRROR 環境變數 → 直接用它（不自動 fallback）
+ *   2. 否則：直連 → 失敗 → 逐一嘗試 GITHUB_MIRRORS 中的內建鏡像
+ *
+ * 每個來源都會使用 fetchWithRetry（含代理 + 指數退避重試）。
+ */
+export async function fetchGithub(
+  url: string,
+  options: RetryFetchOptions = {},
+): Promise<Response> {
+  const userMirror = process.env.GITHUB_MIRROR;
+
+  // 用戶指定了鏡像 → 用它，不自動 fallback
+  if (userMirror) {
+    return fetchWithRetry(`${userMirror}/${url}`, options);
+  }
+
+  // 直連
+  try {
+    return await fetchWithRetry(url, options);
+  } catch (directErr) {
+    console.warn(
+      `[net] GitHub 直連失敗（${(directErr as Error).message}），嘗試內建鏡像...`,
+    );
+  }
+
+  // 嘗試內建鏡像
+  for (const mirror of GITHUB_MIRRORS) {
+    try {
+      console.log(`[net] 嘗試鏡像：${mirror}`);
+      return await fetchWithRetry(`${mirror}/${url}`, options);
+    } catch (err) {
+      console.warn(`[net] 鏡像 ${mirror} 也失敗：${(err as Error).message}`);
+    }
+  }
+
+  throw new Error(
+    `GitHub 所有連線方式都失敗（直連 + ${GITHUB_MIRRORS.length} 個鏡像）`,
+  );
 }
 
 // ========================

@@ -20,7 +20,7 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { closeDb } from "./db/database.js";
-import { fetchWithRetry, applyMirror, diagnoseConnectivity } from "./net.js";
+import { fetchWithRetry, fetchGithub, applyMirror, diagnoseConnectivity } from "./net.js";
 export { diagnoseConnectivity } from "./net.js";
 export type { ConnectivityReport } from "./net.js";
 
@@ -225,9 +225,9 @@ interface GitHubReleaseApiResponse {
  * 失敗時仍返回 null，但會在 console 輸出具體錯誤原因。
  */
 export async function getLatestRelease(): Promise<ReleaseInfo | null> {
-  const apiUrl = applyMirror(`${GITHUB_API_BASE}/releases/latest`);
+  const apiUrl = `${GITHUB_API_BASE}/releases/latest`;
   try {
-    const resp = await fetchWithRetry(apiUrl, {
+    const resp = await fetchGithub(apiUrl, {
       timeoutMs: 30_000,
       retries: 2,
       headers: {
@@ -386,10 +386,9 @@ async function downloadAndExtract(
   const tmpDir = join(stagingDir, ".tmp");
   mkdirSync(tmpDir, { recursive: true });
 
-  // Step 1: 下載 tarball（使用代理 + 重試 + 鏡像）
-  const downloadUrl = applyMirror(tarballUrl);
-  console.log(`[updater] 正在下載 ${downloadUrl}...`);
-  const resp = await fetchWithRetry(downloadUrl, {
+  // Step 1: 下載 tarball（使用代理 + 重試 + 自動鏡像 fallback）
+  console.log(`[updater] 正在下載 ${tarballUrl}...`);
+  const resp = await fetchGithub(tarballUrl, {
     timeoutMs: 180_000,
     retries: 2,
     headers: { "User-Agent": `${GITHUB_OWNER}-${GITHUB_REPO}-updater` },
@@ -533,28 +532,34 @@ function isOOMError(err: any): boolean {
     String(err?.stderr ?? "").includes("Killed");
 }
 
+/** npm registry 備用鏡像列表（主源失敗時按順序嘗試） */
+const NPM_REGISTRY_FALLBACKS = [
+  "https://registry.npmmirror.com", // 淘寶 npm 鏡像
+];
+
 /**
  * 記憶體受限環境的 npm 環境變數（限制 V8 堆疊 + 關閉非必要功能）
  *
  * 同時自動注入代理和 registry 鏡像，解決容器中 npm install 卡住問題：
  *   - NPM_REGISTRY：自定義 registry（如 https://registry.npmmirror.com）
  *   - HTTPS_PROXY / HTTP_PROXY → npm_config_https_proxy / npm_config_proxy
+ *
+ * @param registryOverride 強制使用的 registry（用於 fallback 重試）
  */
-function buildNpmEnv(): Record<string, string | undefined> {
+function buildNpmEnv(registryOverride?: string): Record<string, string | undefined> {
   const env: Record<string, string | undefined> = {
     ...process.env,
     NODE_OPTIONS: [process.env.NODE_OPTIONS, "--max-old-space-size=384"]
       .filter(Boolean).join(" "),
   };
 
-  // Registry 鏡像（如 https://registry.npmmirror.com）
-  const registry = process.env.NPM_REGISTRY;
+  // Registry：override > NPM_REGISTRY env > npm 預設
+  const registry = registryOverride ?? process.env.NPM_REGISTRY;
   if (registry) {
     env.npm_config_registry = registry;
   }
 
   // 代理：npm 使用 npm_config_* 前綴讀取代理設定
-  // 即使 process.env 中有 HTTPS_PROXY，npm 也需要顯式的 npm_config_* 才能可靠使用
   const httpsProxy = process.env.HTTPS_PROXY || process.env.https_proxy;
   const httpProxy = process.env.HTTP_PROXY || process.env.http_proxy;
   if (httpsProxy && !env.npm_config_https_proxy) {
@@ -568,42 +573,107 @@ function buildNpmEnv(): Record<string, string | undefined> {
 }
 
 /**
+ * 判斷錯誤是否為網路/超時問題（值得用備用 registry 重試）
+ */
+function isNpmNetworkError(err: any): boolean {
+  if (isOOMError(err)) return false; // OOM 不是網路問題
+  const msg = String(err?.message ?? "").toLowerCase();
+  return msg.includes("timeout") ||
+    msg.includes("etimedout") ||
+    msg.includes("enotfound") ||
+    msg.includes("econnrefused") ||
+    msg.includes("econnreset") ||
+    msg.includes("eai_again") ||
+    msg.includes("network");
+}
+
+/**
  * 在指定目錄執行 npm install/ci，針對低記憶體容器優化
  *
- * 策略：npm ci（更快更省記憶體）→ 失敗回退 npm install → OOM 偵測
+ * 策略：
+ *   1. npm ci（更快更省記憶體）→ 失敗回退 npm install → OOM 偵測
+ *   2. 網路失敗時自動切換到備用 registry 鏡像重試
  */
 function runNpmInstall(cwd: string, timeoutMs = 180_000): void {
-  const env = buildNpmEnv();
   const hasLockfile = existsSync(join(cwd, "package-lock.json"));
   const flags = ["--no-audit", "--no-fund", "--prefer-offline"];
 
-  try {
-    // 優先使用 npm ci（跳過依賴解析，更快更省記憶體）
-    if (hasLockfile) {
-      execFileSync("npm", ["ci", ...flags], {
-        cwd, timeout: timeoutMs, stdio: "inherit", env,
-      });
-    } else {
-      execFileSync("npm", ["install", ...flags], {
-        cwd, timeout: timeoutMs, stdio: "inherit", env,
-      });
+  /** 嘗試用指定 registry 執行 npm ci/install */
+  function tryInstall(env: Record<string, string | undefined>): void {
+    try {
+      if (hasLockfile) {
+        execFileSync("npm", ["ci", ...flags], {
+          cwd, timeout: timeoutMs, stdio: "inherit", env,
+        });
+      } else {
+        execFileSync("npm", ["install", ...flags], {
+          cwd, timeout: timeoutMs, stdio: "inherit", env,
+        });
+      }
+    } catch (err: any) {
+      // npm ci 失敗（lockfile 不同步等）→ 回退到 npm install
+      if (hasLockfile && !isOOMError(err)) {
+        console.warn("[updater] npm ci 失敗，回退到 npm install...");
+        execFileSync("npm", ["install", ...flags], {
+          cwd, timeout: timeoutMs, stdio: "inherit", env,
+        });
+        return;
+      }
+      throw err; // 重新拋出，由外層判斷是否切 registry
     }
-  } catch (err: any) {
-    // npm ci 失敗（lockfile 不同步等）→ 回退到 npm install
-    if (hasLockfile && !isOOMError(err)) {
-      console.warn("[updater] npm ci 失敗，回退到 npm install...");
-      execFileSync("npm", ["install", ...flags], {
-        cwd, timeout: timeoutMs, stdio: "inherit", env,
-      });
-      return;
-    }
-    // OOM 或 npm install 也失敗 → 清晰的錯誤訊息
-    throw new Error(
-      isOOMError(err)
-        ? "npm install 因記憶體不足被系統終止 (OOM Kill)。請增加容器記憶體限制（建議 ≥512MB）。"
-        : `npm install 失敗：${err.message}`,
-    );
   }
+
+  // 主源：NPM_REGISTRY 環境變數或 npm 預設
+  const primaryEnv = buildNpmEnv();
+  const primaryLabel = process.env.NPM_REGISTRY ?? "registry.npmjs.org（預設）";
+
+  try {
+    console.log(`[updater] npm install（registry: ${primaryLabel}）`);
+    tryInstall(primaryEnv);
+    return;
+  } catch (err: any) {
+    // OOM 不是網路問題，直接報錯
+    if (isOOMError(err)) {
+      throw new Error(
+        "npm install 因記憶體不足被系統終止 (OOM Kill)。請增加容器記憶體限制（建議 ≥512MB）。",
+      );
+    }
+
+    // 非網路錯誤（如 lockfile 問題）→ 直接報錯
+    if (!isNpmNetworkError(err)) {
+      throw new Error(`npm install 失敗：${err.message}`);
+    }
+
+    // 網路錯誤 → 嘗試備用 registry
+    console.warn(`[updater] npm install 失敗（網路問題）：${err.message}`);
+  }
+
+  // Fallback：逐一嘗試備用 registry 鏡像
+  for (const mirror of NPM_REGISTRY_FALLBACKS) {
+    // 用戶自訂的 NPM_REGISTRY 如果就是這個鏡像，跳過
+    if (process.env.NPM_REGISTRY === mirror) continue;
+
+    try {
+      console.log(`[updater] 重試 npm install（registry: ${mirror}）`);
+      const env = buildNpmEnv(mirror);
+      tryInstall(env);
+      console.log(`[updater] ✓ npm install 成功（使用 ${mirror}）`);
+      return;
+    } catch (err: any) {
+      if (isOOMError(err)) {
+        throw new Error(
+          "npm install 因記憶體不足被系統終止 (OOM Kill)。請增加容器記憶體限制（建議 ≥512MB）。",
+        );
+      }
+      console.warn(`[updater] ${mirror} 也失敗了：${err.message}`);
+    }
+  }
+
+  // 所有 registry 都失敗
+  throw new Error(
+    `npm install 失敗：所有 registry（包括 ${NPM_REGISTRY_FALLBACKS.length} 個備用鏡像）都無法連接。\n` +
+    "請檢查網路或手動設定 NPM_REGISTRY / HTTPS_PROXY 環境變數。",
+  );
 }
 
 /**
