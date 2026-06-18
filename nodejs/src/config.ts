@@ -9,6 +9,7 @@ export interface Config {
   DEFAULT_API_URL: string;
   CLOUDFLARE_TUNNEL: string;
   CLOUDFLARE_TOKEN: string;
+  GITHUB_MIRROR: string;
 }
 
 function requireEnv(key: string): string {
@@ -27,4 +28,5 @@ export const config: Config = {
   DEFAULT_API_URL: process.env.DEFAULT_API_URL ?? "http://localhost:8000",
   CLOUDFLARE_TUNNEL: process.env.CLOUDFLARE_TUNNEL ?? "",
   CLOUDFLARE_TOKEN: process.env.CLOUDFLARE_TOKEN ?? "",
+  GITHUB_MIRROR: process.env.GITHUB_MIRROR ?? "",
 };

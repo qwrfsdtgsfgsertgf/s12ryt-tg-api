@@ -19,6 +19,7 @@ import {
   isWorkingDirClean,
   getBackupList,
   rollbackAndRestart,
+  runConnectivityDiagnosis,
 } from "../../updater.js";
 
 type MyContext = Context & ConversationFlavor;
@@ -67,6 +68,31 @@ async function updateCommand(ctx: MyContext): Promise<void> {
     await ctx.reply("⏳ 正在檢查更新...");
 
     const result = await fetchAndCheckUpdate();
+
+    // 網路錯誤 → 自動診斷並給出建議
+    if (result.networkError && !result.latestRelease && !result.hasUpdate) {
+      await ctx.reply("🔍 正在診斷網路連線...");
+      try {
+        const diag = await runConnectivityDiagnosis();
+        let msg = "⚠️ *更新檢查失敗 — 網路診斷報告*\n\n";
+
+        msg += `📡 GitHub API：${diag.githubApi.ok ? "✅" : "❌"} ${diag.githubApi.ok ? `${diag.githubApi.latencyMs}ms` : `(${diag.githubApi.error})`}\n`;
+        msg += `📦 tarball 下載：${diag.githubDownload.ok ? "✅" : "❌"} ${diag.githubDownload.ok ? `${diag.githubDownload.latencyMs}ms` : `(${diag.githubDownload.error})`}\n`;
+        msg += `🔧 git fetch：${diag.gitFetch.ok ? "✅" : "❌"}${diag.gitFetch.error ? ` (${diag.gitFetch.error})` : ""}\n`;
+
+        if (diag.suggestions.length > 0) {
+          msg += "\n💡 *建議：*\n";
+          msg += diag.suggestions.map((s: string) => s).join("\n");
+        }
+
+        await ctx.reply(msg, { parse_mode: "Markdown" });
+      } catch (diagErr) {
+        await ctx.reply(
+          `❌ 檢查更新失敗：${result.networkError}\n\n診斷也失敗了：${(diagErr as Error).message}`,
+        );
+      }
+      return;
+    }
 
     if (!result.hasUpdate) {
       await ctx.reply(

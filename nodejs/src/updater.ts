@@ -20,6 +20,9 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { closeDb } from "./db/database.js";
+import { fetchWithRetry, applyMirror, diagnoseConnectivity } from "./net.js";
+export { diagnoseConnectivity } from "./net.js";
+export type { ConnectivityReport } from "./net.js";
 
 // ========================
 // 常數
@@ -89,6 +92,8 @@ export interface UpdateCheckResult {
   commitsBehind: number;
   /** 落後的 commit 列表（每行一條） */
   newCommits: string[];
+  /** 網路錯誤訊息（GitHub API 或 git fetch 失敗時記錄，供上層診斷用） */
+  networkError: string | null;
 }
 
 export interface UpdateResult {
@@ -215,19 +220,26 @@ interface GitHubReleaseApiResponse {
 
 /**
  * 取得最新 stable Release（非 prerelease）
- * 如果沒有 stable release，回傳 null
+ *
+ * 使用 fetchWithRetry 支援代理 + 重試 + 鏡像。
+ * 失敗時仍返回 null，但會在 console 輸出具體錯誤原因。
  */
 export async function getLatestRelease(): Promise<ReleaseInfo | null> {
+  const apiUrl = applyMirror(`${GITHUB_API_BASE}/releases/latest`);
   try {
-    const resp = await fetch(`${GITHUB_API_BASE}/releases/latest`, {
+    const resp = await fetchWithRetry(apiUrl, {
+      timeoutMs: 30_000,
+      retries: 2,
       headers: {
         Accept: "application/vnd.github+json",
         "User-Agent": `${GITHUB_OWNER}-${GITHUB_REPO}-updater`,
       },
-      signal: AbortSignal.timeout(15_000),
     });
 
-    if (!resp.ok) return null;
+    if (!resp.ok) {
+      console.warn(`[updater] GitHub API 返回 HTTP ${resp.status}`);
+      return null;
+    }
 
     const data = await resp.json() as GitHubReleaseApiResponse;
     return {
@@ -238,7 +250,8 @@ export async function getLatestRelease(): Promise<ReleaseInfo | null> {
       htmlUrl: data.html_url,
       tarballUrl: data.tarball_url,
     };
-  } catch {
+  } catch (err) {
+    console.warn(`[updater] GitHub API 請求失敗：${(err as Error).message}`);
     return null;
   }
 }
@@ -281,6 +294,7 @@ export async function fetchAndCheckUpdate(): Promise<UpdateCheckResult> {
   let commitsBehind = 0;
   let newCommits: string[] = [];
   let gitHasUpdate = false;
+  let gitFetchError: string | null = null;
 
   if (isGitRepo()) {
     try {
@@ -300,8 +314,10 @@ export async function fetchAndCheckUpdate(): Promise<UpdateCheckResult> {
           commitsBehind = newCommits.length;
         }
       }
-    } catch {
-      // git fetch 失敗（網路問題），但 GitHub API 可能成功
+    } catch (err) {
+      // git fetch 失敗（網路問題），記錄原因供診斷
+      gitFetchError = `git fetch 失敗：${(err as Error).message}`;
+      console.warn(`[updater] ${gitFetchError}`);
     }
   }
 
@@ -318,12 +334,23 @@ export async function fetchAndCheckUpdate(): Promise<UpdateCheckResult> {
     hasUpdate = true;
   }
 
+  // 組裝 networkError：如果 GitHub API 和 git fetch 都失敗
+  let networkError: string | null = null;
+  if (!latestRelease && gitFetchError) {
+    networkError = `GitHub API 和 git fetch 均失敗。${gitFetchError}`;
+  } else if (!latestRelease) {
+    networkError = "GitHub API 請求失敗（詳見日誌）";
+  } else if (gitFetchError) {
+    networkError = gitFetchError;
+  }
+
   return {
     hasUpdate,
     current,
     latestRelease,
     commitsBehind,
     newCommits,
+    networkError,
   };
 }
 
@@ -359,11 +386,13 @@ async function downloadAndExtract(
   const tmpDir = join(stagingDir, ".tmp");
   mkdirSync(tmpDir, { recursive: true });
 
-  // Step 1: 下載 tarball
-  console.log(`[updater] 正在下載 ${tarballUrl}...`);
-  const resp = await fetch(tarballUrl, {
+  // Step 1: 下載 tarball（使用代理 + 重試 + 鏡像）
+  const downloadUrl = applyMirror(tarballUrl);
+  console.log(`[updater] 正在下載 ${downloadUrl}...`);
+  const resp = await fetchWithRetry(downloadUrl, {
+    timeoutMs: 180_000,
+    retries: 2,
     headers: { "User-Agent": `${GITHUB_OWNER}-${GITHUB_REPO}-updater` },
-    signal: AbortSignal.timeout(120_000),
   });
   if (!resp.ok) {
     throw new Error(`下載失敗：HTTP ${resp.status}`);
@@ -829,4 +858,17 @@ export async function updateAndRestart(): Promise<UpdateResult> {
     restartProcess(2000);
   }
   return result;
+}
+
+/**
+ * 執行更新系統連通性診斷（供 /update 失敗時呼叫）。
+ *
+ * 測試 GitHub API、tarball 下載、git fetch 三個環節，
+ * 並返回具體錯誤和建議。
+ */
+export async function runConnectivityDiagnosis() {
+  return diagnoseConnectivity(
+    `${GITHUB_API_BASE}/releases/latest`,
+    `${GITHUB_API_BASE}/tarball/main`,
+  );
 }
