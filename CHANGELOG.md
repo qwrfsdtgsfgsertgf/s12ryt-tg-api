@@ -26,6 +26,9 @@
 
 ## [Unreleased]
 
+### ✨ Features
+- support Node.js 22 LTS (broaden engines from >=24 to >=22, CI matrix tests 22+24)
+
 ### ⚡ Performance
 - optimize updater and start.js for low-resource containers (memory-adaptive heap sizing, timeout scaling, streaming download)
 - reduce API log memory footprint with request body truncation (keep first 3 + last 1 message)
