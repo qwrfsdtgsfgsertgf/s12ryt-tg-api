@@ -2,6 +2,28 @@
 
 所有版本變更記錄。本檔案由 `npm run release` 自動維護。
 
+## [1.7.2] - 2026-06-18
+
+### ✨ Features
+- auto-fallback to built-in mirrors on network failure (d7c7ff3)
+- add proxy, mirror, retry and connectivity diagnostics (2c922fc)
+
+### 🐛 Bug Fixes
+- remediate npm audit advisories (9d881f6)
+- inject proxy and registry mirror into npm install (c246e66)
+
+### ⚡ Performance
+- optimize for low-resource containers (da0d102)
+
+### 📝 Documentation
+- document supported lts runtime (f1b5977)
+
+### 🔧 CI
+- add build test audit gate (4ed50b1)
+
+### 📦 Other
+- pin active lts runtime version (2cae433)
+
 ## [Unreleased]
 
 ### ⚡ Performance
