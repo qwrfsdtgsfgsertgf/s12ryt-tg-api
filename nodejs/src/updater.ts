@@ -533,13 +533,38 @@ function isOOMError(err: any): boolean {
     String(err?.stderr ?? "").includes("Killed");
 }
 
-/** 記憶體受限環境的 npm 環境變數（限制 V8 堆疊 + 關閉非必要功能） */
+/**
+ * 記憶體受限環境的 npm 環境變數（限制 V8 堆疊 + 關閉非必要功能）
+ *
+ * 同時自動注入代理和 registry 鏡像，解決容器中 npm install 卡住問題：
+ *   - NPM_REGISTRY：自定義 registry（如 https://registry.npmmirror.com）
+ *   - HTTPS_PROXY / HTTP_PROXY → npm_config_https_proxy / npm_config_proxy
+ */
 function buildNpmEnv(): Record<string, string | undefined> {
-  return {
+  const env: Record<string, string | undefined> = {
     ...process.env,
     NODE_OPTIONS: [process.env.NODE_OPTIONS, "--max-old-space-size=384"]
       .filter(Boolean).join(" "),
   };
+
+  // Registry 鏡像（如 https://registry.npmmirror.com）
+  const registry = process.env.NPM_REGISTRY;
+  if (registry) {
+    env.npm_config_registry = registry;
+  }
+
+  // 代理：npm 使用 npm_config_* 前綴讀取代理設定
+  // 即使 process.env 中有 HTTPS_PROXY，npm 也需要顯式的 npm_config_* 才能可靠使用
+  const httpsProxy = process.env.HTTPS_PROXY || process.env.https_proxy;
+  const httpProxy = process.env.HTTP_PROXY || process.env.http_proxy;
+  if (httpsProxy && !env.npm_config_https_proxy) {
+    env.npm_config_https_proxy = httpsProxy;
+  }
+  if (httpProxy && !env.npm_config_proxy) {
+    env.npm_config_proxy = httpProxy;
+  }
+
+  return env;
 }
 
 /**

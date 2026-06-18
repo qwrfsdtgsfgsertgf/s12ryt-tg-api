@@ -10,6 +10,7 @@ export interface Config {
   CLOUDFLARE_TUNNEL: string;
   CLOUDFLARE_TOKEN: string;
   GITHUB_MIRROR: string;
+  NPM_REGISTRY: string;
 }
 
 function requireEnv(key: string): string {
@@ -29,4 +30,5 @@ export const config: Config = {
   CLOUDFLARE_TUNNEL: process.env.CLOUDFLARE_TUNNEL ?? "",
   CLOUDFLARE_TOKEN: process.env.CLOUDFLARE_TOKEN ?? "",
   GITHUB_MIRROR: process.env.GITHUB_MIRROR ?? "",
+  NPM_REGISTRY: process.env.NPM_REGISTRY ?? "",
 };
