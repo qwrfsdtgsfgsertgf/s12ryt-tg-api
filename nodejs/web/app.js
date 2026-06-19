@@ -677,7 +677,7 @@
         if (!byModel[m]) byModel[m] = { input: 0, output: 0, cost: 0, count: 0 };
         byModel[m].input += Number(r.input_tokens) || 0;
         byModel[m].output += Number(r.output_tokens) || 0;
-        byModel[m].cost += Number(r.input_cost) + Number(r.output_cost) || 0;
+        byModel[m].cost += (Number(r.input_cost) || 0) + (Number(r.output_cost) || 0);
         byModel[m].count++;
       }
 

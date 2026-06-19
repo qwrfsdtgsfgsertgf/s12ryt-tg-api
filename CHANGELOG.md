@@ -55,6 +55,8 @@
 - clear provider key state on provider deletion (prevents stale state memory leak)
 - propagate NODE_OPTIONS heap flag to restarted process in Blue-Green update
 - return unsubscribe function from onProviderCacheRebuild (proper cleanup)
+- fix admin global usage page showing empty (getTotalUsage now returns `total_requests`, `by_provider`, and `by_user` breakdown matching frontend expectations)
+- fix per-model cost showing 0 in user usage page (operator precedence: `(a + b) || 0` → `(a || 0) + (b || 0)`)
 
 ## [1.7.1] - 2026-06-17
 

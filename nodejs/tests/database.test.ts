@@ -571,6 +571,9 @@ describe("Usage CRUD", () => {
     expect(total.total_output_cost).toBe(0);
     expect(total.total_cost).toBe(0);
     expect(total.record_count).toBe(0);
+    expect(total.total_requests).toBe(0);
+    expect(total.by_provider).toEqual({});
+    expect(total.by_user).toEqual({});
   });
 
   it("should calculate total usage correctly", () => {
@@ -585,6 +588,56 @@ describe("Usage CRUD", () => {
     expect(total.total_output_cost).toBe(2.25);
     expect(total.total_cost).toBeCloseTo(3.75, 5);
     expect(total.record_count).toBe(2);
+    expect(total.total_requests).toBe(2);
+    // by_provider breakdown
+    expect(Object.keys(total.by_provider)).toHaveLength(1);
+    expect(total.by_provider["TestProvider"].requests).toBe(2);
+    expect(total.by_provider["TestProvider"].input_tokens).toBe(300);
+    expect(total.by_provider["TestProvider"].output_tokens).toBe(150);
+    expect(total.by_provider["TestProvider"].cost).toBeCloseTo(3.75, 5);
+    // by_user breakdown
+    expect(Object.keys(total.by_user)).toHaveLength(1);
+    expect(total.by_user["usageUser"].requests).toBe(2);
+    expect(total.by_user["usageUser"].cost).toBeCloseTo(3.75, 5);
+  });
+
+  it("should break down total usage by provider and user", () => {
+    // Second provider + second user
+    addUser(22222, "secondUser");
+    addProvider({
+      name: "OtherProvider",
+      api_type: "anthropic",
+      base_url: "https://other",
+      api_key: "other-key",
+      models: "claude-3",
+      input_price: null,
+      output_price: null,
+    });
+    const { key: key2 } = addApiKey(22222);
+    const apiKey2 = getKeyByValue(key2)!.id;
+
+    // User 1 → TestProvider
+    recordUsage(apiKeyId, 1, 100, 50, 0.5, 0.75, "gpt-4o");
+    // User 2 → OtherProvider
+    recordUsage(apiKey2, 2, 300, 200, 2.0, 3.0, "claude-3");
+    flushUsageQueue();
+
+    const total = getTotalUsage();
+    expect(total.record_count).toBe(2);
+    expect(total.total_requests).toBe(2);
+
+    // by_provider: two providers
+    expect(Object.keys(total.by_provider)).toHaveLength(2);
+    expect(total.by_provider["TestProvider"].requests).toBe(1);
+    expect(total.by_provider["TestProvider"].input_tokens).toBe(100);
+    expect(total.by_provider["OtherProvider"].requests).toBe(1);
+    expect(total.by_provider["OtherProvider"].cost).toBeCloseTo(5.0, 5);
+
+    // by_user: two users
+    expect(Object.keys(total.by_user)).toHaveLength(2);
+    expect(total.by_user["usageUser"].requests).toBe(1);
+    expect(total.by_user["secondUser"].requests).toBe(1);
+    expect(total.by_user["secondUser"].cost).toBeCloseTo(5.0, 5);
   });
 });
 

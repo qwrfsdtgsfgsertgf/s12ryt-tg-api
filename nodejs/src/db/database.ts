@@ -1048,6 +1048,13 @@ export function getUsageByProvider(providerId: number): UsageWithDetails[] {
   ) as unknown as UsageWithDetails[];
 }
 
+export interface UsageBreakdown {
+  requests: number;
+  input_tokens: number;
+  output_tokens: number;
+  cost: number;
+}
+
 export interface TotalUsage {
   total_input_tokens: number;
   total_output_tokens: number;
@@ -1055,6 +1062,9 @@ export interface TotalUsage {
   total_output_cost: number;
   total_cost: number;
   record_count: number;
+  total_requests: number;
+  by_provider: Record<string, UsageBreakdown>;
+  by_user: Record<string, UsageBreakdown>;
 }
 
 export function getTotalUsage(): TotalUsage {
@@ -1068,24 +1078,75 @@ export function getTotalUsage(): TotalUsage {
      FROM usage`
   );
 
-  if (!row) {
-    return {
-      total_input_tokens: 0,
-      total_output_tokens: 0,
-      total_input_cost: 0,
-      total_output_cost: 0,
-      total_cost: 0,
-      record_count: 0,
+  const recordCount = row ? Number(row.record_count) : 0;
+  const totalInputCost = row ? Number(row.total_input_cost) : 0;
+  const totalOutputCost = row ? Number(row.total_output_cost) : 0;
+
+  // Aggregate by provider
+  const providerRows = queryAll(
+    `SELECT
+       COALESCE(p.name, 'Unknown') as name,
+       COUNT(*) as requests,
+       COALESCE(SUM(u.input_tokens), 0) as input_tokens,
+       COALESCE(SUM(u.output_tokens), 0) as output_tokens,
+       COALESCE(SUM(u.input_cost), 0) as input_cost,
+       COALESCE(SUM(u.output_cost), 0) as output_cost
+     FROM usage u
+     LEFT JOIN providers p ON u.provider_id = p.id
+     GROUP BY u.provider_id
+     ORDER BY input_cost + output_cost DESC`
+  );
+
+  const by_provider: Record<string, UsageBreakdown> = {};
+  for (const pr of providerRows) {
+    const inputCost = Number(pr.input_cost) || 0;
+    const outputCost = Number(pr.output_cost) || 0;
+    by_provider[String(pr.name)] = {
+      requests: Number(pr.requests) || 0,
+      input_tokens: Number(pr.input_tokens) || 0,
+      output_tokens: Number(pr.output_tokens) || 0,
+      cost: inputCost + outputCost,
+    };
+  }
+
+  // Aggregate by user
+  const userRows = queryAll(
+    `SELECT
+       COALESCE(us.username, CAST(us.tg_user_id AS TEXT), 'Unknown') as name,
+       COUNT(*) as requests,
+       COALESCE(SUM(u.input_tokens), 0) as input_tokens,
+       COALESCE(SUM(u.output_tokens), 0) as output_tokens,
+       COALESCE(SUM(u.input_cost), 0) as input_cost,
+       COALESCE(SUM(u.output_cost), 0) as output_cost
+     FROM usage u
+     JOIN api_keys ak ON u.api_key_id = ak.id
+     LEFT JOIN users us ON ak.user_id = us.id
+     GROUP BY ak.user_id
+     ORDER BY input_cost + output_cost DESC`
+  );
+
+  const by_user: Record<string, UsageBreakdown> = {};
+  for (const ur of userRows) {
+    const inputCost = Number(ur.input_cost) || 0;
+    const outputCost = Number(ur.output_cost) || 0;
+    by_user[String(ur.name)] = {
+      requests: Number(ur.requests) || 0,
+      input_tokens: Number(ur.input_tokens) || 0,
+      output_tokens: Number(ur.output_tokens) || 0,
+      cost: inputCost + outputCost,
     };
   }
 
   return {
-    total_input_tokens: Number(row.total_input_tokens),
-    total_output_tokens: Number(row.total_output_tokens),
-    total_input_cost: Number(row.total_input_cost),
-    total_output_cost: Number(row.total_output_cost),
-    total_cost: Number(row.total_input_cost) + Number(row.total_output_cost),
-    record_count: Number(row.record_count),
+    total_input_tokens: row ? Number(row.total_input_tokens) : 0,
+    total_output_tokens: row ? Number(row.total_output_tokens) : 0,
+    total_input_cost: totalInputCost,
+    total_output_cost: totalOutputCost,
+    total_cost: totalInputCost + totalOutputCost,
+    record_count: recordCount,
+    total_requests: recordCount,
+    by_provider,
+    by_user,
   };
 }
 
