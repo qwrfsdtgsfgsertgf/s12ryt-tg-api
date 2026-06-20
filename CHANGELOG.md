@@ -2,6 +2,25 @@
 
 所有版本變更記錄。本檔案由 `npm run release` 自動維護。
 
+## [1.7.7] - 2026-06-20
+
+### ✨ Features
+- add /backup command with JSON file restore flow (6969007)
+- add database export/import for backup and restore (46b7a59)
+- add messages API direct pass-through and preserve reasoning blocks (8b004fd)
+
+### 🐛 Bug Fixes
+- misc reliability fixes across key selector, model fetcher, update handlers, and database (e56d8e7)
+- harden /v1/models endpoint and enforce model restrictions in coding-mode fallback (7331b6e)
+- validate key ownership on admin key deletion and simplify models route (85b3aa0)
+- re-check admin status per-request in web auth middleware (dcac023)
+
+### 📝 Documentation
+- add API format conversion matrix to README (9ca943a)
+
+### ✅ Tests
+- add IDOR and model access restriction tests for Node.js (b6290b0)
+
 ## [1.7.6] - 2026-06-19
 
 ### 🐛 Bug Fixes
