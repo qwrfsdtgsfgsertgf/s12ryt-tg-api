@@ -2,6 +2,12 @@
 
 所有版本變更記錄。本檔案由 `npm run release` 自動維護。
 
+## [1.7.12] - 2026-06-21
+
+### 🐛 Bug Fixes
+- harden responses stream parsing (fa6f8c9)
+- harden responses stream parsing (d72925d)
+
 ## [1.7.11] - 2026-06-21
 
 ### 📝 Documentation
