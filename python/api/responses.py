@@ -359,10 +359,14 @@ async def stream_responses_api(
     reasoning_item_id = _gen_id("rs")
     reasoning_item_emitted = False
     reasoning_output_index = -1
+    completed_emitted = False
+    buffer = ""
 
     async for chunk in provider_stream:
         text = chunk.decode("utf-8") if isinstance(chunk, bytes) else str(chunk)
-        lines = text.split("\n")
+        buffer += text
+        lines = buffer.split("\n")
+        buffer = lines.pop()
 
         for line in lines:
             trimmed = line.strip()
@@ -414,6 +418,8 @@ async def stream_responses_api(
 
             # --- Handle reasoning ---
             delta_reasoning = delta.get("reasoning")
+            if delta_reasoning is None:
+                delta_reasoning = delta.get("reasoning_content")
             if delta_reasoning is not None and delta_reasoning != "":
                 if not reasoning_item_emitted:
                     reasoning_item_emitted = True
@@ -629,6 +635,121 @@ async def stream_responses_api(
                     "sequence_number": _next_seq(),
                     "response": completed_response,
                 })
+                completed_emitted = True
+
+    if buffer.strip():
+        for line in buffer.split("\n"):
+            trimmed = line.strip()
+            if not trimmed.startswith("data: "):
+                continue
+            data = trimmed[6:].strip()
+            if data == "[DONE]":
+                continue
+
+            try:
+                parsed = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+
+            chunk_usage = parsed.get("usage")
+            if chunk_usage:
+                total_input_tokens = chunk_usage.get("prompt_tokens", total_input_tokens)
+                total_output_tokens = chunk_usage.get("completion_tokens", total_output_tokens)
+
+            choices = parsed.get("choices", [])
+            if not choices:
+                continue
+
+            delta = choices[0].get("delta", {})
+
+            delta_tool_calls = delta.get("tool_calls")
+            if delta_tool_calls and isinstance(delta_tool_calls, list):
+                for tc in delta_tool_calls:
+                    tc_index = tc.get("index", 0)
+                    if tc_index not in tool_call_buffers:
+                        tool_call_buffers[tc_index] = {
+                            "id": tc.get("id", ""),
+                            "name": (tc.get("function") or {}).get("name", ""),
+                            "arguments": (tc.get("function") or {}).get("arguments", ""),
+                        }
+                    else:
+                        buf = tool_call_buffers[tc_index]
+                        if tc.get("id"):
+                            buf["id"] = tc["id"]
+                        fn = tc.get("function")
+                        if fn:
+                            if fn.get("name"):
+                                buf["name"] = fn["name"]
+                            if fn.get("arguments"):
+                                buf["arguments"] += fn["arguments"]
+
+            delta_reasoning = delta.get("reasoning")
+            if delta_reasoning is None:
+                delta_reasoning = delta.get("reasoning_content")
+            if delta_reasoning is not None and delta_reasoning != "":
+                reasoning_text += delta_reasoning
+                reasoning_item_emitted = True
+
+            delta_content = delta.get("content")
+            if delta_content is not None and delta_content != "":
+                accumulated_text += delta_content
+                message_item_emitted = True
+                text_part_emitted = True
+
+    if not completed_emitted:
+        final_output: list[dict[str, Any]] = []
+        if reasoning_item_emitted or reasoning_text:
+            final_output.append({
+                "type": "reasoning",
+                "id": reasoning_item_id,
+                "status": "completed",
+                "summary": [
+                    {"type": "summary_text", "text": reasoning_text},
+                ],
+            })
+        if message_item_emitted or accumulated_text:
+            final_output.append({
+                "type": "message",
+                "id": item_id,
+                "role": "assistant",
+                "status": "completed",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": accumulated_text,
+                        "annotations": [],
+                        "logprobs": [],
+                    }
+                ] if text_part_emitted else [],
+            })
+        for tc_idx, tc_buf in tool_call_buffers.items():
+            final_output.append({
+                "type": "function_call",
+                "id": _gen_id("fc"),
+                "call_id": tc_buf["id"] or f"call_{tc_idx}",
+                "name": tc_buf["name"],
+                "arguments": tc_buf["arguments"],
+                "status": "completed",
+            })
+
+        completed_response = {
+            **base_response,
+            "status": "completed",
+            "completed_at": int(time.time()),
+            "output": final_output,
+            "usage": {
+                "input_tokens": total_input_tokens,
+                "output_tokens": total_output_tokens,
+                "total_tokens": total_input_tokens + total_output_tokens,
+                "input_tokens_details": {"cached_tokens": 0},
+                "output_tokens_details": {"reasoning_tokens": 0},
+            },
+        }
+        yield _sse_line("response.completed", {
+            "type": "response.completed",
+            "sequence_number": _next_seq(),
+            "response": completed_response,
+        })
 
     yield b"data: [DONE]\n\n"
 
@@ -952,6 +1073,85 @@ async def stream_chat_from_responses(
     current_event = ""
     streamed_reasoning_content = ""
 
+    async def _process_line(line: str):
+        nonlocal current_event, streamed_reasoning_content
+        stripped = line.strip()
+        if stripped.startswith("event: "):
+            current_event = stripped[7:]
+            return False, None
+        if not stripped.startswith("data: "):
+            current_event = ""
+            return False, None
+
+        data = stripped[6:]
+        if data == "[DONE]":
+            return True, b"data: [DONE]\n\n"
+
+        try:
+            parsed = json.loads(data)
+        except json.JSONDecodeError:
+            current_event = ""
+            return False, None
+
+        chunk = None
+        if current_event == "response.output_text.delta":
+            chunk = _chat_chunk({"content": _get_delta_text(parsed)})
+
+        elif current_event in {
+            "response.reasoning_summary_text.delta",
+            "response.reasoning_text.delta",
+        }:
+            reasoning_delta = _get_delta_text(parsed)
+            if reasoning_delta:
+                streamed_reasoning_content += reasoning_delta
+                chunk = _chat_chunk({"reasoning_content": reasoning_delta})
+
+        elif current_event == "response.function_call_arguments.delta":
+            chunk = _chat_chunk({
+                "tool_calls": [
+                    {
+                        "index": parsed.get("output_index", 0),
+                        "id": parsed.get("call_id", ""),
+                        "type": "function",
+                        "function": {
+                            "name": "",
+                            "arguments": _get_delta_text(parsed),
+                        },
+                    }
+                ],
+            })
+
+        elif current_event == "response.completed":
+            resp = parsed.get("response", {})
+            usage_data = resp.get("usage", {})
+            output = resp.get("output", [])
+            if not isinstance(output, list):
+                output = []
+            reasoning_suffix = _get_reasoning_suffix(
+                _extract_reasoning_text_from_output(output),
+                streamed_reasoning_content,
+            )
+            has_tool_calls = any(
+                isinstance(i, dict) and i.get("type") == "function_call"
+                for i in output
+            )
+            chunks = []
+            if reasoning_suffix:
+                chunks.append(_chat_chunk({"reasoning_content": reasoning_suffix}))
+            chunks.append(_chat_chunk(
+                {},
+                finish_reason="tool_calls" if has_tool_calls else "stop",
+                usage={
+                    "prompt_tokens": usage_data.get("input_tokens", 0),
+                    "completion_tokens": usage_data.get("output_tokens", 0),
+                    "total_tokens": usage_data.get("total_tokens", 0),
+                },
+            ))
+            chunk = b"".join(chunks)
+
+        current_event = ""
+        return False, chunk
+
     async for raw_chunk in provider_stream:
         text = raw_chunk.decode("utf-8") if isinstance(raw_chunk, bytes) else str(raw_chunk)
         buffer += text
@@ -959,79 +1159,19 @@ async def stream_chat_from_responses(
         buffer = lines.pop()  # keep incomplete trailing line
 
         for line in lines:
-            stripped = line.strip()
-            if stripped.startswith("event: "):
-                current_event = stripped[7:]
-                continue
-            if not stripped.startswith("data: "):
-                current_event = ""
-                continue
-
-            data = stripped[6:]
-            if data == "[DONE]":
-                yield b"data: [DONE]\n\n"
+            done, chunk = await _process_line(line)
+            if chunk:
+                yield chunk
+            if done:
                 return
 
-            try:
-                parsed = json.loads(data)
-            except json.JSONDecodeError:
-                current_event = ""
-                continue
-
-            if current_event == "response.output_text.delta":
-                yield _chat_chunk({"content": _get_delta_text(parsed)})
-
-            elif current_event in {
-                "response.reasoning_summary_text.delta",
-                "response.reasoning_text.delta",
-            }:
-                reasoning_delta = _get_delta_text(parsed)
-                if reasoning_delta:
-                    streamed_reasoning_content += reasoning_delta
-                    yield _chat_chunk({"reasoning_content": reasoning_delta})
-
-            elif current_event == "response.function_call_arguments.delta":
-                yield _chat_chunk({
-                    "tool_calls": [
-                        {
-                            "index": parsed.get("output_index", 0),
-                            "id": parsed.get("call_id", ""),
-                            "type": "function",
-                            "function": {
-                                "name": "",
-                                "arguments": _get_delta_text(parsed),
-                            },
-                        }
-                    ],
-                })
-
-            elif current_event == "response.completed":
-                resp = parsed.get("response", {})
-                usage_data = resp.get("usage", {})
-                output = resp.get("output", [])
-                if not isinstance(output, list):
-                    output = []
-                reasoning_suffix = _get_reasoning_suffix(
-                    _extract_reasoning_text_from_output(output),
-                    streamed_reasoning_content,
-                )
-                has_tool_calls = any(
-                    isinstance(i, dict) and i.get("type") == "function_call"
-                    for i in output
-                )
-                if reasoning_suffix:
-                    yield _chat_chunk({"reasoning_content": reasoning_suffix})
-                yield _chat_chunk(
-                    {},
-                    finish_reason="tool_calls" if has_tool_calls else "stop",
-                    usage={
-                        "prompt_tokens": usage_data.get("input_tokens", 0),
-                        "completion_tokens": usage_data.get("output_tokens", 0),
-                        "total_tokens": usage_data.get("total_tokens", 0),
-                    },
-                )
-
-            current_event = ""
+    if buffer.strip():
+        for line in buffer.split("\n"):
+            done, chunk = await _process_line(line)
+            if chunk:
+                yield chunk
+            if done:
+                return
 
     # Safety: emit DONE if stream ended without one
     yield b"data: [DONE]\n\n"

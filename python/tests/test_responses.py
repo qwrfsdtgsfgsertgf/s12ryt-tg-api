@@ -9,7 +9,11 @@ os.environ.setdefault("DEFAULT_API_URL", "http://localhost:8000")
 
 import pytest
 
-from api.responses import convert_responses_to_chat_completion, stream_chat_from_responses
+from api.responses import (
+    convert_responses_to_chat_completion,
+    stream_chat_from_responses,
+    stream_responses_api,
+)
 
 
 async def _response_events(chunks: list[str]):
@@ -26,6 +30,17 @@ async def _collect_chat_chunks(chunks: list[str]) -> list[dict]:
                 continue
             parsed_chunks.append(json.loads(line[6:]))
     return parsed_chunks
+
+
+async def _collect_response_events(chunks: list[str]) -> list[dict]:
+    parsed_events: list[dict] = []
+    async for chunk in stream_responses_api(_response_events(chunks), "gpt-test"):
+        text = chunk.decode("utf-8")
+        for line in text.split("\n"):
+            if not line.startswith("data: ") or line == "data: [DONE]":
+                continue
+            parsed_events.append(json.loads(line[6:]))
+    return parsed_events
 
 
 def _reasoning_deltas(chunks: list[dict]) -> list[str]:
@@ -118,3 +133,37 @@ async def test_does_not_duplicate_completed_reasoning_already_streamed():
     ])
 
     assert _reasoning_deltas(chunks) == ["full reasoning"]
+
+
+@pytest.mark.asyncio
+async def test_flushes_completed_responses_event_without_trailing_newline():
+    chunks = await _collect_chat_chunks([
+        'event: response.completed\ndata: {"response":{"output":[{"type":"reasoning","content":[{"type":"reasoning_text","text":"tail reasoning"}]}],"usage":{"input_tokens":3,"output_tokens":4,"total_tokens":7}}}',
+    ])
+
+    assert _reasoning_deltas(chunks) == ["tail reasoning"]
+    assert chunks[-1]["usage"] == {
+        "prompt_tokens": 3,
+        "completion_tokens": 4,
+        "total_tokens": 7,
+    }
+
+
+@pytest.mark.asyncio
+async def test_flushes_trailing_chat_reasoning_content_into_responses_events():
+    events = await _collect_response_events([
+        'data: {"choices":[{"delta":{"reasoning_content":"tail step"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":5}}',
+    ])
+
+    completed = next(event for event in events if event["type"] == "response.completed")
+    reasoning_item = next(
+        item for item in completed["response"]["output"] if item["type"] == "reasoning"
+    )
+    assert reasoning_item["summary"][0]["text"] == "tail step"
+    assert completed["response"]["usage"] | {"total_tokens": 7} == {
+        "input_tokens": 2,
+        "output_tokens": 5,
+        "total_tokens": 7,
+        "input_tokens_details": {"cached_tokens": 0},
+        "output_tokens_details": {"reasoning_tokens": 0},
+    }
