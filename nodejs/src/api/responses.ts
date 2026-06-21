@@ -651,9 +651,8 @@ export async function* streamResponsesApi(
     }
   }
 
-  // Flush remaining decoder bytes
+  // Flush remaining decoder bytes and parse any final SSE line that ended without a newline.
   sseBuffer += decoder.decode();
-  // Process any remaining data in buffer (stream ended without trailing newline)
   if (sseBuffer.trim()) {
     const remainingLines = sseBuffer.split("\n");
     for (const line of remainingLines) {
@@ -661,13 +660,53 @@ export async function* streamResponsesApi(
       if (!trimmed.startsWith("data: ")) continue;
       const data = trimmed.slice(6).trim();
       if (data === "[DONE]") continue;
+
+      let parsed: Record<string, any>;
       try {
-        const parsed = JSON.parse(data);
-        if (parsed.usage) {
-          totalInputTokens = parsed.usage.prompt_tokens ?? totalInputTokens;
-          totalOutputTokens = parsed.usage.completion_tokens ?? totalOutputTokens;
+        parsed = JSON.parse(data);
+      } catch {
+        continue;
+      }
+
+      const chunkUsage = parsed.usage;
+      if (chunkUsage) {
+        totalInputTokens = chunkUsage.prompt_tokens ?? totalInputTokens;
+        totalOutputTokens = chunkUsage.completion_tokens ?? totalOutputTokens;
+      }
+
+      const choices = parsed.choices ?? [];
+      if (choices.length === 0) continue;
+      const delta = choices[0].delta ?? {};
+
+      if (delta.tool_calls && Array.isArray(delta.tool_calls)) {
+        for (const tc of delta.tool_calls) {
+          const tcIndex = tc.index ?? 0;
+          if (!toolCallBuffers.has(tcIndex)) {
+            toolCallBuffers.set(tcIndex, {
+              id: tc.id ?? "",
+              name: tc.function?.name ?? "",
+              arguments: tc.function?.arguments ?? "",
+            });
+          } else {
+            const buf = toolCallBuffers.get(tcIndex)!;
+            if (tc.id) buf.id = tc.id;
+            if (tc.function?.name) buf.name = tc.function.name;
+            if (tc.function?.arguments) buf.arguments += tc.function.arguments;
+          }
         }
-      } catch { /* ignore */ }
+      }
+
+      const reasoningDelta: string = delta.reasoning ?? delta.reasoning_content;
+      if (reasoningDelta != null && reasoningDelta !== "") {
+        reasoningText += reasoningDelta;
+        reasoningItemEmitted = true;
+      }
+
+      if (delta.content != null && delta.content !== "") {
+        accumulatedText += delta.content;
+        messageItemEmitted = true;
+        textPartEmitted = true;
+      }
     }
   }
 
@@ -1016,6 +1055,82 @@ export async function* streamChatFromResponses(
   let currentEvent = "";
   let streamedReasoningContent = "";
 
+  async function* processLine(line: string): AsyncGenerator<Uint8Array, boolean, unknown> {
+    const stripped = line.trim();
+    if (stripped.startsWith("event: ")) {
+      currentEvent = stripped.slice(7);
+      return false;
+    }
+    if (!stripped.startsWith("data: ")) {
+      currentEvent = "";
+      return false;
+    }
+
+    const data = stripped.slice(6);
+    if (data === "[DONE]") {
+      yield sharedEncoder.encode("data: [DONE]\n\n");
+      return true;
+    }
+
+    let parsed: Record<string, any>;
+    try {
+      parsed = JSON.parse(data);
+    } catch {
+      currentEvent = "";
+      return false;
+    }
+
+    if (currentEvent === "response.output_text.delta") {
+      yield chatChunk({ content: getDeltaText(parsed) });
+    } else if (
+      currentEvent === "response.reasoning_summary_text.delta" ||
+      currentEvent === "response.reasoning_text.delta"
+    ) {
+      const reasoningDelta = getDeltaText(parsed);
+      if (reasoningDelta) {
+        streamedReasoningContent += reasoningDelta;
+        yield chatChunk({ reasoning_content: reasoningDelta });
+      }
+    } else if (currentEvent === "response.function_call_arguments.delta") {
+      yield chatChunk({
+        tool_calls: [
+          {
+            index: parsed.output_index ?? 0,
+            id: parsed.call_id ?? "",
+            type: "function",
+            function: { name: "", arguments: getDeltaText(parsed) },
+          },
+        ],
+      });
+    } else if (currentEvent === "response.completed") {
+      const resp = parsed.response ?? {};
+      const usageData = resp.usage ?? {};
+      const respOutput = Array.isArray(resp.output) ? resp.output : [];
+      const reasoningSuffix = getReasoningSuffix(
+        extractReasoningTextFromOutput(respOutput),
+        streamedReasoningContent
+      );
+      const hasToolCalls = respOutput.some(
+        (item: unknown) => isRecord(item) && item.type === "function_call"
+      );
+      if (reasoningSuffix) {
+        yield chatChunk({ reasoning_content: reasoningSuffix });
+      }
+      yield chatChunk(
+        {},
+        hasToolCalls ? "tool_calls" : "stop",
+        {
+          prompt_tokens: usageData.input_tokens ?? 0,
+          completion_tokens: usageData.output_tokens ?? 0,
+          total_tokens: usageData.total_tokens ?? 0,
+        }
+      );
+    }
+
+    currentEvent = "";
+    return false;
+  }
+
   for await (const rawChunk of providerStream) {
     const text = decoder.decode(rawChunk, { stream: true });
     buffer += text;
@@ -1023,78 +1138,16 @@ export async function* streamChatFromResponses(
     buffer = lines.pop() ?? ""; // keep incomplete trailing line
 
     for (const line of lines) {
-      const stripped = line.trim();
-      if (stripped.startsWith("event: ")) {
-        currentEvent = stripped.slice(7);
-        continue;
-      }
-      if (!stripped.startsWith("data: ")) {
-        currentEvent = "";
-        continue;
-      }
+      const done = yield* processLine(line);
+      if (done) return;
+    }
+  }
 
-      const data = stripped.slice(6);
-      if (data === "[DONE]") {
-        yield sharedEncoder.encode("data: [DONE]\n\n");
-        return;
-      }
-
-      let parsed: Record<string, any>;
-      try {
-        parsed = JSON.parse(data);
-      } catch {
-        currentEvent = "";
-        continue;
-      }
-
-      if (currentEvent === "response.output_text.delta") {
-        yield chatChunk({ content: getDeltaText(parsed) });
-      } else if (
-        currentEvent === "response.reasoning_summary_text.delta" ||
-        currentEvent === "response.reasoning_text.delta"
-      ) {
-        const reasoningDelta = getDeltaText(parsed);
-        if (reasoningDelta) {
-          streamedReasoningContent += reasoningDelta;
-          yield chatChunk({ reasoning_content: reasoningDelta });
-        }
-      } else if (currentEvent === "response.function_call_arguments.delta") {
-        yield chatChunk({
-          tool_calls: [
-            {
-              index: parsed.output_index ?? 0,
-              id: parsed.call_id ?? "",
-              type: "function",
-              function: { name: "", arguments: getDeltaText(parsed) },
-            },
-          ],
-        });
-      } else if (currentEvent === "response.completed") {
-        const resp = parsed.response ?? {};
-        const usageData = resp.usage ?? {};
-        const respOutput = Array.isArray(resp.output) ? resp.output : [];
-        const reasoningSuffix = getReasoningSuffix(
-          extractReasoningTextFromOutput(respOutput),
-          streamedReasoningContent
-        );
-        const hasToolCalls = respOutput.some(
-          (item: unknown) => isRecord(item) && item.type === "function_call"
-        );
-        if (reasoningSuffix) {
-          yield chatChunk({ reasoning_content: reasoningSuffix });
-        }
-        yield chatChunk(
-          {},
-          hasToolCalls ? "tool_calls" : "stop",
-          {
-            prompt_tokens: usageData.input_tokens ?? 0,
-            completion_tokens: usageData.output_tokens ?? 0,
-            total_tokens: usageData.total_tokens ?? 0,
-          }
-        );
-      }
-
-      currentEvent = "";
+  buffer += decoder.decode();
+  if (buffer.trim()) {
+    for (const line of buffer.split("\n")) {
+      const done = yield* processLine(line);
+      if (done) return;
     }
   }
 

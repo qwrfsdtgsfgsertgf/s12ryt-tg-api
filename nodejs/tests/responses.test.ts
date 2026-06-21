@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   convertResponsesToChatCompletion,
+  streamResponsesApi,
   streamChatFromResponses,
 } from "../src/api/responses.js";
 
@@ -23,6 +24,18 @@ async function collectChatChunks(chunks: string[]): Promise<Record<string, any>[
     }
   }
   return parsedChunks;
+}
+
+async function collectResponseEvents(chunks: string[]): Promise<Record<string, any>[]> {
+  const parsedEvents: Record<string, any>[] = [];
+  for await (const chunk of streamResponsesApi(responseEvents(chunks), "gpt-test")) {
+    const text = decoder.decode(chunk);
+    for (const line of text.split("\n")) {
+      if (!line.startsWith("data: ") || line === "data: [DONE]") continue;
+      parsedEvents.push(JSON.parse(line.slice(6)));
+    }
+  }
+  return parsedEvents;
 }
 
 function reasoningDeltas(chunks: Record<string, any>[]): string[] {
@@ -110,5 +123,35 @@ describe("Responses API conversion", () => {
     ]);
 
     expect(reasoningDeltas(chunks)).toEqual(["full reasoning"]);
+  });
+
+  it("flushes completed responses event without a trailing newline", async () => {
+    const chunks = await collectChatChunks([
+      'event: response.completed\ndata: {"response":{"output":[{"type":"reasoning","content":[{"type":"reasoning_text","text":"tail reasoning"}]}],"usage":{"input_tokens":3,"output_tokens":4,"total_tokens":7}}}',
+    ]);
+
+    expect(reasoningDeltas(chunks)).toEqual(["tail reasoning"]);
+    expect(chunks.at(-1)?.usage).toEqual({
+      prompt_tokens: 3,
+      completion_tokens: 4,
+      total_tokens: 7,
+    });
+  });
+
+  it("flushes trailing chat reasoning_content into responses events", async () => {
+    const events = await collectResponseEvents([
+      'data: {"choices":[{"delta":{"reasoning_content":"tail step"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":5}}',
+    ]);
+
+    const completed = events.find((event) => event.type === "response.completed");
+    const reasoningItem = completed?.response.output.find(
+      (item: Record<string, any>) => item.type === "reasoning",
+    );
+    expect(reasoningItem?.summary[0].text).toBe("tail step");
+    expect(completed?.response.usage).toMatchObject({
+      input_tokens: 2,
+      output_tokens: 5,
+      total_tokens: 7,
+    });
   });
 });
