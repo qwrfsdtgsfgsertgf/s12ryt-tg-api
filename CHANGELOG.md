@@ -2,6 +2,11 @@
 
 所有版本變更記錄。本檔案由 `npm run release` 自動維護。
 
+## [1.7.13] - 2026-06-21
+
+### 🐛 Bug Fixes
+- log upstream model for mapped aliases (ee7e578)
+
 ## [1.7.12] - 2026-06-21
 
 ### 🐛 Bug Fixes
