@@ -2,6 +2,11 @@
 
 所有版本變更記錄。本檔案由 `npm run release` 自動維護。
 
+## [1.7.16] - 2026-06-22
+
+### 🐛 Bug Fixes
+- support Responses API format in token estimation fallback (03cf9e3)
+
 ## [1.7.15] - 2026-06-22
 
 ### 🐛 Bug Fixes
