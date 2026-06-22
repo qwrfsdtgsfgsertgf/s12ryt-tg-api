@@ -2,6 +2,14 @@
 
 所有版本變更記錄。本檔案由 `npm run release` 自動維護。
 
+## [1.7.14] - 2026-06-22
+
+### ✨ Features
+- token estimation fallback when provider returns no usage data (66b49bf)
+
+### 🐛 Bug Fixes
+- preserve reasoning_content in streaming + align python thinking parser to 6 levels (44ab285)
+
 ## [1.7.13] - 2026-06-21
 
 ### 🐛 Bug Fixes
