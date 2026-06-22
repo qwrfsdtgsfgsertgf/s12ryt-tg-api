@@ -72,15 +72,18 @@ export function extractUsageWithFallback(
   body?: Record<string, any>,
 ): Usage {
   const usage = extractUsage(providerType, responseData);
-  if (usage.input_tokens > 0 || usage.output_tokens > 0) return usage;
 
-  // Provider returned no usage — estimate from text
-  const inputText = body ? extractInputTextFromBody(body) : "";
-  const outputText = extractOutputTextFromResponse(responseData);
-  return {
-    input_tokens: estimateTokens(inputText),
-    output_tokens: estimateTokens(outputText),
-  };
+  // Estimate input/output independently — some providers return only one of the two
+  if (usage.input_tokens === 0 && body) {
+    const inputText = extractInputTextFromBody(body);
+    if (inputText) usage.input_tokens = estimateTokens(inputText);
+  }
+  if (usage.output_tokens === 0) {
+    const outputText = extractOutputTextFromResponse(responseData);
+    if (outputText) usage.output_tokens = estimateTokens(outputText);
+  }
+
+  return usage;
 }
 
 // ---------------------------------------------------------------------------

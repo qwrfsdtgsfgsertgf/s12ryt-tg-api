@@ -127,14 +127,15 @@ def extract_usage_with_fallback(
     """Extract usage; if no usage data, estimate from request/response text."""
     usage = extract_usage(provider_type, response_data)
 
-    if usage["input_tokens"] == 0 and usage["output_tokens"] == 0:
+    # Estimate input/output independently — some providers return only one of the two
+    if usage["input_tokens"] == 0 and body:
+        input_text = extract_input_text_from_body(body)
+        if input_text:
+            usage["input_tokens"] = estimate_tokens(input_text)
+    if usage["output_tokens"] == 0:
         output_text = extract_output_text_from_response(response_data)
         if output_text:
             usage["output_tokens"] = estimate_tokens(output_text)
-        if body:
-            input_text = extract_input_text_from_body(body)
-            if input_text:
-                usage["input_tokens"] = estimate_tokens(input_text)
 
     return usage
 
