@@ -1,7 +1,9 @@
 /**
  * API Key authentication middleware for Express.
  *
- * Validates Bearer tokens with format "sk-s12ryt-..." against the database.
+ * Validates API keys with format "sk-s12ryt-..." against the database.
+ * Accepts OpenAI-compatible Authorization Bearer, Anthropic-compatible x-api-key,
+ * and Google-compatible x-goog-api-key / ?key= authentication.
  * Uses LRU cache to avoid DB queries on repeated requests.
  */
 
@@ -34,6 +36,38 @@ declare global {
 
 const PUBLIC_PATHS = new Set(["/", "/health", "/docs"]);
 
+function firstHeaderValue(value: string | string[] | undefined): string {
+  if (Array.isArray(value)) return value[0] ?? "";
+  return value ?? "";
+}
+
+function firstQueryValue(value: unknown): string {
+  if (Array.isArray(value)) return firstQueryValue(value[0]);
+  return typeof value === "string" ? value : "";
+}
+
+function extractApiToken(req: Request): { token?: string; error?: string } {
+  const authHeader = firstHeaderValue(req.headers.authorization).trim();
+  if (authHeader) {
+    const parts = authHeader.split(" ", 2);
+    if (parts.length !== 2 || parts[0].toLowerCase() !== "bearer") {
+      return { error: "Invalid Authorization header format" };
+    }
+    return { token: parts[1].trim() };
+  }
+
+  const anthropicApiKey = firstHeaderValue(req.headers["x-api-key"]).trim();
+  if (anthropicApiKey) return { token: anthropicApiKey };
+
+  const googleApiKey = firstHeaderValue(req.headers["x-goog-api-key"]).trim();
+  if (googleApiKey) return { token: googleApiKey };
+
+  const queryApiKey = firstQueryValue(req.query.key).trim();
+  if (queryApiKey) return { token: queryApiKey };
+
+  return { error: "Missing Authorization, x-api-key, x-goog-api-key, or key query" };
+}
+
 // ---------------------------------------------------------------------------
 // Middleware
 // ---------------------------------------------------------------------------
@@ -50,26 +84,15 @@ export function authMiddleware(req: Request, res: Response, next: NextFunction):
     return;
   }
 
-  const authHeader = req.headers.authorization ?? "";
-
-  if (!authHeader) {
+  const { token, error } = extractApiToken(req);
+  if (error) {
     res.status(401).json({
-      error: { message: "Missing Authorization header", type: "auth_error" },
+      error: { message: error, type: "auth_error" },
     });
     return;
   }
 
-  const parts = authHeader.split(" ", 2);
-  if (parts.length !== 2 || parts[0].toLowerCase() !== "bearer") {
-    res.status(401).json({
-      error: { message: "Invalid Authorization header format", type: "auth_error" },
-    });
-    return;
-  }
-
-  const token = parts[1].trim();
-
-  if (!token.startsWith(KEY_PREFIX)) {
+  if (!token?.startsWith(KEY_PREFIX)) {
     res.status(401).json({
       error: { message: "Invalid API key format", type: "auth_error" },
     });

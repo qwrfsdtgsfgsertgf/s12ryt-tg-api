@@ -306,7 +306,9 @@ describe("TestAuthMiddleware", () => {
   it("test_no_auth_header_returns_401", async () => {
     const res = await request(app).get("/v1/models");
     expect(res.status).toBe(401);
-    expect(res.body.error.message).toBe("Missing Authorization header");
+    expect(res.body.error.message).toBe(
+      "Missing Authorization, x-api-key, x-goog-api-key, or key query",
+    );
   });
 
   it("test_invalid_format_returns_401", async () => {
@@ -340,6 +342,43 @@ describe("TestAuthMiddleware", () => {
       .get("/v1/models")
       .set("Authorization", AUTH_HEADER);
     expect(res.status).toBe(200);
+  });
+
+  it("test_valid_x_api_key_header_returns_200", async () => {
+    const res = await request(app)
+      .get("/v1/models")
+      .set("x-api-key", VALID_KEY);
+    expect(res.status).toBe(200);
+  });
+
+  it("test_invalid_x_api_key_prefix_returns_401", async () => {
+    const res = await request(app)
+      .get("/v1/models")
+      .set("x-api-key", "sk-other-key");
+    expect(res.status).toBe(401);
+    expect(res.body.error.message).toBe("Invalid API key format");
+  });
+
+  it("test_valid_x_goog_api_key_header_returns_200", async () => {
+    const res = await request(app)
+      .get("/v1/models")
+      .set("x-goog-api-key", VALID_KEY);
+    expect(res.status).toBe(200);
+  });
+
+  it("test_valid_key_query_returns_200", async () => {
+    const res = await request(app)
+      .get("/v1/models")
+      .query({ key: VALID_KEY });
+    expect(res.status).toBe(200);
+  });
+
+  it("test_invalid_key_query_prefix_returns_401", async () => {
+    const res = await request(app)
+      .get("/v1/models")
+      .query({ key: "sk-other-key" });
+    expect(res.status).toBe(401);
+    expect(res.body.error.message).toBe("Invalid API key format");
   });
 
   it("test_inactive_user_key_returns_401", async () => {
@@ -688,6 +727,22 @@ describe("TestAnthropicMessagesValidation", () => {
     expect(res.body.content).toBeDefined();
     expect(Array.isArray(res.body.content)).toBe(true);
     expect(res.body.model).toBe("claude-3.5-sonnet");
+  });
+
+  it("test_anthropic_x_api_key_auth_success_non_streaming", async () => {
+    const res = await request(app)
+      .post("/v1/messages")
+      .set("x-api-key", VALID_KEY)
+      .send({
+        model: "claude-3.5-sonnet",
+        messages: [{ role: "user", content: "Hello" }],
+        max_tokens: 100,
+      });
+
+    expect(res.status).toBe(200);
+    expect(res.body.type).toBe("message");
+    expect(res.body.model).toBe("claude-3.5-sonnet");
+    expect(mockMessagesApi).toHaveBeenCalled();
   });
 });
 
