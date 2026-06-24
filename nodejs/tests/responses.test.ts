@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  convertMessagesToResponsesInput,
   convertResponsesToChatCompletion,
   streamResponsesApi,
   streamChatFromResponses,
@@ -45,6 +46,19 @@ function reasoningDeltas(chunks: Record<string, any>[]): string[] {
 }
 
 describe("Responses API conversion", () => {
+  it("joins multiple system messages into responses instructions", () => {
+    const converted = convertMessagesToResponsesInput([
+      { role: "system", content: "first instruction" },
+      { role: "system", content: "second instruction" },
+      { role: "user", content: "hello" },
+    ]);
+
+    expect(converted.instructions).toBe("first instruction\nsecond instruction");
+    expect(converted.inputItems).toEqual([
+      { type: "message", role: "user", content: "hello" },
+    ]);
+  });
+
   it("preserves summary_text reasoning in non-streaming conversion", () => {
     const result = convertResponsesToChatCompletion(
       {

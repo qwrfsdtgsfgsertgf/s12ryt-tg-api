@@ -769,7 +769,7 @@ export async function* streamResponsesApi(
 export function convertMessagesToResponsesInput(
   messages: ChatMessage[]
 ): { inputItems: Record<string, any>[]; instructions: string | null } {
-  let instructions: string | null = null;
+  const instructionParts: string[] = [];
   const inputItems: Record<string, any>[] = [];
 
   for (const msg of messages) {
@@ -777,7 +777,7 @@ export function convertMessagesToResponsesInput(
     const content = msg.content;
 
     if (role === "system") {
-      instructions = typeof content === "string" ? content : String(content);
+      instructionParts.push(typeof content === "string" ? content : String(content));
       continue;
     }
 
@@ -821,7 +821,10 @@ export function convertMessagesToResponsesInput(
     });
   }
 
-  return { inputItems, instructions };
+  return {
+    inputItems,
+    instructions: instructionParts.length > 0 ? instructionParts.join("\n") : null,
+  };
 }
 
 function convertChatContentToResponses(content: string | unknown[]): string | unknown[] {

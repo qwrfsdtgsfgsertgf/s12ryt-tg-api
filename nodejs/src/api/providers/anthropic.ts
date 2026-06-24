@@ -265,9 +265,20 @@ function toOpenAIResponse(
   const contentBlocks: Array<Record<string, any>> = anthropicResp.content ?? [];
   const textParts: string[] = [];
   const thinkingParts: string[] = [];
+  const toolCalls: Array<Record<string, any>> = [];
   for (const block of contentBlocks) {
     if (block.type === "text") textParts.push(block.text ?? "");
     else if (block.type === "thinking") thinkingParts.push(block.thinking ?? "");
+    else if (block.type === "tool_use") {
+      toolCalls.push({
+        id: block.id ?? `call_${uuidv4().replace(/-/g, "").slice(0, 24)}`,
+        type: "function",
+        function: {
+          name: block.name ?? "",
+          arguments: stringifyToolInput(block.input),
+        },
+      });
+    }
   }
   const text = textParts.join("");
   const reasoningContent = thinkingParts.length > 0 ? thinkingParts.join("") : undefined;
@@ -291,6 +302,7 @@ function toOpenAIResponse(
           role: "assistant",
           content: text,
           ...(reasoningContent ? { reasoning_content: reasoningContent } : {}),
+          ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
         },
         finish_reason: finishReason,
       },
@@ -303,11 +315,20 @@ function toOpenAIResponse(
   };
 }
 
+function stringifyToolInput(input: unknown): string {
+  try {
+    return JSON.stringify(input ?? {});
+  } catch {
+    return JSON.stringify({ value: String(input) });
+  }
+}
+
 function mapStopReason(reason: string): string {
   const mapping: Record<string, string> = {
     end_turn: "stop",
     max_tokens: "length",
     stop_sequence: "stop",
+    tool_use: "tool_calls",
   };
   return mapping[reason] ?? "stop";
 }
