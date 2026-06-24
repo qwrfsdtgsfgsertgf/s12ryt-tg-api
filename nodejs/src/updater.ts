@@ -18,6 +18,7 @@ import {
   mkdirSync,
   renameSync,
   createWriteStream,
+  statfsSync,
 } from "node:fs";
 import { join } from "node:path";
 import os from "node:os";
@@ -41,9 +42,12 @@ const GITHUB_API_BASE = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_R
 
 /** 需要原子交換的項目（這些會被 staging 版本替換） */
 const SWAP_ITEMS = [
-  "src", "dist", "web", "tests", "scripts",
+  "src", "dist", "web", "scripts",
   "node_modules", "package.json", "package-lock.json", "tsconfig.json",
 ] as const;
+
+/** tarball 中不需要部署到執行環境的項目 */
+const STAGING_SKIP_ITEMS = new Set(["data", ".env", "node_modules", ".git", "tests"]);
 
 /** 暫存目錄名稱（新版本在此下載、安裝、編譯） */
 const STAGING_DIR = ".staging";
@@ -53,6 +57,35 @@ const BACKUP_PREFIX = ".backup-";
 
 /** 最大保留備份數量 */
 const MAX_BACKUPS = 2;
+
+/** 更新前最低建議可用空間（Blue-Green 需要暫存新版本 + node_modules + dist + 備份） */
+const MIN_UPDATE_FREE_BYTES = 768 * 1024 * 1024;
+
+/** 更新前最低建議可用 inode 數，避免小檔案過多導致 ENOSPC */
+const MIN_UPDATE_FREE_INODES = 10_000;
+
+const BYTES_PER_MB = 1024 * 1024;
+
+export interface DiskSpaceInfo {
+  availableBytes: number;
+  freeInodes: number | null;
+}
+
+export interface DiskSpaceThresholds {
+  minFreeBytes: number;
+  minFreeInodes: number;
+}
+
+export interface DiskPreflightResult {
+  ok: boolean;
+  info: DiskSpaceInfo | null;
+  message: string | null;
+}
+
+const DEFAULT_UPDATE_DISK_THRESHOLDS: DiskSpaceThresholds = {
+  minFreeBytes: MIN_UPDATE_FREE_BYTES,
+  minFreeInodes: MIN_UPDATE_FREE_INODES,
+};
 
 // ========================
 // 低資源環境輔助函數
@@ -210,6 +243,85 @@ function parseVersionInfo(ref: string): VersionInfo {
     // 沒有 tag，正常情況
   }
   return { hash, date, message, tag };
+}
+
+function formatBytes(bytes: number): string {
+  return `${Math.max(0, bytes / BYTES_PER_MB).toFixed(0)} MB`;
+}
+
+function buildDiskCleanupHint(): string {
+  return "請在 Node.js 目錄清理更新暫存/備份與 npm 快取：rm -rf .staging .backup-* && npm cache clean --force；再用 df -h / df -i 檢查磁碟與 inode。不要刪除 data/ 或 .env。";
+}
+
+export function shouldStageItem(entry: string): boolean {
+  return !STAGING_SKIP_ITEMS.has(entry);
+}
+
+function buildDiskSpaceMessage(reason: string, info: DiskSpaceInfo | null): string {
+  const current = info
+    ? `目前可用空間 ${formatBytes(info.availableBytes)}，可用 inode ${info.freeInodes ?? "未知"}。`
+    : "目前無法讀取磁碟容量資訊。";
+  return `${reason}${current}${buildDiskCleanupHint()}`;
+}
+
+export function evaluateDiskSpace(
+  info: DiskSpaceInfo,
+  thresholds: DiskSpaceThresholds = DEFAULT_UPDATE_DISK_THRESHOLDS,
+): DiskPreflightResult {
+  if (info.availableBytes < thresholds.minFreeBytes) {
+    return {
+      ok: false,
+      info,
+      message: buildDiskSpaceMessage(
+        `更新前可用空間不足，至少需要 ${formatBytes(thresholds.minFreeBytes)}。`,
+        info,
+      ),
+    };
+  }
+
+  if (info.freeInodes !== null && info.freeInodes < thresholds.minFreeInodes) {
+    return {
+      ok: false,
+      info,
+      message: buildDiskSpaceMessage(
+        `更新前可用 inode 不足，至少需要 ${thresholds.minFreeInodes}。`,
+        info,
+      ),
+    };
+  }
+
+  return { ok: true, info, message: null };
+}
+
+export function getDiskSpaceInfo(path = process.cwd()): DiskSpaceInfo | null {
+  try {
+    const stat = statfsSync(path);
+    const availableBytes = Number(stat.bavail) * Number(stat.bsize);
+    const freeInodes = Number.isFinite(Number(stat.ffree)) ? Number(stat.ffree) : null;
+    return { availableBytes, freeInodes };
+  } catch {
+    return null;
+  }
+}
+
+export function checkUpdateDiskSpace(path = process.cwd()): DiskPreflightResult {
+  const info = getDiskSpaceInfo(path);
+  if (!info) return { ok: true, info: null, message: null };
+  return evaluateDiskSpace(info);
+}
+
+export function isNoSpaceError(err: any): boolean {
+  const text = [err?.code, err?.message, err?.stderr, err?.stdout]
+    .map((value) => String(value ?? "").toLowerCase())
+    .join("\n");
+  return text.includes("enospc") || text.includes("no space left on device");
+}
+
+function buildNoSpaceErrorMessage(info: DiskSpaceInfo | null): string {
+  return buildDiskSpaceMessage(
+    "磁碟空間或 inode 不足（ENOSPC）。Blue-Green 更新會同時保留目前版本、暫存新版本、node_modules、dist 與備份。",
+    info,
+  );
 }
 
 // ========================
@@ -485,10 +597,9 @@ async function downloadAndExtract(
   }
 
   // Step 5: 將需要的項目移動到 staging 根目錄（同檔案系統 = renameSync 原子操作）
-  // 跳過 data/、.env、node_modules/、.git（這些不從 tarball 覆蓋）
-  const skipItems = new Set(["data", ".env", "node_modules", ".git"]);
+  // 跳過 data/、.env、node_modules/、.git、tests（這些不從 tarball 覆蓋/部署）
   for (const entry of readdirSync(sourceDir)) {
-    if (skipItems.has(entry)) continue;
+    if (!shouldStageItem(entry)) continue;
     renameSync(join(sourceDir, entry), join(stagingDir, entry));
   }
 
@@ -564,9 +675,9 @@ function atomicSwap(stagingDir: string): string {
 }
 
 /**
- * 清理舊備份，只保留最新的 MAX_BACKUPS 個
+ * 清理舊備份，只保留最新的指定數量
  */
-function cleanOldBackups(): void {
+function cleanOldBackups(maxBackups = MAX_BACKUPS): void {
   const cwd = process.cwd();
   try {
     const entries = readdirSync(cwd);
@@ -579,11 +690,25 @@ function cleanOldBackups(): void {
       })
       .sort((a, b) => b.timestamp - a.timestamp);
 
-    for (let i = MAX_BACKUPS; i < backups.length; i++) {
+    for (let i = maxBackups; i < backups.length; i++) {
       console.log(`[updater] 清理舊備份：${backups[i].name}`);
       rmSync(join(cwd, backups[i].name), { recursive: true, force: true });
     }
   } catch { /* ignore */ }
+}
+
+function prepareUpdateWorkspace(cwd: string, stagingPath: string): void {
+  try {
+    rmSync(stagingPath, { recursive: true, force: true });
+  } catch { /* ignore */ }
+
+  // 低容量環境先只保留最新一份備份，避免舊備份卡住更新暫存空間。
+  cleanOldBackups(1);
+
+  const diskCheck = checkUpdateDiskSpace(cwd);
+  if (!diskCheck.ok) {
+    throw new Error(diskCheck.message ?? buildNoSpaceErrorMessage(diskCheck.info));
+  }
 }
 
 /** 偵測錯誤是否為 OOM（記憶體不足被系統終止） */
@@ -739,6 +864,23 @@ function runNpmInstall(cwd: string, timeoutMs = 180_000 * TIMEOUT_MULT): void {
   );
 }
 
+function pruneDevDependencies(cwd: string, timeoutMs = 120_000 * TIMEOUT_MULT): void {
+  if (!existsSync(join(cwd, "node_modules"))) return;
+
+  try {
+    console.log("[updater] npm prune --omit=dev（移除 staging devDependencies）");
+    execFileSync("npm", ["prune", "--omit=dev", "--no-audit", "--no-fund"], {
+      cwd,
+      timeout: timeoutMs,
+      stdio: "inherit",
+      env: buildNpmEnv(),
+    });
+  } catch (err: any) {
+    if (isNoSpaceError(err)) throw err;
+    console.warn(`[updater] npm prune --omit=dev 失敗，保留完整 node_modules：${err.message}`);
+  }
+}
+
 /** 進度回調型別 — 用於向調用方報告更新進度 */
 export type ProgressCallback = (step: string) => void;
 
@@ -755,6 +897,10 @@ export async function performBlueGreenUpdate(
   const stagingPath = join(cwd, STAGING_DIR);
 
   try {
+    // Step 0: 清理舊暫存/過舊備份並檢查磁碟空間
+    onProgress?.("🧹 正在清理舊暫存並檢查磁碟空間...");
+    prepareUpdateWorkspace(cwd, stagingPath);
+
     // Step 1: 下載並解壓
     onProgress?.("📥 正在下載新版本...");
     await downloadAndExtract(tarballUrl, stagingPath);
@@ -792,7 +938,11 @@ export async function performBlueGreenUpdate(
       }
     }
 
-    // Step 5: 驗證 — production 必須有 dist/index.js；tsx 模式必須有 src/index.ts
+    // Step 5: build 完成後移除 staging devDependencies，降低部署與備份體積
+    onProgress?.("🧹 正在移除暫存 devDependencies...");
+    pruneDevDependencies(stagingPath);
+
+    // Step 6: 驗證 — production 必須有 dist/index.js；tsx 模式必須有 src/index.ts
     const hasDist = existsSync(join(stagingPath, "dist", "index.js"));
     const hasSrc = existsSync(join(stagingPath, "src", "index.ts"));
     const hasNodeModules = existsSync(join(stagingPath, "node_modules"));
@@ -804,12 +954,12 @@ export async function performBlueGreenUpdate(
     }
     console.log("[updater] 驗證通過");
 
-    // Step 6: 原子交換
+    // Step 7: 原子交換
     onProgress?.("🔄 正在切換版本...");
     const backupName = atomicSwap(stagingPath);
     console.log(`[updater] 交換完成，備份：${backupName}`);
 
-    // Step 7: 清理舊備份
+    // Step 8: 清理舊備份
     cleanOldBackups();
 
     return {
@@ -822,9 +972,12 @@ export async function performBlueGreenUpdate(
     try {
       rmSync(stagingPath, { recursive: true, force: true });
     } catch { /* ignore */ }
+    const message = isNoSpaceError(err)
+      ? buildNoSpaceErrorMessage(getDiskSpaceInfo(cwd))
+      : err.message;
     return {
       success: false,
-      message: `Blue-Green 更新失敗：${err.message}`,
+      message: `Blue-Green 更新失敗：${message}`,
     };
   }
 }

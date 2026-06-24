@@ -39,6 +39,9 @@ import {
   getBackupList,
   performRollback,
   fetchAndCheckUpdate,
+  evaluateDiskSpace,
+  isNoSpaceError,
+  shouldStageItem,
 } from "../src/updater.js";
 
 // ===========================================================================
@@ -232,6 +235,82 @@ describe("getBackupList", () => {
     const backups = getBackupList();
     expect(backups).toHaveLength(1);
     expect(backups[0].timestamp).toBe(0); // NaN → 0 fallback
+  });
+});
+
+// ===========================================================================
+// Disk space preflight
+// ===========================================================================
+
+describe("evaluateDiskSpace", () => {
+  const thresholds = {
+    minFreeBytes: 768 * 1024 * 1024,
+    minFreeInodes: 10_000,
+  };
+
+  it("passes when free bytes and inodes are enough", () => {
+    const result = evaluateDiskSpace(
+      { availableBytes: 1024 * 1024 * 1024, freeInodes: 20_000 },
+      thresholds,
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.message).toBeNull();
+  });
+
+  it("fails with cleanup hint when free bytes are low", () => {
+    const result = evaluateDiskSpace(
+      { availableBytes: 128 * 1024 * 1024, freeInodes: 20_000 },
+      thresholds,
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain("可用空間不足");
+    expect(result.message).toContain("rm -rf .staging .backup-*");
+    expect(result.message).toContain("npm cache clean --force");
+  });
+
+  it("fails when free inodes are low", () => {
+    const result = evaluateDiskSpace(
+      { availableBytes: 1024 * 1024 * 1024, freeInodes: 100 },
+      thresholds,
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain("inode 不足");
+    expect(result.message).toContain("df -h / df -i");
+  });
+});
+
+describe("isNoSpaceError", () => {
+  it("detects ENOSPC by error code or message", () => {
+    expect(isNoSpaceError(Object.assign(new Error("write failed"), { code: "ENOSPC" }))).toBe(true);
+    expect(isNoSpaceError(new Error("ENOSPC: no space left on device, write"))).toBe(true);
+  });
+
+  it("detects ENOSPC from child process stderr", () => {
+    expect(isNoSpaceError({ stderr: "npm ERR! no space left on device" })).toBe(true);
+  });
+
+  it("does not classify unrelated errors as disk space errors", () => {
+    expect(isNoSpaceError(new Error("network timeout"))).toBe(false);
+  });
+});
+
+describe("shouldStageItem", () => {
+  it("skips runtime-local or non-production items", () => {
+    expect(shouldStageItem("data")).toBe(false);
+    expect(shouldStageItem(".env")).toBe(false);
+    expect(shouldStageItem("node_modules")).toBe(false);
+    expect(shouldStageItem(".git")).toBe(false);
+    expect(shouldStageItem("tests")).toBe(false);
+  });
+
+  it("keeps production update items", () => {
+    expect(shouldStageItem("src")).toBe(true);
+    expect(shouldStageItem("dist")).toBe(true);
+    expect(shouldStageItem("web")).toBe(true);
+    expect(shouldStageItem("package.json")).toBe(true);
   });
 });
 
