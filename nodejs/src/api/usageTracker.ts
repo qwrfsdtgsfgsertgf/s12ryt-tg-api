@@ -5,6 +5,7 @@
  * Usage recording is non-blocking — enqueues to a write queue for batched DB writes.
  */
 
+import { encode } from "gpt-tokenizer";
 import { recordUsage as dbRecordUsage } from "../db/database.js";
 import { recordTokenUsage } from "./rateLimiter.js";
 
@@ -15,6 +16,12 @@ import { recordTokenUsage } from "./rateLimiter.js";
 export interface Usage {
   input_tokens: number;
   output_tokens: number;
+}
+
+/** Minimal provider config for remote token-counting API calls. */
+export interface ProviderConfig {
+  baseUrl?: string;
+  apiKey: string;
 }
 
 export interface Cost {
@@ -61,26 +68,40 @@ export function extractUsage(
 }
 
 /**
- * Extract usage from a provider response, falling back to text-based estimation
+ * Extract usage from a provider response, falling back to accurate token counting
  * when the provider did not return any usage data (input_tokens and output_tokens both 0).
  *
- * @param body  The original request body (used to extract input text for estimation).
+ * Accuracy depends on providerType:
+ * - OpenAI (openai_chat / openai_response): local BPE tokenizer (gpt-tokenizer)
+ * - Anthropic: POST /v1/messages/count_tokens API (requires providerConfig)
+ * - Google: POST :countTokens API (requires providerConfig)
+ * - Any API failure → falls back to CJK-aware heuristic (estimateTokens)
+ *
+ * @param body             The original request body (used to extract input text).
+ * @param providerConfig   Provider connection config (baseUrl, apiKey) for remote counting.
+ * @param modelName        Upstream model name (for selecting the correct tokenizer encoding).
  */
-export function extractUsageWithFallback(
+export async function extractUsageWithFallback(
   providerType: string,
   responseData: Record<string, any>,
   body?: Record<string, any>,
-): Usage {
+  providerConfig?: ProviderConfig,
+  modelName?: string,
+): Promise<Usage> {
   const usage = extractUsage(providerType, responseData);
 
-  // Estimate input/output independently — some providers return only one of the two
+  // Count input/output independently — some providers return only one of the two
   if (usage.input_tokens === 0 && body) {
     const inputText = extractInputTextFromBody(body);
-    if (inputText) usage.input_tokens = estimateTokens(inputText);
+    if (inputText) {
+      usage.input_tokens = await countTokensAccurate(providerType, inputText, providerConfig, modelName);
+    }
   }
   if (usage.output_tokens === 0) {
     const outputText = extractOutputTextFromResponse(responseData);
-    if (outputText) usage.output_tokens = estimateTokens(outputText);
+    if (outputText) {
+      usage.output_tokens = await countTokensAccurate(providerType, outputText, providerConfig, modelName);
+    }
   }
 
   return usage;
@@ -118,6 +139,143 @@ export function estimateTokens(text: string | null | undefined): number {
     }
   }
   return Math.ceil(cjk * 1.2 + other / 4);
+}
+
+// ---------------------------------------------------------------------------
+// Accurate token counting (provider-specific)
+// ---------------------------------------------------------------------------
+
+/** Cache for cl100k_base encoding (lazy loaded on first use). */
+let _cl100kEncode: ((text: string) => number[]) | null = null;
+
+/**
+ * Map an OpenAI model name to its BPE encoding.
+ * - o200k_base: gpt-4o, o1, o3, o4, gpt-4.1, gpt-4.5, gpt-5 and newer
+ * - cl100k_base: gpt-4 (non-4o), gpt-3.5 and older
+ */
+function getOpenAIEncoding(model: string): "o200k_base" | "cl100k_base" {
+  const m = model.toLowerCase();
+  if (
+    m.startsWith("gpt-4o") ||
+    m.startsWith("gpt-4.1") ||
+    m.startsWith("gpt-4.5") ||
+    m.startsWith("gpt-5") ||
+    m.startsWith("o1") ||
+    m.startsWith("o3") ||
+    m.startsWith("o4")
+  ) {
+    return "o200k_base";
+  }
+  if (m.startsWith("gpt-4") || m.startsWith("gpt-3.5")) {
+    return "cl100k_base";
+  }
+  // Default to o200k_base for unknown modern models
+  return "o200k_base";
+}
+
+/**
+ * Count tokens using OpenAI's BPE tokenizer (local, zero network).
+ * Uses gpt-tokenizer with the model-appropriate encoding.
+ */
+async function countTokensOpenAI(text: string, model: string): Promise<number> {
+  const encoding = getOpenAIEncoding(model);
+  if (encoding === "o200k_base") {
+    // Default import uses o200k_base
+    return encode(text).length;
+  }
+  // Lazy-load cl100k_base encoding (only needed for gpt-4 / gpt-3.5)
+  if (!_cl100kEncode) {
+    const mod = await import("gpt-tokenizer/encoding/cl100k_base");
+    _cl100kEncode = mod.encode;
+  }
+  return _cl100kEncode(text).length;
+}
+
+/**
+ * Count tokens via Anthropic's count_tokens API.
+ * POST {baseUrl}/v1/messages/count_tokens
+ */
+async function countTokensAnthropic(
+  text: string,
+  model: string,
+  config: ProviderConfig,
+): Promise<number> {
+  const baseUrl = (config.baseUrl || "https://api.anthropic.com").replace(/\/+$/, "");
+  const resp = await fetch(`${baseUrl}/v1/messages/count_tokens`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": config.apiKey,
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify({
+      model,
+      messages: [{ role: "user", content: text }],
+      max_tokens: 1,
+    }),
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!resp.ok) throw new Error(`Anthropic count_tokens HTTP ${resp.status}`);
+  const data = (await resp.json()) as { input_tokens: number };
+  return data.input_tokens;
+}
+
+/**
+ * Count tokens via Google's countTokens API.
+ * POST {baseUrl}/v1beta/models/{model}:countTokens?key={apiKey}
+ */
+async function countTokensGoogle(
+  text: string,
+  model: string,
+  config: ProviderConfig,
+): Promise<number> {
+  const baseUrl = (config.baseUrl || "https://generativelanguage.googleapis.com").replace(/\/+$/, "");
+  const resp = await fetch(
+    `${baseUrl}/v1beta/models/${model}:countTokens?key=${config.apiKey}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ role: "user", parts: [{ text }] }],
+      }),
+      signal: AbortSignal.timeout(10_000),
+    },
+  );
+  if (!resp.ok) throw new Error(`Google countTokens HTTP ${resp.status}`);
+  const data = (await resp.json()) as { totalTokens: number };
+  return data.totalTokens;
+}
+
+/**
+ * Accurately count tokens using the provider-appropriate method.
+ *
+ * - OpenAI: local BPE tokenizer (gpt-tokenizer) — zero network
+ * - Anthropic: POST /v1/messages/count_tokens API
+ * - Google: POST :countTokens API
+ *
+ * Falls back to CJK-aware heuristic (estimateTokens) on any error or
+ * when provider config is missing.
+ */
+export async function countTokensAccurate(
+  providerType: string,
+  text: string,
+  config?: ProviderConfig,
+  modelName?: string,
+): Promise<number> {
+  try {
+    if (providerType === "openai_chat" || providerType === "openai_response") {
+      if (modelName) return await countTokensOpenAI(text, modelName);
+    }
+    if (providerType === "anthropic" && config?.apiKey && modelName) {
+      return await countTokensAnthropic(text, modelName, config);
+    }
+    if (providerType === "google" && config?.apiKey && modelName) {
+      return await countTokensGoogle(text, modelName, config);
+    }
+  } catch (err) {
+    console.warn(`[token-count] Accurate counting failed, using heuristic: ${err}`);
+  }
+  return estimateTokens(text);
 }
 
 /**
