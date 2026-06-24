@@ -18,6 +18,7 @@
 ### 計費與用量
 - **每模型獨立定價** — 自動從 [models.dev](https://models.dev) 獲取各模型定價（USD / 1M tokens），支援 per-model 計費
 - **Token 用量追蹤** — 自動記錄每個 API Key 的輸入/輸出 Token 數與費用
+- **精確 Token 計數** — 當供應商不回傳 usage 數據時，自動使用精確方法計數：OpenAI 用 tiktoken / gpt-tokenizer（BPE），Anthropic 用 `count_tokens` API，Google 用 `:countTokens` API；API 呼叫失敗或超時（10s）則回退到 CJK/Latin 啟發式估算，確保計費不漏記
 
 ### 高可用性
 - **多金鑰負載均衡** — 每個供應商可設定多個 API Key（逗號分隔），支援 3 種選擇策略：`failover`（預設，首鍵優先，失敗才切）、`round_robin`（輪詢）、`random`（隨機），搭配 Circuit Breaker 故障轉移（連續失敗 ≥3 次 → 60 秒冷卻排除）
@@ -46,7 +47,7 @@
 
 ### 工程
 - **雙語言實作** — Python (FastAPI + python-telegram-bot) 與 Node.js (Express + grammY)
-- **完整測試** — 304 個單元 + 整合測試全部通過
+- **完整測試** — 530 個單元 + 整合測試全部通過（Node.js 316 + Python 214）
 - **CI/CD** — GitHub Actions 自動發布 Release（push to main 更新 `latest`，tag v*.*.* 建立 stable）
 - **低資源容器優化**（僅 Node.js）— 自動偵測可用記憶體，動態調整 V8 heap size（50% 記憶體，[128, 512]MB 區間）、npm 並發連接數（maxsockets=2）和操作超時倍率（≤512MB→3x、≤1024MB→2x），適配 256MB 等低配 VPS / 容器
 
@@ -195,6 +196,22 @@ npm run dev
 
 ```
 Authorization: Bearer sk-s12ryt-{your-key}
+```
+
+Anthropic 相容用戶端呼叫 `/v1/messages` 時，也可使用 Anthropic SDK 常見的 `x-api-key` 標頭：
+
+```
+x-api-key: sk-s12ryt-{your-key}
+```
+
+Google Gemini 相容用戶端也可使用 Google 常見的 `x-goog-api-key` 標頭或 `?key=` 查詢參數；這裡同樣填入本服務發出的 `sk-s12ryt-...` API Key：
+
+```
+x-goog-api-key: sk-s12ryt-{your-key}
+```
+
+```
+?key=sk-s12ryt-{your-key}
 ```
 
 ### 請求範例
@@ -386,7 +403,7 @@ s12ryt-tg-api/
 │   ├── db/                          # 資料庫
 │   │   ├── database.py              # SQLite 操作
 │   │   └── models.py                # 資料模型
-│   └── tests/                       # 測試（219 tests）
+│   └── tests/                       # 測試（214 tests）
 │
 ├── nodejs/                          # Node.js 版本
 │   ├── src/
