@@ -16,7 +16,7 @@ import * as openaiProvider from "./providers/openai.js";
 import * as openaiResponseProvider from "./providers/openaiResponse.js";
 import * as anthropicProvider from "./providers/anthropic.js";
 import * as googleProvider from "./providers/google.js";
-import { extractUsage, extractUsageWithFallback, calculateCost, recordUsage, estimateTokens, extractInputTextFromBody } from "./usageTracker.js";
+import { extractUsage, extractUsageWithFallback, calculateCost, recordUsage, countTokensAccurate, extractInputTextFromBody, type ProviderConfig } from "./usageTracker.js";
 import {
   convertResponsesInputToMessages,
   convertChatCompletionToResponses,
@@ -381,6 +381,9 @@ async function forwardStreamAndExtractUsage(
   stream: AsyncIterable<Uint8Array>,
   write: (chunk: Uint8Array) => void,
   inputText?: string,
+  providerType?: string,
+  providerConfig?: ProviderConfig,
+  modelName?: string,
 ): Promise<{ input_tokens: number; output_tokens: number }> {
   const decoder = new TextDecoder();
   let inputTokens = 0;
@@ -407,9 +410,9 @@ async function forwardStreamAndExtractUsage(
     extractUsageFromSSE(line.trim());
   }
 
-  // Fallback: estimate tokens from accumulated text when provider returns no usage
-  if (!outputTokens && outputText) outputTokens = estimateTokens(outputText);
-  if (!inputTokens && inputText) inputTokens = estimateTokens(inputText);
+  // Fallback: count tokens accurately when provider returns no usage
+  if (!outputTokens && outputText) outputTokens = await countTokensAccurate(providerType ?? "", outputText, providerConfig, modelName);
+  if (!inputTokens && inputText) inputTokens = await countTokensAccurate(providerType ?? "", inputText, providerConfig, modelName);
 
   return { input_tokens: inputTokens, output_tokens: outputTokens };
 
@@ -461,6 +464,9 @@ async function extractUsageFromProviderStream(
   providerStream: AsyncIterable<Uint8Array>,
   transformAndWrite: (providerStream: AsyncIterable<Uint8Array>) => Promise<void>,
   inputText?: string,
+  providerType?: string,
+  providerConfig?: ProviderConfig,
+  modelName?: string,
 ): Promise<{ input_tokens: number; output_tokens: number }> {
   const decoder = new TextDecoder();
   let inputTokens = 0;
@@ -575,9 +581,9 @@ async function extractUsageFromProviderStream(
     flushDecoder();
   }
 
-  // Fallback: estimate tokens from accumulated text when provider returned no usage
-  if (!outputTokens && outputText) outputTokens = estimateTokens(outputText);
-  if (!inputTokens && inputText) inputTokens = estimateTokens(inputText);
+  // Fallback: count tokens accurately when provider returns no usage
+  if (!outputTokens && outputText) outputTokens = await countTokensAccurate(providerType ?? "", outputText, providerConfig, modelName);
+  if (!inputTokens && inputText) inputTokens = await countTokensAccurate(providerType ?? "", inputText, providerConfig, modelName);
 
   return { input_tokens: inputTokens, output_tokens: outputTokens };
 }
@@ -694,6 +700,7 @@ app.post(
             result as AsyncIterable<Uint8Array>,
             (chunk) => { chunkCount++; writeAndFlush(res, chunk); },
             extractInputTextFromBody(body),
+            providerType, providerConfig, actualModel,
           );
 
           // Record streaming usage
@@ -735,7 +742,7 @@ app.post(
       // Non-streaming: extract usage and record
       if (result && typeof result === "object") {
         try {
-          const usage = extractUsageWithFallback(providerType, result, body);
+          const usage = await extractUsageWithFallback(providerType, result, body, providerConfig, actualModel);
           await recordUsageAndCost(req.auth, providerId, actualModel,
             usage.input_tokens, usage.output_tokens, inputPrice, outputPrice, isCodingMode);
           addApiLog({
@@ -846,6 +853,7 @@ app.post(
                   result as AsyncIterable<Uint8Array>,
                   (chunk) => { writeAndFlush(res, chunk); },
                   extractInputTextFromBody(body),
+                  "openai_response", _resolved.config, modelName,
                 );
                 await recordUsageAndCost(
                   req.auth, String(_resolved.providerId), modelName,
@@ -886,7 +894,7 @@ app.post(
             }
 
             if (result && typeof result === "object") {
-              const _usage = extractUsageWithFallback("openai_response", result as Record<string, any>, body);
+              const _usage = await extractUsageWithFallback("openai_response", result as Record<string, any>, body, _resolved.config, modelName);
               const _inT = _usage.input_tokens;
               const _outT = _usage.output_tokens;
               await recordUsageAndCost(
@@ -1041,6 +1049,7 @@ app.post(
               }
             },
             extractInputTextFromBody(body),
+            providerType, providerConfig, actualModel,
           );
 
           // Record streaming usage
@@ -1090,7 +1099,7 @@ app.post(
 
         // Extract usage and record
         try {
-          const usage = extractUsageWithFallback(providerType, result2, body);
+          const usage = await extractUsageWithFallback(providerType, result2, body, providerConfig, actualModel);
           await recordUsageAndCost(req.auth, String(providerId), actualModel, usage.input_tokens, usage.output_tokens, inputPrice, outputPrice, isCodingModeResp);
           addApiLog({
             timestamp: new Date().toISOString(),
@@ -1205,6 +1214,7 @@ app.post(
                   result as AsyncIterable<Uint8Array>,
                   (chunk) => { writeAndFlush(res, chunk); },
                   extractInputTextFromBody(body),
+                  "anthropic", _resolved.config, modelName,
                 );
                 await recordUsageAndCost(
                   req.auth, String(_resolved.providerId), modelName,
@@ -1245,7 +1255,7 @@ app.post(
             }
 
             if (result && typeof result === "object") {
-              const _usage = extractUsageWithFallback("anthropic", result as Record<string, any>, body);
+              const _usage = await extractUsageWithFallback("anthropic", result as Record<string, any>, body, _resolved.config, modelName);
               const _inT = _usage.input_tokens;
               const _outT = _usage.output_tokens;
               await recordUsageAndCost(
@@ -1360,6 +1370,7 @@ app.post(
               }
             },
             extractInputTextFromBody(body),
+            providerType, providerConfig, actualModel,
           );
 
           await recordUsageAndCost(req.auth, String(providerId), actualModel, streamUsage.input_tokens, streamUsage.output_tokens, inputPrice, outputPrice, isCodingModeMsg);
@@ -1401,7 +1412,7 @@ app.post(
         const anthropicResult = convertChatCompletionToAnthropic(result, actualModel);
 
         try {
-          const usage = extractUsageWithFallback(providerType, result, body);
+          const usage = await extractUsageWithFallback(providerType, result, body, providerConfig, actualModel);
           await recordUsageAndCost(req.auth, String(providerId), actualModel, usage.input_tokens, usage.output_tokens, inputPrice, outputPrice, isCodingModeMsg);
           addApiLog({
             timestamp: new Date().toISOString(),
