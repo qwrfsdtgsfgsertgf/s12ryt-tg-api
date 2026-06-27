@@ -2,6 +2,19 @@
 
 所有版本變更記錄。本檔案由 `npm run release` 自動維護。
 
+## [1.8.2] - 2026-06-28
+
+### ✨ Features
+- expose memory limit config (1a1a072)
+- add shared memory limit parsing (5580436)
+
+### 🐛 Bug Fixes
+- honor memory env in launcher (460d7df)
+- apply memory limit to npm scripts (fdd1b6f)
+
+### 📝 Documentation
+- document memory env coverage (0afc907)
+
 ## [1.8.1] - 2026-06-27
 
 - 維護更新
