@@ -187,6 +187,7 @@ npm run dev
 | `API_PORT` | ❌ | `8000` | API 代理伺服器監聽埠 |
 | `DATABASE_PATH` | ❌ | `./data/bot.db` | SQLite 資料庫檔案路徑 |
 | `DEFAULT_API_URL` | ❌ | `http://localhost:8000` | 顯示給用戶的預設 API 端點 URL |
+| `memory` | ❌ | 自動偵測 | Node.js V8 heap 上限（MB），支援小數點後一位；例如 `256.5`。所有 Node.js npm scripts、`start.js` 與內置更新流程都會套用（僅 Node.js） |
 | `CLOUDFLARE_TUNNEL` | ❌ | — | Cloudflare 隧道模式：`quick`（臨時 trycloudflare URL）或 `token`（命名隧道，需搭配 `CLOUDFLARE_TOKEN`）（僅 Node.js） |
 | `CLOUDFLARE_TOKEN` | ❌ | — | Cloudflare 命名隧道 Token（`CLOUDFLARE_TUNNEL=token` 時必填）（僅 Node.js） |
 | `GITHUB_MIRROR` | ❌ | — | GitHub 代理鏡像 URL（用於 `git clone` / 下載 Release 時走鏡像，應對網路限制）（僅 Node.js） |
