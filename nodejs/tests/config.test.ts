@@ -23,6 +23,8 @@ describe("Config", () => {
     delete process.env.API_PORT;
     delete process.env.DATABASE_PATH;
     delete process.env.DEFAULT_API_URL;
+    delete process.env.memory;
+    delete process.env.MAX_OLD_SPACE;
   });
 
   afterEach(() => {
@@ -58,6 +60,7 @@ describe("Config", () => {
     expect(config.API_PORT).toBe(8000);
     expect(config.DATABASE_PATH).toBe("./data/bot.db");
     expect(config.DEFAULT_API_URL).toBe("http://localhost:8000");
+    expect(config.MEMORY_LIMIT_MB).toBeNull();
   });
 
   it("should use custom API_PORT from env", async () => {
@@ -98,5 +101,36 @@ describe("Config", () => {
 
     expect(config.ADMIN_ID).toBe(42);
     expect(typeof config.ADMIN_ID).toBe("number");
+  });
+
+  it("should expose memory limit from lowercase memory env", async () => {
+    process.env.BOT_TOKEN = "tok";
+    process.env.ADMIN_ID = "1";
+    process.env.memory = "256.5";
+
+    const { config } = await import("../src/config.js");
+
+    expect(config.MEMORY_LIMIT_MB).toBe(256);
+  });
+
+  it("should fall back to MAX_OLD_SPACE when memory is invalid", async () => {
+    process.env.BOT_TOKEN = "tok";
+    process.env.ADMIN_ID = "1";
+    process.env.memory = "128.55";
+    process.env.MAX_OLD_SPACE = "384";
+
+    const { config } = await import("../src/config.js");
+
+    expect(config.MEMORY_LIMIT_MB).toBe(384);
+  });
+
+  it("should return null for invalid memory values without fallback", async () => {
+    process.env.BOT_TOKEN = "tok";
+    process.env.ADMIN_ID = "1";
+    process.env.memory = "128mb";
+
+    const { config } = await import("../src/config.js");
+
+    expect(config.MEMORY_LIMIT_MB).toBeNull();
   });
 });
