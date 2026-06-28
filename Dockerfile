@@ -26,7 +26,7 @@ COPY --from=build /app/nodejs/dist ./dist
 COPY nodejs/scripts ./scripts
 COPY nodejs/web ./web
 COPY nodejs/start.js ./start.js
-COPY nodejs/VERSION ./VERSION
+COPY VERSION ./VERSION
 
 RUN mkdir -p data && chown -R node:node /app
 
