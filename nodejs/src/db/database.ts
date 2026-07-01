@@ -54,7 +54,9 @@ export async function initDbAsync(databasePath: string): Promise<SqlJsDatabase> 
     db = new SQL.Database();
   }
 
+  db.run("PRAGMA foreign_keys = ON");
   createTables(db);
+  db.run("PRAGMA foreign_keys = ON");
   rebuildProviderCache();
   startUsageFlushTimer();
 
@@ -269,6 +271,13 @@ function createTables(db: SqlJsDatabase): void {
     db.run(`INSERT INTO user_groups (name, display_name, is_default) VALUES ('default', 'Default (unlimited)', 1)`);
   }
 
+  db.run(`
+    UPDATE users
+    SET group_id = (SELECT id FROM user_groups WHERE is_default = 1 LIMIT 1)
+    WHERE group_id IS NOT NULL
+      AND group_id NOT IN (SELECT id FROM user_groups)
+  `);
+
   // Migration: openai → openai_chat (split api_type)
   const migrationRow = db.exec(
     "SELECT value FROM settings WHERE key = 'migration_openai_split'"
@@ -358,6 +367,11 @@ function createTables(db: SqlJsDatabase): void {
       UNIQUE(provider_id, original_model)
     );
   `);
+
+  // Clean up historical orphan provider children. These rows are unreachable
+  // after their provider is deleted and can make future backups invalid or noisy.
+  db.run(`DELETE FROM model_prices WHERE provider_id NOT IN (SELECT id FROM providers)`);
+  db.run(`DELETE FROM model_mappings WHERE provider_id NOT IN (SELECT id FROM providers)`);
 
   // -------------------------------------------------------------------------
   // Performance indexes — speeds up quota queries (hottest path: per-request)
@@ -591,6 +605,9 @@ export function getModelMappings(): ModelMapping[] {
 /** Insert or update a model mapping. */
 export function upsertModelMapping(providerId: number, originalModel: string, displayName: string): void {
   if (!db) return;
+  if (!getProviderById(providerId)) {
+    throw new Error("Provider not found");
+  }
   db.run(
     `INSERT INTO model_mappings (provider_id, original_model, display_name)
      VALUES (?, ?, ?)
@@ -616,6 +633,11 @@ export function deleteModelMapping(providerId: number, originalModel: string): v
 /** Replace all model mappings (batch operation). */
 export function replaceModelMappings(mappings: Array<{ provider_id: number; original_model: string; display_name: string }>): void {
   if (!db) return;
+  const providerIds = new Set(getProviders(false).map((p) => p.id));
+  const invalid = mappings.find((m) => !providerIds.has(m.provider_id));
+  if (invalid) {
+    throw new Error(`Provider not found for model mapping: ${invalid.provider_id}`);
+  }
   db.run("DELETE FROM model_mappings");
   for (const m of mappings) {
     db.run(
@@ -885,7 +907,11 @@ export function updateProvider(
 }
 
 export function deleteProvider(ids: number[]): void {
+  if (ids.length === 0) return;
+
   const placeholders = ids.map(() => "?").join(",");
+  runSql(`DELETE FROM model_mappings WHERE provider_id IN (${placeholders})`, ids);
+  runSql(`DELETE FROM model_prices WHERE provider_id IN (${placeholders})`, ids);
   runSql(`DELETE FROM providers WHERE id IN (${placeholders})`, ids);
   // Clean up in-memory keySelector state for deleted providers (prevents memory leak)
   for (const id of ids) clearProviderKeyState(id);
@@ -1842,6 +1868,9 @@ export function getUserWithLimits(id: number): UserWithLimits | undefined {
 }
 
 export function setUserGroup(userId: number, groupId: number): void {
+  if (!getUserGroupById(groupId)) {
+    throw new Error("User group not found");
+  }
   runSql("UPDATE users SET group_id = ? WHERE id = ?", [groupId, userId]);
   invalidateEffectiveLimitsCache(userId);
 }

@@ -16,6 +16,7 @@ import fs from "fs";
 import {
   initDbAsync,
   closeDb,
+  getDb,
   saveDb,
   // Provider CRUD
   addProvider,
@@ -23,6 +24,11 @@ import {
   getProviderById,
   updateProvider,
   deleteProvider,
+  batchUpsertModelPrices,
+  getModelPricesByProvider,
+  getModelMappings,
+  upsertModelMapping,
+  replaceModelMappings,
   // User CRUD
   addUser,
   getUsers,
@@ -256,6 +262,103 @@ describe("Provider CRUD", () => {
     const remaining = getProviders();
     expect(remaining).toHaveLength(1);
     expect(remaining[0].name).toBe("Anthropic");
+  });
+
+  it("should enable foreign key enforcement after initialization", () => {
+    const result = getDb().exec("PRAGMA foreign_keys");
+    expect(result[0].values[0][0]).toBe(1);
+  });
+
+  it("should delete model prices when deleting a provider", () => {
+    addProvider({
+      name: "OpenAI",
+      api_type: "openai_chat",
+      base_url: "https://api.openai.com/v1",
+      api_key: "sk-key",
+      models: "gpt-4o",
+      input_price: null,
+      output_price: null,
+    });
+    batchUpsertModelPrices(1, [
+      { model: "gpt-4o", input_price: 1.25, output_price: 5 },
+    ]);
+
+    expect(getModelPricesByProvider(1)).toHaveLength(1);
+
+    getDb().run("PRAGMA foreign_keys = OFF");
+    try {
+      deleteProvider([1]);
+    } finally {
+      getDb().run("PRAGMA foreign_keys = ON");
+    }
+
+    expect(getProviders()).toHaveLength(0);
+    expect(getModelPricesByProvider(1)).toHaveLength(0);
+  });
+
+  it("should delete model mappings when deleting a provider", () => {
+    addProvider({
+      name: "OpenAI",
+      api_type: "openai_chat",
+      base_url: "https://api.openai.com/v1",
+      api_key: "sk-key",
+      models: "gpt-4o",
+      input_price: null,
+      output_price: null,
+    });
+    upsertModelMapping(1, "gpt-4o", "public-gpt");
+
+    expect(getModelMappings()).toHaveLength(1);
+
+    deleteProvider([1]);
+
+    expect(getProviders()).toHaveLength(0);
+    expect(getModelMappings()).toHaveLength(0);
+    expect(exportDatabase().tables.model_mappings).toHaveLength(0);
+  });
+
+  it("should reject model mappings for missing providers", () => {
+    expect(() => upsertModelMapping(999, "ghost-model", "public-ghost")).toThrow("Provider not found");
+    expect(getModelMappings()).toHaveLength(0);
+  });
+
+  it("should reject invalid batch model mappings without clearing existing mappings", () => {
+    addProvider({
+      name: "OpenAI",
+      api_type: "openai_chat",
+      base_url: "https://api.openai.com/v1",
+      api_key: "sk-key",
+      models: "gpt-4o",
+      input_price: null,
+      output_price: null,
+    });
+    upsertModelMapping(1, "gpt-4o", "public-gpt");
+
+    expect(() => replaceModelMappings([
+      { provider_id: 999, original_model: "ghost-model", display_name: "public-ghost" },
+    ])).toThrow("Provider not found for model mapping: 999");
+
+    expect(getModelMappings()).toEqual([
+      {
+        provider_id: 1,
+        provider_name: "OpenAI",
+        original_model: "gpt-4o",
+        display_name: "public-gpt",
+      },
+    ]);
+  });
+
+  it("should clean orphan model mappings during initialization", async () => {
+    getDb().run(
+      "INSERT INTO model_mappings (provider_id, original_model, display_name) VALUES (?, ?, ?)",
+      [999, "ghost-model", "public-ghost"]
+    );
+    saveDb();
+
+    closeDb();
+    await initDbAsync(dbFile);
+
+    expect(exportDatabase().tables.model_mappings).toHaveLength(0);
   });
 
   it("should delete multiple providers", () => {
@@ -805,6 +908,29 @@ describe("Permission System — User Groups", () => {
     // temp-group should no longer exist
     expect(getUserGroupByName("temp-group")).toBeUndefined();
   });
+
+  it("should reject assigning a missing user group", () => {
+    addUser(22222, "invalid-group-user");
+    const user = getUserByTgId(22222);
+
+    expect(() => setUserGroup(user!.id, 999)).toThrow("User group not found");
+    expect(getUserWithLimits(user!.id)!.group_id).toBeNull();
+  });
+
+  it("should repair missing user group references during initialization", async () => {
+    const defaultGroup = getDefaultUserGroup();
+    addUser(33333, "orphan-group-user");
+    const user = getUserByTgId(33333);
+
+    getDb().run("UPDATE users SET group_id = ? WHERE id = ?", [999, user!.id]);
+    saveDb();
+    closeDb();
+
+    await initDbAsync(dbFile);
+
+    const repairedUser = getUserWithLimits(user!.id);
+    expect(repairedUser!.group_id).toBe(defaultGroup!.id);
+  });
 });
 
 // ===========================================================================
@@ -1163,6 +1289,46 @@ describe("Backup / Restore", () => {
 
     expect(() => importDatabase(tampered)).toThrow(/foreign key violations|Invalid backup/);
     expect(getKeysByUser(111)).toHaveLength(1);
+  });
+
+  it("importDatabase rejects orphan model prices and rolls back", () => {
+    addProvider({
+      name: "OpenAI",
+      api_type: "openai_chat",
+      base_url: "https://api.openai.com/v1",
+      api_key: "sk-key",
+      models: "gpt-4o",
+      input_price: null,
+      output_price: null,
+    });
+
+    const orphanBackup: BackupData = {
+      version: 1,
+      exportedAt: "2024-01-01T00:00:00.000Z",
+      tables: {
+        providers: [],
+        users: [],
+        api_keys: [],
+        usage: [],
+        settings: [],
+        model_prices: [{
+          id: 1,
+          provider_id: 999,
+          model: "ghost-model",
+          input_price: 1,
+          output_price: 2,
+          created_at: "2024-01-01 00:00:00",
+          updated_at: "2024-01-01 00:00:00",
+        }],
+        coding_configs: [],
+        model_restrictions: [],
+        user_groups: [],
+        model_mappings: [],
+      },
+    };
+
+    expect(() => importDatabase(orphanBackup)).toThrow(/model_prices.*providers|foreign key violations|Invalid backup/);
+    expect(getProviders()).toHaveLength(1);
   });
 
   it("importDatabase throws on invalid format", () => {
