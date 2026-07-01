@@ -2,6 +2,11 @@
 
 所有版本變更記錄。本檔案由 `npm run release` 自動維護。
 
+## [1.8.4] - 2026-07-02
+
+### 🐛 Bug Fixes
+- enforce relational integrity cleanup (fd2b5df)
+
 ## [1.8.3] - 2026-07-01
 
 ### ✨ Features
