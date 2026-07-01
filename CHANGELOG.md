@@ -2,6 +2,27 @@
 
 所有版本變更記錄。本檔案由 `npm run release` 自動維護。
 
+## [1.8.3] - 2026-07-01
+
+### ✨ Features
+- show API log source details (80a6a83)
+- log request source metadata (de08f62)
+- configure provider user agents (6c6d588)
+- send provider user agent headers (f7de3b2)
+- store provider user agents (c918e85)
+
+### 🐛 Bug Fixes
+- copy root version file into image (065d749)
+
+### ♻️ Refactor
+- merge system management pages (f3957a2)
+
+### 📝 Documentation
+- update web system management entry (e3e78dd)
+
+### 🔧 CI
+- publish GHCR image (4c13a29)
+
 ## [1.8.2] - 2026-06-28
 
 ### ✨ Features
