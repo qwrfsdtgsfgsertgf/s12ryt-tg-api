@@ -17,6 +17,10 @@ export interface ApiLogEntry {
   actualModel: string;
   providerName: string;
   username: string;
+  userId?: string;
+  apiKeyId?: string;
+  ip?: string;
+  userAgent?: string;
   body: Record<string, any>;
   responseStatus: number;
   error?: string;

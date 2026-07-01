@@ -31,7 +31,7 @@ import {
 import { getProviders, getSetting, lookupModelCached, rebuildProviderCache, onProviderCacheRebuild, getAllCachedModelNames, type Provider, getActiveCodingForApiKey, incrementCodingSessionStats, checkModelAllowed, getAllowedModels, getUserByTgId } from "../db/database.js";
 import { config } from "../config.js";
 import { preprocessThinking, parseModelThinkingSuffix } from "./thinkingParser.js";
-import { addApiLog } from "./apiLogStore.js";
+import { addApiLog, type ApiLogEntry } from "./apiLogStore.js";
 import webRouter from "../web/routes.js";
 
 // ---------------------------------------------------------------------------
@@ -139,6 +139,45 @@ async function recordUsageAndCost(
   } catch (err) {
     console.error("Failed to record usage:", err);
   }
+}
+
+const MAX_API_LOG_IP_LENGTH = 128;
+const MAX_API_LOG_USER_AGENT_LENGTH = 256;
+
+type ApiLogSourceField = "username" | "userId" | "apiKeyId" | "ip" | "userAgent";
+type ApiLogPayload = Omit<ApiLogEntry, "id" | ApiLogSourceField>;
+
+function cleanLogHeaderValue(value: unknown, maxLength: number): string {
+  const raw = Array.isArray(value) ? value[0] : value;
+  if (typeof raw !== "string") return "";
+  return raw.replace(/[\r\n]/g, " ").trim().slice(0, maxLength);
+}
+
+function getClientIp(req: Request): string {
+  const forwardedFor = cleanLogHeaderValue(req.headers["x-forwarded-for"], MAX_API_LOG_IP_LENGTH);
+  const forwardedIp = forwardedFor.split(",")[0]?.trim() ?? "";
+  return forwardedIp
+    || cleanLogHeaderValue(req.headers["cf-connecting-ip"], MAX_API_LOG_IP_LENGTH)
+    || cleanLogHeaderValue(req.headers["x-real-ip"], MAX_API_LOG_IP_LENGTH)
+    || cleanLogHeaderValue(req.ip, MAX_API_LOG_IP_LENGTH)
+    || cleanLogHeaderValue(req.socket.remoteAddress, MAX_API_LOG_IP_LENGTH);
+}
+
+function getApiLogSource(req: Request): Pick<ApiLogEntry, ApiLogSourceField> {
+  const auth = req.auth;
+  const userAgent = cleanLogHeaderValue(req.get("user-agent"), MAX_API_LOG_USER_AGENT_LENGTH);
+  const ip = getClientIp(req);
+  return {
+    username: auth ? String(auth.tgUserId) : "unknown",
+    userId: auth?.userId !== undefined ? String(auth.userId) : undefined,
+    apiKeyId: auth?.apiKeyId !== undefined ? String(auth.apiKeyId) : undefined,
+    ip: ip || undefined,
+    userAgent: userAgent || undefined,
+  };
+}
+
+function writeApiLog(req: Request, entry: ApiLogPayload): void {
+  addApiLog({ ...entry, ...getApiLogSource(req) });
 }
 
 // ---------------------------------------------------------------------------
@@ -696,18 +735,15 @@ app.post(
         dispatch = await dispatchWithFallback(modelName, body, apiKeyId, req.auth);
       } catch (err: any) {
         const statusCode = err.message?.includes("Unknown model") || err.message?.includes("coding-mode") ? 400 : 502;
-        addApiLog({
-          timestamp: new Date().toISOString(),
-          path: "/v1/chat/completions",
-          model: originalModel,
-          actualModel: originalModel,
-          providerName: "-",
-          username: req.auth ? String(req.auth.tgUserId) : "unknown",
-          body: { ...body, model: originalModel },
-          responseStatus: statusCode,
-          error: err.message,
-          latencyMs: Date.now() - logStart,
-        });
+        writeApiLog(req, { timestamp: new Date().toISOString(),
+        path: "/v1/chat/completions",
+        model: originalModel,
+        actualModel: originalModel,
+        providerName: "-",
+        body: { ...body, model: originalModel },
+        responseStatus: statusCode,
+        error: err.message,
+        latencyMs: Date.now() - logStart, });
         res.status(statusCode).json({
           error: { message: err.message, type: statusCode === 400 ? "invalid_request_error" : "upstream_error" },
         });
@@ -735,33 +771,27 @@ app.post(
           // Record streaming usage
           await recordUsageAndCost(req.auth, providerId, actualModel,
             streamUsage.input_tokens, streamUsage.output_tokens, inputPrice, outputPrice, isCodingMode);
-          addApiLog({
-            timestamp: new Date().toISOString(),
-            path: "/v1/chat/completions",
-            model: originalModel,
-            actualModel: upstreamModelName,
-            providerName: dispProviderName,
-            username: req.auth ? String(req.auth.tgUserId) : "unknown",
-            body: { ...body, model: originalModel },
-            responseStatus: 200,
-            inputTokens: streamUsage.input_tokens,
-            outputTokens: streamUsage.output_tokens,
-            latencyMs: Date.now() - logStart,
-          });
+          writeApiLog(req, { timestamp: new Date().toISOString(),
+          path: "/v1/chat/completions",
+          model: originalModel,
+          actualModel: upstreamModelName,
+          providerName: dispProviderName,
+          body: { ...body, model: originalModel },
+          responseStatus: 200,
+          inputTokens: streamUsage.input_tokens,
+          outputTokens: streamUsage.output_tokens,
+          latencyMs: Date.now() - logStart, });
         } catch (err: any) {
           console.error("Stream error:", err);
-          addApiLog({
-            timestamp: new Date().toISOString(),
-            path: "/v1/chat/completions",
-            model: originalModel,
-            actualModel: upstreamModelName,
-            providerName: dispProviderName,
-            username: req.auth ? String(req.auth.tgUserId) : "unknown",
-            body: { ...body, model: originalModel },
-            responseStatus: 502,
-            error: err.message,
-            latencyMs: Date.now() - logStart,
-          });
+          writeApiLog(req, { timestamp: new Date().toISOString(),
+          path: "/v1/chat/completions",
+          model: originalModel,
+          actualModel: upstreamModelName,
+          providerName: dispProviderName,
+          body: { ...body, model: originalModel },
+          responseStatus: 502,
+          error: err.message,
+          latencyMs: Date.now() - logStart, });
         } finally {
           res.end();
         }
@@ -774,19 +804,16 @@ app.post(
           const usage = await extractUsageWithFallback(providerType, result, body, providerConfig, actualModel);
           await recordUsageAndCost(req.auth, providerId, actualModel,
             usage.input_tokens, usage.output_tokens, inputPrice, outputPrice, isCodingMode);
-          addApiLog({
-            timestamp: new Date().toISOString(),
-            path: "/v1/chat/completions",
-            model: originalModel,
-            actualModel: upstreamModelName,
-            providerName: dispProviderName,
-            username: req.auth ? String(req.auth.tgUserId) : "unknown",
-            body: { ...body, model: originalModel },
-            responseStatus: 200,
-            inputTokens: usage.input_tokens,
-            outputTokens: usage.output_tokens,
-            latencyMs: Date.now() - logStart,
-          });
+          writeApiLog(req, { timestamp: new Date().toISOString(),
+          path: "/v1/chat/completions",
+          model: originalModel,
+          actualModel: upstreamModelName,
+          providerName: dispProviderName,
+          body: { ...body, model: originalModel },
+          responseStatus: 200,
+          inputTokens: usage.input_tokens,
+          outputTokens: usage.output_tokens,
+          latencyMs: Date.now() - logStart, });
         } catch (err) {
           console.error("Failed to record usage:", err);
         }
@@ -889,33 +916,27 @@ app.post(
                   streamUsage.input_tokens, streamUsage.output_tokens,
                   _resolved.inputPrice, _resolved.outputPrice,
                 );
-                addApiLog({
-                  timestamp: new Date().toISOString(),
-                  path: "/v1/responses",
-                  model: modelName,
-                  actualModel: _resolved.originalModel,
-                  providerName: _resolved.providerName,
-                  username: req.auth ? String(req.auth.tgUserId) : "unknown",
-                  body: { ...body, model: modelName },
-                  responseStatus: 200,
-                  inputTokens: streamUsage.input_tokens,
-                  outputTokens: streamUsage.output_tokens,
-                  latencyMs: Date.now() - logStart,
-                });
+                writeApiLog(req, { timestamp: new Date().toISOString(),
+                path: "/v1/responses",
+                model: modelName,
+                actualModel: _resolved.originalModel,
+                providerName: _resolved.providerName,
+                body: { ...body, model: modelName },
+                responseStatus: 200,
+                inputTokens: streamUsage.input_tokens,
+                outputTokens: streamUsage.output_tokens,
+                latencyMs: Date.now() - logStart, });
               } catch (err: any) {
                 console.error("Responses direct stream error:", err);
-                addApiLog({
-                  timestamp: new Date().toISOString(),
-                  path: "/v1/responses",
-                  model: modelName,
-                  actualModel: _resolved.originalModel,
-                  providerName: _resolved.providerName,
-                  username: req.auth ? String(req.auth.tgUserId) : "unknown",
-                  body: { ...body, model: modelName },
-                  responseStatus: 502,
-                  error: err.message,
-                  latencyMs: Date.now() - logStart,
-                });
+                writeApiLog(req, { timestamp: new Date().toISOString(),
+                path: "/v1/responses",
+                model: modelName,
+                actualModel: _resolved.originalModel,
+                providerName: _resolved.providerName,
+                body: { ...body, model: modelName },
+                responseStatus: 502,
+                error: err.message,
+                latencyMs: Date.now() - logStart, });
               } finally {
                 res.end();
               }
@@ -931,35 +952,29 @@ app.post(
                 _inT, _outT,
                 _resolved.inputPrice, _resolved.outputPrice,
               );
-              addApiLog({
-                timestamp: new Date().toISOString(),
-                path: "/v1/responses",
-                model: modelName,
-                actualModel: _resolved.originalModel,
-                providerName: _resolved.providerName,
-                username: req.auth ? String(req.auth.tgUserId) : "unknown",
-                body: { ...body, model: modelName },
-                responseStatus: 200,
-                inputTokens: _inT,
-                outputTokens: _outT,
-                latencyMs: Date.now() - logStart,
-              });
-              res.json(result);
-              return;
-            }
-          } catch (err: any) {
-            addApiLog({
-              timestamp: new Date().toISOString(),
+              writeApiLog(req, { timestamp: new Date().toISOString(),
               path: "/v1/responses",
               model: modelName,
               actualModel: _resolved.originalModel,
               providerName: _resolved.providerName,
-              username: req.auth ? String(req.auth.tgUserId) : "unknown",
               body: { ...body, model: modelName },
-              responseStatus: 502,
-              error: err.message,
-              latencyMs: Date.now() - logStart,
-            });
+              responseStatus: 200,
+              inputTokens: _inT,
+              outputTokens: _outT,
+              latencyMs: Date.now() - logStart, });
+              res.json(result);
+              return;
+            }
+          } catch (err: any) {
+            writeApiLog(req, { timestamp: new Date().toISOString(),
+            path: "/v1/responses",
+            model: modelName,
+            actualModel: _resolved.originalModel,
+            providerName: _resolved.providerName,
+            body: { ...body, model: modelName },
+            responseStatus: 502,
+            error: err.message,
+            latencyMs: Date.now() - logStart, });
             res.status(502).json({
               error: { message: err.message, type: "upstream_error" },
             });
@@ -1029,18 +1044,15 @@ app.post(
         dispatch = await dispatchWithFallback(modelName, chatBody as Record<string, any>, apiKeyIdResp, req.auth);
       } catch (err: any) {
         const statusCode = err.message?.includes("Unknown model") || err.message?.includes("coding-mode") ? 400 : 502;
-        addApiLog({
-          timestamp: new Date().toISOString(),
-          path: "/v1/responses",
-          model: originalModelResp,
-          actualModel: originalModelResp,
-          providerName: "-",
-          username: req.auth ? String(req.auth.tgUserId) : "unknown",
-          body: { ...body },
-          responseStatus: statusCode,
-          error: err.message,
-          latencyMs: Date.now() - logStart,
-        });
+        writeApiLog(req, { timestamp: new Date().toISOString(),
+        path: "/v1/responses",
+        model: originalModelResp,
+        actualModel: originalModelResp,
+        providerName: "-",
+        body: { ...body },
+        responseStatus: statusCode,
+        error: err.message,
+        latencyMs: Date.now() - logStart, });
         res.status(statusCode).json({
           error: { message: err.message, type: statusCode === 400 ? "invalid_request_error" : "upstream_error" },
         });
@@ -1083,34 +1095,28 @@ app.post(
 
           // Record streaming usage
           await recordUsageAndCost(req.auth, String(providerId), actualModel, streamUsage.input_tokens, streamUsage.output_tokens, inputPrice, outputPrice, isCodingModeResp);
-          addApiLog({
-            timestamp: new Date().toISOString(),
-            path: "/v1/responses",
-            model: originalModelResp,
-            actualModel: upstreamModelName,
-            providerName: respProviderName,
-            username: req.auth ? String(req.auth.tgUserId) : "unknown",
-            body: { ...body },
-            responseStatus: 200,
-            inputTokens: streamUsage.input_tokens,
-            outputTokens: streamUsage.output_tokens,
-            latencyMs: Date.now() - logStart,
-          });
+          writeApiLog(req, { timestamp: new Date().toISOString(),
+          path: "/v1/responses",
+          model: originalModelResp,
+          actualModel: upstreamModelName,
+          providerName: respProviderName,
+          body: { ...body },
+          responseStatus: 200,
+          inputTokens: streamUsage.input_tokens,
+          outputTokens: streamUsage.output_tokens,
+          latencyMs: Date.now() - logStart, });
 
         } catch (err: any) {
           console.error("Responses stream error:", err);
-          addApiLog({
-            timestamp: new Date().toISOString(),
-            path: "/v1/responses",
-            model: originalModelResp,
-            actualModel: upstreamModelName,
-            providerName: respProviderName,
-            username: req.auth ? String(req.auth.tgUserId) : "unknown",
-            body: { ...body },
-            responseStatus: 502,
-            error: err.message,
-            latencyMs: Date.now() - logStart,
-          });
+          writeApiLog(req, { timestamp: new Date().toISOString(),
+          path: "/v1/responses",
+          model: originalModelResp,
+          actualModel: upstreamModelName,
+          providerName: respProviderName,
+          body: { ...body },
+          responseStatus: 502,
+          error: err.message,
+          latencyMs: Date.now() - logStart, });
         } finally {
           res.end();
         }
@@ -1130,19 +1136,16 @@ app.post(
         try {
           const usage = await extractUsageWithFallback(providerType, result2, body, providerConfig, actualModel);
           await recordUsageAndCost(req.auth, String(providerId), actualModel, usage.input_tokens, usage.output_tokens, inputPrice, outputPrice, isCodingModeResp);
-          addApiLog({
-            timestamp: new Date().toISOString(),
-            path: "/v1/responses",
-            model: originalModelResp,
-            actualModel: upstreamModelName,
-            providerName: respProviderName,
-            username: req.auth ? String(req.auth.tgUserId) : "unknown",
-            body: { ...body },
-            responseStatus: 200,
-            inputTokens: usage.input_tokens,
-            outputTokens: usage.output_tokens,
-            latencyMs: Date.now() - logStart,
-          });
+          writeApiLog(req, { timestamp: new Date().toISOString(),
+          path: "/v1/responses",
+          model: originalModelResp,
+          actualModel: upstreamModelName,
+          providerName: respProviderName,
+          body: { ...body },
+          responseStatus: 200,
+          inputTokens: usage.input_tokens,
+          outputTokens: usage.output_tokens,
+          latencyMs: Date.now() - logStart, });
         } catch (err) {
           console.error("Failed to record usage:", err);
         }
@@ -1250,33 +1253,27 @@ app.post(
                   streamUsage.input_tokens, streamUsage.output_tokens,
                   _resolved.inputPrice, _resolved.outputPrice,
                 );
-                addApiLog({
-                  timestamp: new Date().toISOString(),
-                  path: "/v1/messages",
-                  model: modelName,
-                  actualModel: _resolved.originalModel,
-                  providerName: _resolved.providerName,
-                  username: req.auth ? String(req.auth.tgUserId) : "unknown",
-                  body: { ...body, model: modelName },
-                  responseStatus: 200,
-                  inputTokens: streamUsage.input_tokens,
-                  outputTokens: streamUsage.output_tokens,
-                  latencyMs: Date.now() - logStart,
-                });
+                writeApiLog(req, { timestamp: new Date().toISOString(),
+                path: "/v1/messages",
+                model: modelName,
+                actualModel: _resolved.originalModel,
+                providerName: _resolved.providerName,
+                body: { ...body, model: modelName },
+                responseStatus: 200,
+                inputTokens: streamUsage.input_tokens,
+                outputTokens: streamUsage.output_tokens,
+                latencyMs: Date.now() - logStart, });
               } catch (err: any) {
                 console.error("Messages direct stream error:", err);
-                addApiLog({
-                  timestamp: new Date().toISOString(),
-                  path: "/v1/messages",
-                  model: modelName,
-                  actualModel: _resolved.originalModel,
-                  providerName: _resolved.providerName,
-                  username: req.auth ? String(req.auth.tgUserId) : "unknown",
-                  body: { ...body, model: modelName },
-                  responseStatus: 502,
-                  error: err.message,
-                  latencyMs: Date.now() - logStart,
-                });
+                writeApiLog(req, { timestamp: new Date().toISOString(),
+                path: "/v1/messages",
+                model: modelName,
+                actualModel: _resolved.originalModel,
+                providerName: _resolved.providerName,
+                body: { ...body, model: modelName },
+                responseStatus: 502,
+                error: err.message,
+                latencyMs: Date.now() - logStart, });
               } finally {
                 res.end();
               }
@@ -1292,35 +1289,29 @@ app.post(
                 _inT, _outT,
                 _resolved.inputPrice, _resolved.outputPrice,
               );
-              addApiLog({
-                timestamp: new Date().toISOString(),
-                path: "/v1/messages",
-                model: modelName,
-                actualModel: _resolved.originalModel,
-                providerName: _resolved.providerName,
-                username: req.auth ? String(req.auth.tgUserId) : "unknown",
-                body: { ...body, model: modelName },
-                responseStatus: 200,
-                inputTokens: _inT,
-                outputTokens: _outT,
-                latencyMs: Date.now() - logStart,
-              });
-              res.json(result);
-              return;
-            }
-          } catch (err: any) {
-            addApiLog({
-              timestamp: new Date().toISOString(),
+              writeApiLog(req, { timestamp: new Date().toISOString(),
               path: "/v1/messages",
               model: modelName,
               actualModel: _resolved.originalModel,
               providerName: _resolved.providerName,
-              username: req.auth ? String(req.auth.tgUserId) : "unknown",
               body: { ...body, model: modelName },
-              responseStatus: 502,
-              error: err.message,
-              latencyMs: Date.now() - logStart,
-            });
+              responseStatus: 200,
+              inputTokens: _inT,
+              outputTokens: _outT,
+              latencyMs: Date.now() - logStart, });
+              res.json(result);
+              return;
+            }
+          } catch (err: any) {
+            writeApiLog(req, { timestamp: new Date().toISOString(),
+            path: "/v1/messages",
+            model: modelName,
+            actualModel: _resolved.originalModel,
+            providerName: _resolved.providerName,
+            body: { ...body, model: modelName },
+            responseStatus: 502,
+            error: err.message,
+            latencyMs: Date.now() - logStart, });
             res.status(502).json({
               type: "error",
               error: { type: "api_error", message: err.message },
@@ -1361,18 +1352,15 @@ app.post(
       } catch (err: any) {
         const statusCode = err.message?.includes("Unknown model") || err.message?.includes("coding-mode") ? 400 : 502;
         const errorType = statusCode === 400 ? "invalid_request_error" : "api_error";
-        addApiLog({
-          timestamp: new Date().toISOString(),
-          path: "/v1/messages",
-          model: originalModelMsg,
-          actualModel: originalModelMsg,
-          providerName: "-",
-          username: req.auth ? String(req.auth.tgUserId) : "unknown",
-          body: { ...body },
-          responseStatus: statusCode,
-          error: err.message,
-          latencyMs: Date.now() - logStart,
-        });
+        writeApiLog(req, { timestamp: new Date().toISOString(),
+        path: "/v1/messages",
+        model: originalModelMsg,
+        actualModel: originalModelMsg,
+        providerName: "-",
+        body: { ...body },
+        responseStatus: statusCode,
+        error: err.message,
+        latencyMs: Date.now() - logStart, });
         res.status(statusCode).json({
           type: "error",
           error: { type: errorType, message: err.message },
@@ -1403,33 +1391,27 @@ app.post(
           );
 
           await recordUsageAndCost(req.auth, String(providerId), actualModel, streamUsage.input_tokens, streamUsage.output_tokens, inputPrice, outputPrice, isCodingModeMsg);
-          addApiLog({
-            timestamp: new Date().toISOString(),
-            path: "/v1/messages",
-            model: originalModelMsg,
-            actualModel: upstreamModelName,
-            providerName: msgProviderName,
-            username: req.auth ? String(req.auth.tgUserId) : "unknown",
-            body: { ...body },
-            responseStatus: 200,
-            inputTokens: streamUsage.input_tokens,
-            outputTokens: streamUsage.output_tokens,
-            latencyMs: Date.now() - logStart,
-          });
+          writeApiLog(req, { timestamp: new Date().toISOString(),
+          path: "/v1/messages",
+          model: originalModelMsg,
+          actualModel: upstreamModelName,
+          providerName: msgProviderName,
+          body: { ...body },
+          responseStatus: 200,
+          inputTokens: streamUsage.input_tokens,
+          outputTokens: streamUsage.output_tokens,
+          latencyMs: Date.now() - logStart, });
         } catch (err: any) {
           console.error("Anthropic stream error:", err);
-          addApiLog({
-            timestamp: new Date().toISOString(),
-            path: "/v1/messages",
-            model: originalModelMsg,
-            actualModel: upstreamModelName,
-            providerName: msgProviderName,
-            username: req.auth ? String(req.auth.tgUserId) : "unknown",
-            body: { ...body },
-            responseStatus: 502,
-            error: err.message,
-            latencyMs: Date.now() - logStart,
-          });
+          writeApiLog(req, { timestamp: new Date().toISOString(),
+          path: "/v1/messages",
+          model: originalModelMsg,
+          actualModel: upstreamModelName,
+          providerName: msgProviderName,
+          body: { ...body },
+          responseStatus: 502,
+          error: err.message,
+          latencyMs: Date.now() - logStart, });
         } finally {
           res.end();
         }
@@ -1443,19 +1425,16 @@ app.post(
         try {
           const usage = await extractUsageWithFallback(providerType, result, body, providerConfig, actualModel);
           await recordUsageAndCost(req.auth, String(providerId), actualModel, usage.input_tokens, usage.output_tokens, inputPrice, outputPrice, isCodingModeMsg);
-          addApiLog({
-            timestamp: new Date().toISOString(),
-            path: "/v1/messages",
-            model: originalModelMsg,
-            actualModel: upstreamModelName,
-            providerName: msgProviderName,
-            username: req.auth ? String(req.auth.tgUserId) : "unknown",
-            body: { ...body },
-            responseStatus: 200,
-            inputTokens: usage.input_tokens,
-            outputTokens: usage.output_tokens,
-            latencyMs: Date.now() - logStart,
-          });
+          writeApiLog(req, { timestamp: new Date().toISOString(),
+          path: "/v1/messages",
+          model: originalModelMsg,
+          actualModel: upstreamModelName,
+          providerName: msgProviderName,
+          body: { ...body },
+          responseStatus: 200,
+          inputTokens: usage.input_tokens,
+          outputTokens: usage.output_tokens,
+          latencyMs: Date.now() - logStart, });
         } catch (err) {
           console.error("Failed to record usage:", err);
         }

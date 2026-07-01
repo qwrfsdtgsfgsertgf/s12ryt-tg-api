@@ -485,9 +485,13 @@ describe("TestChatCompletionsSuccess", () => {
   });
 
   it("test_successful_non_streaming", async () => {
+    clearApiLogs();
+
     const res = await request(app)
       .post("/v1/chat/completions")
       .set("Authorization", AUTH_HEADER)
+      .set("User-Agent", "s12ryt-test-client/1.0")
+      .set("X-Forwarded-For", "203.0.113.10, 10.0.0.1")
       .send({
         model: "gpt-4o",
         messages: [{ role: "user", content: "Hello" }],
@@ -505,6 +509,14 @@ describe("TestChatCompletionsSuccess", () => {
     expect(configArg.baseUrl).toBe("https://api.openai.com/v1");
     expect(configArg.apiKey).toBe("test-key");
     expect(configArg.extraHeaders).toEqual({ "User-Agent": "ProviderUA/1.0" });
+
+    const [log] = getApiLogs();
+    expect(log.path).toBe("/v1/chat/completions");
+    expect(log.username).toBe("99999");
+    expect(log.userId).toBe("1");
+    expect(log.apiKeyId).toBe("1");
+    expect(log.ip).toBe("203.0.113.10");
+    expect(log.userAgent).toBe("s12ryt-test-client/1.0");
   });
 
   it("test_provider_error_returns_502", async () => {
