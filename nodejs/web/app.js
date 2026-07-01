@@ -2393,6 +2393,10 @@
       }
 
       let rows = "";
+      const shortLogText = (value, max = 42) => {
+        const text = String(value || "");
+        return text.length > max ? `${text.slice(0, Math.max(0, max - 3))}...` : text;
+      };
       for (const log of logs) {
         const statusClass = log.responseStatus >= 400 ? "badge-danger" : "badge-success";
         const tokens = (log.inputTokens || 0) + (log.outputTokens || 0);
@@ -2402,7 +2406,12 @@
             <td><span class="badge badge-muted" style="font-size:11px;">${esc(log.path)}</span></td>
             <td class="mono">${esc(log.model)}</td>
             <td>${esc(log.providerName)}</td>
-            <td class="mono">${esc(log.username)}</td>
+            <td>
+              <div class="mono">TG ${esc(log.username || "unknown")}</div>
+              <div style="font-size:11px;color:var(--text-secondary);">User ${esc(log.userId || "-")} / Key ${esc(log.apiKeyId || "-")}</div>
+              <div style="font-size:11px;color:var(--text-secondary);">IP ${esc(log.ip || "-")}</div>
+              <div style="font-size:11px;color:var(--text-secondary);" title="${esc(log.userAgent || "")}">UA ${esc(shortLogText(log.userAgent || "-", 42))}</div>
+            </td>
             <td style="text-align:right;">${tokens > 0 ? tokens : "-"}</td>
             <td style="text-align:right;">${log.latencyMs}ms</td>
             <td><span class="badge ${statusClass}">${log.responseStatus}</span></td>
@@ -2421,7 +2430,7 @@
               <thead>
                 <tr>
                   <th>時間</th><th>路徑</th><th>模型</th><th>供應商</th>
-                  <th>用戶</th><th style="text-align:right;">Tokens</th>
+                  <th>來源</th><th style="text-align:right;">Tokens</th>
                   <th style="text-align:right;">延遲</th><th>狀態</th><th></th>
                 </tr>
               </thead>
@@ -2455,6 +2464,9 @@
               <div>模型: <span class="mono">${esc(log.model)}</span> → <span class="mono">${esc(log.actualModel)}</span></div>
               <div>供應商: ${esc(log.providerName)}</div>
               <div>用戶: <span class="mono">${esc(log.username)}</span></div>
+              <div>User ID: <span class="mono">${esc(log.userId || "-")}</span> | API Key ID: <span class="mono">${esc(log.apiKeyId || "-")}</span></div>
+              <div>IP: <span class="mono">${esc(log.ip || "-")}</span></div>
+              <div>User-Agent: <span class="mono">${esc(log.userAgent || "-")}</span></div>
               <div>狀態: ${log.responseStatus} | 延遲: ${log.latencyMs}ms</div>
             </div>
             ${usageHtml}
