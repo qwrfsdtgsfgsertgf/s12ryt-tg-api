@@ -3,6 +3,7 @@ import type { Bot, Context } from "grammy";
 import type { BotCommand } from "grammy/types";
 import type { ConversationFlavor } from "@grammyjs/conversations";
 import type { Config } from "../config.js";
+import type { PluginServices } from "./services.js";
 
 export type NodeJsPluginContext = Context & ConversationFlavor;
 export type NodeJsPluginBot = Bot<NodeJsPluginContext>;
@@ -32,6 +33,7 @@ export type PluginContext = {
   /** Advanced escape hatch. Prefer router for normal plugin endpoints. */
   app: Application;
   logger: PluginLogger;
+  services: PluginServices;
   registerBotCommand(command: RegisterBotCommandOptions): void;
   usePluginMiddleware(handler: RequestHandler): void;
 };

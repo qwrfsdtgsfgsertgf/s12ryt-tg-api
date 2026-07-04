@@ -3,6 +3,7 @@ import fs from "fs/promises";
 import path from "path";
 import { pathToFileURL } from "url";
 import { config } from "../config.js";
+import { cleanupPluginServices, createPluginServices } from "./services.js";
 import type {
   LoadedNodeJsPlugin,
   NodeJsPlugin,
@@ -187,6 +188,7 @@ async function activatePlugin(loaded: LoadedNodeJsPlugin): Promise<void> {
   }
 
   const logger = createPluginLogger(loaded.plugin.name);
+  const services = createPluginServices(loaded.id, logger);
   const router = express.Router();
   const context: PluginContext = {
     name: loaded.plugin.name,
@@ -196,6 +198,7 @@ async function activatePlugin(loaded: LoadedNodeJsPlugin): Promise<void> {
     router,
     app: appRef,
     logger,
+    services,
     registerBotCommand(command) {
       botCommands.push(command);
       if (command.handler && botRef) {
@@ -281,6 +284,7 @@ export async function startNodeJsPlugins(): Promise<void> {
 export async function shutdownNodeJsPlugins(): Promise<void> {
   for (const loaded of [...loadedPlugins].reverse()) {
     await callPluginHook(loaded.id, "onStop");
+    cleanupPluginServices(loaded.id);
   }
 }
 
