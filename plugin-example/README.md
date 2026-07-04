@@ -52,12 +52,18 @@ NODEJS_PLUGIN_PATHS=../plugin-example/dist/index.js;../another-plugin/dist/index
 | 方法 | 路徑 | 說明 |
 |------|------|------|
 | `GET` | `/plugins/nodejs-example/status` | 查看插件狀態、版本、啟動時間與範例路由 |
+| `GET` | `/plugins/nodejs-example/me` | 示範 `context.services.auth`、`services.db` 與 `services.providers` |
 | `POST` | `/plugins/nodejs-example/echo` | 回傳請求 body，示範如何讀取 Express request |
 
 範例請求：
 
 ```bash
 curl http://localhost:8000/plugins/nodejs-example/status \
+  -H "Authorization: Bearer sk-s12ryt-your-key-here"
+```
+
+```bash
+curl http://localhost:8000/plugins/nodejs-example/me \
   -H "Authorization: Bearer sk-s12ryt-your-key-here"
 ```
 
@@ -105,6 +111,29 @@ export default plugin;
 
 `context.router` 會自動掛到 `/plugins/<plugin-id>`，其中 `<plugin-id>` 由插件名稱標準化而來。例如 `nodejs-example` 的狀態路由就是 `/plugins/nodejs-example/status`。
 
+`context.services` 提供插件穩定內部接口，常用能力包含：
+
+- `services.auth`：檢查 Telegram admin / trusted user，或讀取 Express request 上的 API Key 認證資訊。
+- `services.storage`：插件專屬 JSON KV 儲存，key 使用受限字元，單筆值上限 256KB。
+- `services.events`：程序內事件 bus，支援訂閱、一次性訂閱、發布與取消訂閱。
+- `services.scheduler`：受控 timeout / interval，插件停止時由核心集中清理。
+- `services.providers`：只讀 provider、model、price、mapping 查詢；不回傳 provider API Key 或 base URL。
+- `services.db`：只讀用戶、限制、用量與模型權限查詢；API Key 只回傳末 12 碼預覽。
+
+範例：
+
+```ts
+setup(context) {
+  context.router.get("/me", (req, res) => {
+    const auth = context.services.auth.requireRequestAuth(req);
+    const user = context.services.db.getUserByTelegramId(auth.tgUserId);
+    res.json({ user, models: context.services.providers.listModels() });
+  });
+
+  context.services.storage.set("lastSetupAt", new Date().toISOString());
+}
+```
+
 ## 安全注意事項
 
 - 插件只在 Node.js 版本中載入，不依賴已停止維護的 Python 版本。
@@ -113,6 +142,8 @@ export default plugin;
 - Web 安裝目前限制 `.js` / `.mjs` 入口檔，大小上限 1MB。
 - 插件路由預設沿用 API Key 認證、rate limit 與 quota middleware。
 - 插件 Bot 指令的業務權限需要插件自行檢查。
+- `context.services.providers` 和 `context.services.db` 會遮蔽 API Key、provider base URL 等敏感資料；不要改用核心內部 DB 函式繞過這層限制。
+- `context.services.storage` 資料目前不會進入主程式 `/backup` JSON，若插件需要備份請自行提供匯出流程。
 - 不要在插件回應中輸出 API Key、Bot Token、資料庫路徑或其他敏感設定。
 
 ## 開發建議
@@ -121,3 +152,4 @@ export default plugin;
 - 在 `setup()` 中只做路由與指令註冊，長時間任務放到 `onStart()`。
 - 在 `onStop()` 清理計時器、連線、檔案 handle。
 - 避免直接 import 核心內部模組；優先使用 `PluginContext` 暴露的穩定能力。
+- 優先使用 `context.services.scheduler` 建立計時器，讓核心能在插件停止時清理資源。
