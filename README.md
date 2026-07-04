@@ -168,9 +168,11 @@ npm run dev
 
 ## 插件範例
 
-本專案的 Node.js 插件範例已獨立發布，可用來測試插件生命週期、Express 路由與 grammY Bot 指令接入。
+本專案的 Node.js 插件範例放在 [`plugin-example/`](plugin-example/)，可用來測試插件生命週期、Express 路由、grammY Bot 指令接入與 `context.services` 穩定內部服務接口。
 
-插件範例倉庫：[`s12ryt/s12ryt-nodejs-plugin-example`](https://github.com/s12ryt/s12ryt-nodejs-plugin-example)。主專案倉庫仍是 [`s12ryt/s12ryt-tg-api`](https://github.com/s12ryt/s12ryt-tg-api)，兩邊 README 會互相連結，方便從主程式或範例插件任一側找到另一個倉庫。
+此範例也已獨立發布為 GitHub 倉庫：[`s12ryt/s12ryt-nodejs-plugin-example`](https://github.com/s12ryt/s12ryt-nodejs-plugin-example)。主專案倉庫仍是 [`s12ryt/s12ryt-tg-api`](https://github.com/s12ryt/s12ryt-tg-api)，兩邊 README 會互相連結，方便從主程式或範例插件任一側找到另一個倉庫。
+
+`context.services` 的詳細接口、實際路由範例與安全注意事項請看 [`plugin-example/README.md`](plugin-example/README.md)。
 
 ## 更新與備份還原（Node.js）
 
