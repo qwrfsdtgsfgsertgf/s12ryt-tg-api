@@ -44,6 +44,9 @@
  *   DELETE /web/api/admin/groups/:id          — 刪除分組
  *   GET    /web/api/admin/usage               — 全部用量統計
  *   GET    /web/api/admin/system-usage        — 系統與程式資源佔用
+ *   GET    /web/api/admin/plugins             — Node.js 插件列表
+ *   POST   /web/api/admin/plugins/upload      — 從 Web 上傳安裝 Node.js 插件
+ *   POST   /web/api/admin/plugins/github      — 從 GitHub 連結安裝 Node.js 插件
  *   GET    /web/api/admin/settings            — 系統設定
  *   PUT    /web/api/admin/settings            — 更新系統設定
  */
@@ -78,6 +81,7 @@ import {
   rollbackAndRestart,
 } from "../updater.js";
 import { getApiLogs } from "../api/apiLogStore.js";
+import { installNodeJsPluginFromContent, listNodeJsPlugins } from "../plugins/index.js";
 import {
   // providers
   getProviders, addProvider, updateProvider, deleteProvider,
@@ -126,6 +130,13 @@ function sanitizeProviderTestUrl(url: string, apiType: string): string {
 
 const PROVIDER_DEFAULT_USER_AGENT_SETTING = "provider_default_user_agent";
 const MAX_USER_AGENT_LENGTH = 256;
+const MAX_PLUGIN_SOURCE_BYTES = 1024 * 1024;
+
+type ResolvedGitHubPlugin = {
+  rawUrl: string;
+  filename: string;
+  sourceUrl: string;
+};
 
 function sanitizeUserAgent(value: unknown): { ok: true; value: string } | { ok: false; error: string } {
   if (value === undefined || value === null) return { ok: true, value: "" };
@@ -151,6 +162,109 @@ function buildUserAgentHeader(providerUserAgent: unknown): Record<string, string
     ? sanitizedProvider.value
     : getProviderDefaultUserAgent();
   return userAgent ? { "User-Agent": userAgent } : {};
+}
+
+function assertPluginEntryFilename(filename: string): void {
+  const ext = path.extname(filename).toLowerCase();
+  if (ext !== ".js" && ext !== ".mjs") {
+    throw new Error("插件入口必須是 .js 或 .mjs 檔案");
+  }
+}
+
+function getFilenameFromPathname(pathname: string): string {
+  const filename = path.basename(pathname);
+  assertPluginEntryFilename(filename);
+  return filename;
+}
+
+function buildRawGitHubUrl(owner: string, repo: string, ref: string, filePath: string): string {
+  return `https://raw.githubusercontent.com/${owner}/${repo}/${ref}/${filePath}`;
+}
+
+async function fetchTextWithLimit(url: string, timeoutMs = 15000): Promise<string> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, {
+      signal: controller.signal,
+      headers: { "User-Agent": "s12ryt-tg-api-plugin-installer" },
+    });
+    if (!response.ok) throw new Error(`下載失敗: HTTP ${response.status}`);
+    const length = response.headers.get("content-length");
+    if (length && Number(length) > MAX_PLUGIN_SOURCE_BYTES) {
+      throw new Error("插件檔案超過 1MB 上限");
+    }
+    const text = await response.text();
+    if (Buffer.byteLength(text, "utf8") > MAX_PLUGIN_SOURCE_BYTES) {
+      throw new Error("插件檔案超過 1MB 上限");
+    }
+    return text;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function resolveRepoPluginSource(owner: string, repo: string, ref: string | null, sourceUrl: string): Promise<ResolvedGitHubPlugin> {
+  const refs = ref ? [ref] : ["main", "master"];
+  let lastError: unknown = null;
+
+  for (const candidateRef of refs) {
+    const manifestUrl = buildRawGitHubUrl(owner, repo, candidateRef, "plugin.json");
+    try {
+      const manifest = JSON.parse(await fetchTextWithLimit(manifestUrl)) as { main?: unknown };
+      if (typeof manifest.main !== "string" || !manifest.main.trim()) {
+        throw new Error("plugin.json 缺少 main 欄位");
+      }
+      const entry = manifest.main.replace(/^\.\//, "");
+      const filename = getFilenameFromPathname(entry);
+      return {
+        rawUrl: buildRawGitHubUrl(owner, repo, candidateRef, entry),
+        filename,
+        sourceUrl,
+      };
+    } catch (err) {
+      lastError = err;
+    }
+  }
+
+  throw new Error(`找不到可用的 plugin.json 入口: ${String((lastError as Error | null)?.message ?? lastError)}`);
+}
+
+async function resolveGitHubPluginSource(value: unknown): Promise<ResolvedGitHubPlugin> {
+  if (typeof value !== "string" || !value.trim()) throw new Error("GitHub 連結不能為空");
+  const sourceUrl = value.trim();
+  const url = new URL(sourceUrl);
+  if (url.protocol !== "https:") throw new Error("只支援 https GitHub 連結");
+
+  if (url.hostname === "raw.githubusercontent.com") {
+    const segments = url.pathname.split("/").filter(Boolean);
+    if (segments.length < 4) throw new Error("raw GitHub 連結格式不正確");
+    return {
+      rawUrl: `https://raw.githubusercontent.com/${segments.join("/")}`,
+      filename: getFilenameFromPathname(url.pathname),
+      sourceUrl,
+    };
+  }
+
+  if (url.hostname !== "github.com") throw new Error("只支援 github.com 或 raw.githubusercontent.com");
+
+  const segments = url.pathname.split("/").filter(Boolean);
+  const [owner, repo, action, ref, ...fileParts] = segments;
+  if (!owner || !repo) throw new Error("GitHub repo 連結格式不正確");
+
+  if ((action === "blob" || action === "raw") && ref && fileParts.length > 0) {
+    const filePath = fileParts.join("/");
+    return {
+      rawUrl: buildRawGitHubUrl(owner, repo, ref, filePath),
+      filename: getFilenameFromPathname(filePath),
+      sourceUrl,
+    };
+  }
+
+  if (!action) return resolveRepoPluginSource(owner, repo, null, sourceUrl);
+  if (action === "tree" && ref) return resolveRepoPluginSource(owner, repo, ref, sourceUrl);
+
+  throw new Error("GitHub 連結需是 .js/.mjs 檔案、repo 根目錄，或 tree 連結");
 }
 
 type CpuTimesSnapshot = { idle: number; total: number };
@@ -507,6 +621,46 @@ router.use("/api/admin", requireAdmin);
 /** GET /web/api/admin/system-usage — 系統與程式資源佔用 */
 router.get("/api/admin/system-usage", (_req: Request, res: Response) => {
   res.json({ usage: getSystemUsageSnapshot() });
+});
+
+/** GET /web/api/admin/plugins — Node.js 插件列表 */
+router.get("/api/admin/plugins", async (_req: Request, res: Response) => {
+  res.json({ plugins: await listNodeJsPlugins() });
+});
+
+/** POST /web/api/admin/plugins/upload — 從 Web 上傳安裝 Node.js 插件 */
+router.post("/api/admin/plugins/upload", async (req: Request, res: Response) => {
+  const { filename, content } = req.body as { filename?: unknown; content?: unknown };
+  if (typeof filename !== "string" || typeof content !== "string") {
+    res.status(400).json({ error: "缺少必要欄位: filename, content" });
+    return;
+  }
+
+  try {
+    const plugin = await installNodeJsPluginFromContent({ filename, content, kind: "upload" });
+    res.json({ ok: true, plugin, plugins: await listNodeJsPlugins() });
+  } catch (err) {
+    console.error("[web] install uploaded plugin error:", err);
+    res.status(400).json({ error: err instanceof Error ? err.message : "插件安裝失敗" });
+  }
+});
+
+/** POST /web/api/admin/plugins/github — 從 GitHub 連結安裝 Node.js 插件 */
+router.post("/api/admin/plugins/github", async (req: Request, res: Response) => {
+  try {
+    const source = await resolveGitHubPluginSource((req.body as { url?: unknown }).url);
+    const content = await fetchTextWithLimit(source.rawUrl);
+    const plugin = await installNodeJsPluginFromContent({
+      filename: source.filename,
+      content,
+      kind: "github",
+      url: source.sourceUrl,
+    });
+    res.json({ ok: true, plugin, rawUrl: source.rawUrl, plugins: await listNodeJsPlugins() });
+  } catch (err) {
+    console.error("[web] install GitHub plugin error:", err);
+    res.status(400).json({ error: err instanceof Error ? err.message : "GitHub 插件安裝失敗" });
+  }
 });
 
 // --- Providers ---

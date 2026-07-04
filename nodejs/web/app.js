@@ -446,6 +446,7 @@
     "/model-mapping": pageModelMapping,
     "/api-logs": pageApiLogs,
     "/system-usage": pageSystemUsage,
+    "/plugins": pagePlugins,
     "/system": pageSystem,
   };
 
@@ -2669,6 +2670,166 @@
     if (refreshBtn) refreshBtn.onclick = refresh;
     await refresh();
     systemUsageTimer = setInterval(refresh, 1000);
+  }
+
+  // =========================================================================
+  // Pages — Plugin Management (Admin)
+  // =========================================================================
+
+  function pluginKindLabel(kind) {
+    if (kind === "github") return "GitHub";
+    if (kind === "upload") return "檔案匯入";
+    if (kind === "env") return "環境變數";
+    return kind || "未知";
+  }
+
+  function renderPluginStatusList(plugins) {
+    const loaded = Array.isArray(plugins.loaded) ? plugins.loaded : [];
+    const installed = Array.isArray(plugins.installed) ? plugins.installed : [];
+    const installedById = new Map(installed.map((item) => [item.id, item]));
+    const ids = new Set([...loaded.map((item) => item.id), ...installed.map((item) => item.id)]);
+
+    if (ids.size === 0) {
+      return `
+        <div class="plugin-empty">
+          ${ic.plug}
+          <div>
+            <strong>尚未安裝插件</strong>
+            <p>可以從本機 .js/.mjs 檔案匯入，或貼上 GitHub raw/blob/repo 連結線上安裝。</p>
+          </div>
+        </div>`;
+    }
+
+    const items = [...ids].sort().map((id) => {
+      const loadedItem = loaded.find((item) => item.id === id) || {};
+      const installedItem = installedById.get(id) || {};
+      const name = loadedItem.name || installedItem.name || id;
+      const version = loadedItem.version || installedItem.version || "--";
+      const description = loadedItem.description || installedItem.description || "未提供描述";
+      const source = installedItem.url || installedItem.source || loadedItem.source || "--";
+      const installedAt = installedItem.installedAt ? fmtDate(installedItem.installedAt) : "--";
+      const isLoaded = loaded.some((item) => item.id === id);
+
+      return `
+        <div class="plugin-item">
+          <div class="plugin-item-main">
+            <div class="plugin-item-title">
+              <span>${esc(name)}</span>
+              <span class="badge ${isLoaded ? "badge-success" : "badge-warning"}">${isLoaded ? "已載入" : "待重啟載入"}</span>
+            </div>
+            <div class="plugin-item-desc">${esc(description)}</div>
+            <div class="plugin-meta">
+              <span>ID: <code>${esc(id)}</code></span>
+              <span>版本: <code>${esc(version)}</code></span>
+              <span>來源: ${esc(pluginKindLabel(installedItem.kind || (loadedItem.source ? "env" : "")))}</span>
+              <span>安裝時間: ${esc(installedAt)}</span>
+            </div>
+          </div>
+          <div class="plugin-path" title="${esc(source)}">${esc(source)}</div>
+        </div>`;
+    }).join("");
+
+    return `<div class="plugin-list">${items}</div>`;
+  }
+
+  async function pagePlugins() {
+    if (!state.user?.isAdmin) { location.hash = "#/dashboard"; return; }
+    const body = setPage("插件管理", "透過 Web 匯入 Node.js 插件；Bot 不提供插件配置入口");
+
+    body.innerHTML = `
+      <div class="usage-toolbar">
+        <button class="btn btn-ghost" id="btn-refresh-plugins">${ic.refresh} 刷新列表</button>
+        <span class="usage-updated">插件會安裝到 Node.js 執行環境，請只匯入信任來源。</span>
+      </div>
+      <div class="form-hint" style="margin-bottom:16px;">註：安裝第三方插件說明你信任第三方插件與本項目無關。</div>
+
+      <div class="plugin-install-grid">
+        <div class="card plugin-card">
+          <div class="card-title">${ic.download} 匯入本機插件檔案</div>
+          <div class="form-group">
+            <label for="plugin-file">插件入口檔</label>
+            <input type="file" id="plugin-file" accept=".js,.mjs">
+            <div class="form-hint">支援 .js / .mjs，大小上限 1MB。檔案內容會由伺服器端驗證後載入。</div>
+          </div>
+          <button class="btn btn-primary" id="btn-install-plugin-file">${ic.plug} 安裝檔案</button>
+        </div>
+
+        <div class="card plugin-card">
+          <div class="card-title">${ic.link} 從 GitHub 安裝</div>
+          <div class="form-group">
+            <label for="plugin-github-url">GitHub 連結</label>
+            <input type="url" id="plugin-github-url" placeholder="https://github.com/owner/repo 或 blob/raw .js">
+            <div class="form-hint">支援 GitHub repo、tree、blob 與 raw 連結；repo 會讀取 plugin.json 的 main 欄位。</div>
+          </div>
+          <button class="btn btn-primary" id="btn-install-plugin-github">${ic.download} 線上安裝</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">${ic.plug} 已安裝插件</div>
+        <div id="plugin-list-content">${loading("載入插件列表...")}</div>
+      </div>`;
+
+    const listContent = $("#plugin-list-content");
+    const refreshBtn = $("#btn-refresh-plugins");
+    const fileBtn = $("#btn-install-plugin-file");
+    const githubBtn = $("#btn-install-plugin-github");
+
+    const refresh = async () => {
+      if (refreshBtn) refreshBtn.disabled = true;
+      try {
+        const data = await API.get("/web/api/admin/plugins");
+        if (listContent) listContent.innerHTML = renderPluginStatusList(data.plugins || {});
+      } catch (err) {
+        if (listContent) listContent.innerHTML = errorState(err.message);
+      } finally {
+        if (refreshBtn) refreshBtn.disabled = false;
+      }
+    };
+
+    const installFromFile = async () => {
+      const input = $("#plugin-file");
+      const file = input?.files?.[0];
+      if (!file) { toast("請先選擇插件檔案", "warning"); return; }
+      if (!/\.m?js$/i.test(file.name)) { toast("只支援 .js 或 .mjs 插件檔", "error"); return; }
+      if (file.size > 1024 * 1024) { toast("插件檔案超過 1MB 上限", "error"); return; }
+
+      fileBtn.disabled = true;
+      try {
+        const content = await file.text();
+        const data = await API.post("/web/api/admin/plugins/upload", { filename: file.name, content });
+        toast(`插件已安裝：${data.plugin?.name || data.plugin?.id || file.name}`, "success");
+        input.value = "";
+        await refresh();
+      } catch (err) {
+        toast(err.message, "error");
+      } finally {
+        fileBtn.disabled = false;
+      }
+    };
+
+    const installFromGitHub = async () => {
+      const input = $("#plugin-github-url");
+      const url = input?.value?.trim();
+      if (!url) { toast("請輸入 GitHub 連結", "warning"); return; }
+
+      githubBtn.disabled = true;
+      try {
+        const data = await API.post("/web/api/admin/plugins/github", { url });
+        toast(`插件已安裝：${data.plugin?.name || data.plugin?.id || url}`, "success");
+        input.value = "";
+        await refresh();
+      } catch (err) {
+        toast(err.message, "error");
+      } finally {
+        githubBtn.disabled = false;
+      }
+    };
+
+    if (refreshBtn) refreshBtn.onclick = refresh;
+    if (fileBtn) fileBtn.onclick = installFromFile;
+    if (githubBtn) githubBtn.onclick = installFromGitHub;
+    await refresh();
   }
 
   // =========================================================================

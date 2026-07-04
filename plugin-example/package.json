@@ -1,0 +1,11 @@
+{
+  "name": "s12ryt-nodejs-plugin-example",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Detailed Node.js-only plugin example for s12ryt-tg-api",
+  "main": "dist/index.js",
+  "scripts": {
+    "check": "node --check dist/index.js"
+  }
+}

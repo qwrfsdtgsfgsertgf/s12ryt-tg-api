@@ -33,6 +33,7 @@ import { config } from "../config.js";
 import { preprocessThinking, parseModelThinkingSuffix } from "./thinkingParser.js";
 import { addApiLog, type ApiLogEntry } from "./apiLogStore.js";
 import webRouter from "../web/routes.js";
+import { bindPluginApp, getPluginRootRouter } from "../plugins/index.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -59,6 +60,10 @@ app.use("/web", webRouter);
 app.use(authMiddleware);
 app.use(rateLimitMiddleware);
 app.use(quotaCheckMiddleware);
+
+// Node.js plugins are opt-in and inherit the normal API auth/rate/quota chain.
+bindPluginApp(app);
+app.use("/plugins", getPluginRootRouter());
 
 // ---------------------------------------------------------------------------
 // Helper: write SSE chunk and immediately flush the socket

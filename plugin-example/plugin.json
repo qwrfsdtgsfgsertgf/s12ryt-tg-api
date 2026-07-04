@@ -1,0 +1,13 @@
+{
+  "name": "nodejs-example",
+  "version": "1.0.0",
+  "nodeOnly": true,
+  "main": "dist/index.js",
+  "routes": [
+    "GET /plugins/nodejs-example/status",
+    "POST /plugins/nodejs-example/echo"
+  ],
+  "commands": [
+    "/plugin_example"
+  ]
+}

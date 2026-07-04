@@ -1,8 +1,10 @@
 # s12ryt-tg-api
 
+> **維護狀態**：Python 版本已停止維護，目錄已改名為 [`python(not-supported)/`](python(not-supported)/) 作為歷史參考保留。後續功能、修復與文件更新以 Node.js 版本為主。
+
 透過 Telegram Bot 和 Web 控制台管理多個 AI API 供應商的聚合代理服務。支援 OpenAI、Anthropic、Google 等供應商，並對外提供統一的 OpenAI 相容 API 端點，讓你能用一套 API 金鑰存取所有 AI 模型。
 
-提供 **Python** 和 **Node.js** 兩種實作版本（Web 控制台目前僅 Node.js 版本支援）。
+目前維護 **Node.js** 實作版本；**Python** 版本已停止支援，僅保留於 `python(not-supported)/` 作為歷史參考。
 
 ## 特色
 
@@ -46,8 +48,8 @@
 - **權限查詢優化** — 單次 LEFT JOIN + 60s TTL 快取，每請求 DB 查詢從 ~10 降至 0-2
 
 ### 工程
-- **雙語言實作** — Python (FastAPI + python-telegram-bot) 與 Node.js (Express + grammY)
-- **完整測試** — 530 個單元 + 整合測試全部通過（Node.js 316 + Python 214）
+- **主要維護版本** — Node.js (Express + grammY)；Python (FastAPI + python-telegram-bot) 已停止維護並僅作歷史參考
+- **完整測試** — Node.js 測試持續維護；Python 舊測試保留於 `python(not-supported)/`，不再作為主要支援承諾
 - **CI/CD** — GitHub Actions 自動發布 Release（push to main 更新 `latest`，tag v*.*.* 建立 stable）
 - **低資源容器優化**（僅 Node.js）— 自動偵測可用記憶體，動態調整 V8 heap size、npm 並發與超時；更新流程加入磁碟/inode 預檢、舊暫存清理、devDependencies prune，適配低配 VPS / 容器
 
@@ -144,10 +146,12 @@ Web 控制台採用 **OTP + Session** 兩階段認證，無需獨立帳號密碼
 
 ## 快速開始
 
-### Python 版本
+### Python 版本（停止維護）
+
+> 此版本已停止維護，不建議新部署使用。以下指令僅供查閱舊版行為時參考。
 
 ```bash
-cd python
+cd "python(not-supported)"
 pip install -r requirements.txt
 cp .env.example .env   # 編輯 .env 填入你的設定值
 python main.py
@@ -390,7 +394,7 @@ s12ryt-tg-api/
 │   └── workflows/
 │       ├── release.yml              # GitHub Actions 自動發布（tag → Release + assets）
 │       └── nodejs-ci.yml            # Node.js CI（build + test + npm audit gate）
-├── python/                          # Python 版本
+├── python(not-supported)/           # Python 版本（已停止維護，僅作歷史參考）
 │   ├── main.py                      # 程式進入點
 │   ├── config.py                    # 環境變數配置
 │   ├── updater.py                   # 自動更新工具（從 GitHub Releases 拉取最新版）
@@ -486,7 +490,7 @@ s12ryt-tg-api/
 
 ## 技術棧
 
-| | Python 版本 | Node.js 版本 |
+| | Python 版本（停止維護） | Node.js 版本 |
 |---|---|---|
 | Bot 框架 | python-telegram-bot | grammY |
 | Web 框架 | FastAPI + Uvicorn | Express |

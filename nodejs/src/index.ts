@@ -17,6 +17,13 @@ import { registerLimitHandlers } from "./bot/handlers/limitHandlers.js";
 import { registerUpdateHandlers } from "./bot/handlers/updateHandlers.js";
 import { registerWebHandlers } from "./bot/handlers/webHandlers.js";
 import { registerBackupHandlers } from "./bot/handlers/backupHandlers.js";
+import {
+  getPluginBotCommands,
+  initializeNodeJsPlugins,
+  loadNodeJsPlugins,
+  shutdownNodeJsPlugins,
+  startNodeJsPlugins,
+} from "./plugins/index.js";
 
 import { Bot, Context, session } from "grammy";
 import type { BotCommand } from "grammy/types";
@@ -46,7 +53,7 @@ function validateConfig(): void {
 // Set bot commands
 // ---------------------------------------------------------------------------
 
-async function setBotCommands(bot: MyBot): Promise<void> {
+async function setBotCommands(bot: MyBot, pluginCommands: BotCommand[] = []): Promise<void> {
   // 普通用戶指令
   const userCommands: BotCommand[] = [
     { command: "start", description: "開始使用 Bot" },
@@ -76,7 +83,11 @@ async function setBotCommands(bot: MyBot): Promise<void> {
 
   try {
     // 設置所有私人聊天可見的指令（用戶 + 管理員全部）
-    await bot.api.setMyCommands([...userCommands, ...adminCommands]);
+    const commands = new Map<string, BotCommand>();
+    for (const command of [...userCommands, ...adminCommands, ...pluginCommands]) {
+      commands.set(command.command, command);
+    }
+    await bot.api.setMyCommands([...commands.values()]);
     console.log("[bot] Command menu set successfully");
   } catch (err: any) {
     console.error(`[bot] Failed to set commands: ${err.message}`);
@@ -173,13 +184,17 @@ async function main(): Promise<void> {
   registerWebHandlers(bot);
   registerBackupHandlers(bot);
 
+  await loadNodeJsPlugins(config.NODEJS_PLUGIN_PATHS);
+  await initializeNodeJsPlugins(bot);
+
   // 3.5 Set bot commands menu
-  await setBotCommands(bot);
+  await setBotCommands(bot, getPluginBotCommands());
 
   // 4. Start Express API server
   try {
     await startServer(config.API_PORT);
     console.log(`[api] API proxy server listening on port ${config.API_PORT}`);
+    await startNodeJsPlugins();
   } catch (err: any) {
     console.error(`[api] Failed to start API server: ${err.message}`);
     process.exit(1);
@@ -214,11 +229,16 @@ async function main(): Promise<void> {
 // ---------------------------------------------------------------------------
 
 function setupGracefulShutdown(): void {
+  let shuttingDown = false;
   const shutdown = (signal: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     console.log(`\n[shutdown] Received ${signal}, exiting gracefully...`);
-    stopTunnel();
-    closeDb();
-    process.exit(0);
+    void shutdownNodeJsPlugins().finally(() => {
+      stopTunnel();
+      closeDb();
+      process.exit(0);
+    });
   };
 
   process.on("SIGINT", () => shutdown("SIGINT"));
