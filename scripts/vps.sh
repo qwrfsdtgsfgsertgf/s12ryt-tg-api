@@ -27,6 +27,30 @@ die() { printf '[vps][error] %s\n' "$*" >&2; exit 1; }
 
 has_cmd() { command -v "$1" >/dev/null 2>&1; }
 
+read_input() {
+  local prompt="$1"
+  local __var="$2"
+  local secret="${3:-false}"
+
+  if [ -r /dev/tty ]; then
+    printf '%s' "$prompt" >/dev/tty
+    if [ "$secret" = "true" ]; then
+      IFS= read -r -s "$__var" </dev/tty
+      printf '\n' >/dev/tty
+    else
+      IFS= read -r "$__var" </dev/tty
+    fi
+    return 0
+  fi
+
+  if [ "$secret" = "true" ]; then
+    read -r -s -p "$prompt" "$__var"
+    printf '\n' >&2
+  else
+    read -r -p "$prompt" "$__var"
+  fi
+}
+
 as_root() {
   if [ "$(id -u)" -eq 0 ]; then
     "$@"
@@ -41,22 +65,21 @@ prompt_default() {
   local prompt="$1"
   local default="$2"
   local value=""
-  read -r -p "$prompt [$default]: " value
+  read_input "$prompt [$default]: " value
   printf '%s' "${value:-$default}"
 }
 
 prompt_secret() {
   local prompt="$1"
   local value=""
-  read -r -s -p "$prompt: " value
-  printf '\n' >&2
+  read_input "$prompt: " value true
   printf '%s' "$value"
 }
 
 confirm_default_yes() {
   local prompt="$1"
   local answer=""
-  read -r -p "$prompt [Y/n]: " answer
+  read_input "$prompt [Y/n]: " answer
   case "$answer" in
     ""|y|Y|yes|YES) return 0 ;;
     *) return 1 ;;
@@ -69,13 +92,13 @@ choose_option() {
   local options=("$@")
   local i choice
 
-  printf '\n%s\n' "$prompt"
+  printf '\n%s\n' "$prompt" >&2
   for i in "${!options[@]}"; do
-    printf '  %s) %s\n' "$((i + 1))" "${options[$i]}"
+    printf '  %s) %s\n' "$((i + 1))" "${options[$i]}" >&2
   done
 
   while true; do
-    read -r -p "Choose [1-${#options[@]}]: " choice
+    read_input "Choose [1-${#options[@]}]: " choice
     if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#options[@]}" ]; then
       printf '%s' "${options[$((choice - 1))]}"
       return 0
