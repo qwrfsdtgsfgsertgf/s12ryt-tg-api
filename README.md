@@ -88,11 +88,24 @@ bash <(curl -fsSL https://raw.githubusercontent.com/s12ryt/s12ryt-tg-api/main/sc
 腳本支援：
 
 - 安裝或更新既有部署。
-- `systemd` 部署：自動準備 Node.js 22、安裝依賴、build、建立 service，並以非 root 使用者執行。
-- `docker` 部署：自動準備 Docker、pull GHCR image、重建 container，並掛載 `nodejs/data`；不需要 clone 倉庫。
+- `docker` 部署：自動準備 Docker、pull GHCR image、重建 container，預設只使用 `/opt/s12ryt-tg-api-docker` 存放 `.env` 與 `nodejs/data`；不會 clone 倉庫。
+- `systemd` 部署：自動準備 Node.js 22、clone/update 倉庫、安裝依賴、build、建立 service，並以非 root 使用者執行。
 - 互動填寫 `.env`，或讀取目前 shell 的 `BOT_TOKEN`、`ADMIN_ID`、`API_PORT` 等環境變數。
 
 腳本不會設定 HTTPS、Nginx 或 Cloudflare Tunnel；如需對外網域與 TLS，請在服務通過健康檢查後另外配置反向代理。
+
+### Docker Compose 範例
+
+專案根目錄提供 [`docker-compose.yml`](docker-compose.yml)，預設使用 `ghcr.io/s12ryt/s12ryt-tg-api:latest`，不會在 VPS 上 build image。
+
+```bash
+cp nodejs/.env.example .env
+# 編輯 .env，至少填入 BOT_TOKEN 與 ADMIN_ID
+docker compose up -d
+docker compose logs -f
+```
+
+Compose 會把 `./nodejs/data` 掛載到容器的 `/app/nodejs/data`，資料庫與 Web 安裝的插件資料會保留在主機上。
 
 ### Python 版本（停止維護）
 
