@@ -89,7 +89,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/s12ryt/s12ryt-tg-api/main/sc
 
 - 安裝或更新既有部署。
 - `systemd` 部署：自動準備 Node.js 22、安裝依賴、build、建立 service，並以非 root 使用者執行。
-- `docker` 部署：自動準備 Docker、build image、重建 container，並掛載 `nodejs/data`。
+- `docker` 部署：自動準備 Docker、pull GHCR image、重建 container，並掛載 `nodejs/data`；不需要 clone 倉庫。
 - 互動填寫 `.env`，或讀取目前 shell 的 `BOT_TOKEN`、`ADMIN_ID`、`API_PORT` 等環境變數。
 
 腳本不會設定 HTTPS、Nginx 或 Cloudflare Tunnel；如需對外網域與 TLS，請在服務通過健康檢查後另外配置反向代理。

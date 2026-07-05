@@ -8,7 +8,7 @@ SERVICE_NAME="${SERVICE_NAME:-s12ryt-tg-api}"
 SERVICE_USER="${SERVICE_USER:-s12ryt}"
 SERVICE_GROUP="${SERVICE_GROUP:-s12ryt}"
 NODE_VERSION="${NODE_VERSION:-22.17.1}"
-DOCKER_IMAGE="${DOCKER_IMAGE:-s12ryt-tg-api:local}"
+DOCKER_IMAGE="${DOCKER_IMAGE:-ghcr.io/s12ryt/s12ryt-tg-api:latest}"
 DOCKER_CONTAINER="${DOCKER_CONTAINER:-s12ryt-tg-api}"
 
 RUNNER=""
@@ -152,13 +152,26 @@ install_base_packages() {
   log "Detected package manager: $PACKAGE_MANAGER"
 
   case "$PACKAGE_MANAGER" in
-    apt) install_packages ca-certificates curl git tar xz-utils ;;
-    dnf|yum) install_packages ca-certificates curl git tar xz ;;
-    pacman) install_packages ca-certificates curl git tar xz ;;
-    apk) install_packages ca-certificates curl git tar xz ;;
-    zypper) install_packages ca-certificates curl git tar xz ;;
+    apt)
+      if [ "$DEPLOY_MODE" = "docker" ]; then
+        install_packages ca-certificates curl
+      else
+        install_packages ca-certificates curl git tar xz-utils
+      fi
+      ;;
+    dnf|yum|pacman|apk|zypper)
+      if [ "$DEPLOY_MODE" = "docker" ]; then
+        install_packages ca-certificates curl
+      else
+        install_packages ca-certificates curl git tar xz
+      fi
+      ;;
     *)
-      for cmd in curl git tar; do has_cmd "$cmd" || die "Missing required command: $cmd"; done
+      if [ "$DEPLOY_MODE" = "docker" ]; then
+        for cmd in curl; do has_cmd "$cmd" || die "Missing required command: $cmd"; done
+      else
+        for cmd in curl git tar; do has_cmd "$cmd" || die "Missing required command: $cmd"; done
+      fi
       ;;
   esac
 }
@@ -318,6 +331,14 @@ sync_repo() {
   fi
 }
 
+prepare_docker_app_dir() {
+  APP_DIR="$(prompt_default "Docker config/data directory" "$APP_DIR")"
+  validate_app_dir
+  prepare_app_dir_for_runner
+  mkdir -p "$APP_DIR/nodejs/data"
+  log "Using Docker config/data directory: $APP_DIR"
+}
+
 write_env_file() {
   local env_file="$APP_DIR/nodejs/.env"
   local bot_token admin_id api_port default_api_url database_path memory_limit
@@ -434,10 +455,9 @@ deploy_systemd() {
 
 deploy_docker() {
   ensure_docker
-  cd "$APP_DIR"
 
-  log "Building Docker image: $DOCKER_IMAGE"
-  as_root docker build -t "$DOCKER_IMAGE" .
+  log "Pulling Docker image: $DOCKER_IMAGE"
+  as_root docker pull "$DOCKER_IMAGE"
 
   if as_root docker ps -a --format '{{.Names}}' | grep -Fxq "$DOCKER_CONTAINER"; then
     log "Removing existing Docker container: $DOCKER_CONTAINER"
@@ -496,11 +516,12 @@ EOF
 
 main() {
   log "s12ryt-tg-api VPS installer/updater"
-  install_base_packages
 
   ACTION="$(choose_option "What do you want to do?" "Install or reinstall" "Update existing deployment")"
   DEPLOY_MODE="$(choose_option "Choose deployment mode" "systemd" "docker")"
   ENV_MODE="$(choose_option "How should .env be filled?" "Interactive input" "Use current environment variables")"
+
+  install_base_packages
 
   case "$DEPLOY_MODE" in
     systemd)
@@ -511,7 +532,11 @@ main() {
     *) die "Unknown deployment mode: $DEPLOY_MODE" ;;
   esac
 
-  sync_repo
+  if [ "$DEPLOY_MODE" = "systemd" ]; then
+    sync_repo
+  else
+    prepare_docker_app_dir
+  fi
   write_env_file
 
   if [ "$DEPLOY_MODE" = "systemd" ]; then
