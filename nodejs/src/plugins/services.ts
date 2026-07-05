@@ -1,3 +1,20 @@
+/**
+ * Public plugin services facade (`context.services`).
+ *
+ * Language convention (see manager.ts header for the full rule): every
+ * thrown message in this file describes a *plugin author's contract*
+ * violation (invalid name/key, non-serializable storage value, wrong
+ * handler type, out-of-range timer delay, missing auth) — these are
+ * part of the developer-facing services API, so they stay in English.
+ * Several exact substrings are asserted on by
+ * nodejs/tests/pluginServices.test.ts (`/exceeds/`, `/at least/`,
+ * `/Trusted/`, `/Authenticated/`) — do not reword them.
+ *
+ * Event and timer bookkeeping lives in pluginEventBus.ts /
+ * pluginTimerRegistry.ts; this file only builds the public per-plugin
+ * service facades on top of those (plus direct DB/provider lookups).
+ */
+
 import type { Request } from "express";
 import { config } from "../config.js";
 import type { AuthInfo } from "../api/middleware.js";
@@ -24,16 +41,15 @@ import {
   type Provider,
   type User,
 } from "../db/database.js";
+import { pluginEventBus, type PluginEventHandler, type PluginUnsubscribe } from "./pluginEventBus.js";
+import { pluginTimerRegistry } from "./pluginTimerRegistry.js";
 import type { PluginLogger } from "./types.js";
+
+export type { PluginEventHandler, PluginUnsubscribe } from "./pluginEventBus.js";
 
 const NAME_PATTERN = /^[A-Za-z0-9._:-]+$/;
 const MAX_NAME_LENGTH = 128;
 const MAX_STORAGE_VALUE_BYTES = 256 * 1024;
-const MIN_TIMER_MS = 1000;
-const MAX_TIMER_MS = 2_147_483_647;
-
-export type PluginEventHandler<T = unknown> = (payload: T) => unknown | Promise<unknown>;
-export type PluginUnsubscribe = () => void;
 
 export type PublicUser = {
   id: number;
@@ -154,18 +170,10 @@ export type PluginServices = Readonly<{
   db: Readonly<PluginDbService>;
 }>;
 
-type EventListener = {
-  pluginId: string;
-  handler: PluginEventHandler;
-  once: boolean;
-  logger: PluginLogger;
-};
-type TimerHandle = ReturnType<typeof globalThis.setTimeout>;
-type TimerRecord = { handle: TimerHandle; interval: boolean };
-
-const eventListeners = new Map<string, EventListener[]>();
-const pluginTimers = new Map<string, Map<string, TimerRecord>>();
-let nextTimerId = 0;
+/** Shared `Object.freeze` wrapper for every read-only public value this module hands to plugins. */
+function freezePublic<T>(value: T): Readonly<T> {
+  return Object.freeze(value);
+}
 
 function validateName(kind: string, value: string): void {
   if (!value || value.length > MAX_NAME_LENGTH || !NAME_PATTERN.test(value)) {
@@ -189,14 +197,6 @@ function parseJsonValue<T>(raw: string): T {
   return JSON.parse(raw) as T;
 }
 
-function normalizeTimerMs(value: number, label: string): number {
-  if (!Number.isFinite(value)) throw new Error(`${label} must be a finite number`);
-  const integer = Math.floor(value);
-  if (integer < MIN_TIMER_MS) throw new Error(`${label} must be at least ${MIN_TIMER_MS}ms`);
-  if (integer > MAX_TIMER_MS) throw new Error(`${label} exceeds the maximum timer delay`);
-  return integer;
-}
-
 function normalizeDbId(value: number | string, label: string): number {
   const normalized = typeof value === "string" ? Number(value) : value;
   if (!Number.isSafeInteger(normalized) || normalized <= 0) {
@@ -210,26 +210,9 @@ function normalizeOptionalDbId(value: number | string | null | undefined, label:
   return normalizeDbId(value, label);
 }
 
-function getPluginTimerMap(pluginId: string): Map<string, TimerRecord> {
-  let timers = pluginTimers.get(pluginId);
-  if (!timers) {
-    timers = new Map();
-    pluginTimers.set(pluginId, timers);
-  }
-  return timers;
-}
-
-function removeEventListener(eventName: string, listener: EventListener): void {
-  const listeners = eventListeners.get(eventName);
-  if (!listeners) return;
-  const next = listeners.filter((item) => item !== listener);
-  if (next.length === 0) eventListeners.delete(eventName);
-  else eventListeners.set(eventName, next);
-}
-
 function toPublicUser(user: User | undefined): PublicUser | null {
   if (!user) return null;
-  return Object.freeze({
+  return freezePublic({
     id: user.id,
     tgUserId: user.tg_user_id,
     username: user.username,
@@ -243,7 +226,7 @@ function maskApiKey(key: string): string {
 }
 
 function toPublicApiKeyPreview(apiKey: ApiKey): PublicApiKeyPreview {
-  return Object.freeze({
+  return freezePublic({
     id: apiKey.id,
     userId: apiKey.user_id,
     preview: maskApiKey(apiKey.key),
@@ -258,13 +241,13 @@ function splitModels(models: string): string[] {
 
 function toPublicProvider(provider: Provider | undefined): PublicProvider | null {
   if (!provider) return null;
-  return Object.freeze({
+  return freezePublic({
     id: provider.id,
     name: provider.name,
     apiType: provider.api_type,
     userAgent: provider.user_agent,
     keyStrategy: provider.key_strategy,
-    models: Object.freeze(splitModels(provider.models)) as string[],
+    models: freezePublic(splitModels(provider.models)) as string[],
     enabled: provider.enabled === 1,
     inputPrice: provider.input_price,
     outputPrice: provider.output_price,
@@ -274,7 +257,7 @@ function toPublicProvider(provider: Provider | undefined): PublicProvider | null
 }
 
 function toPublicModelPrice(price: ModelPrice): PublicModelPrice {
-  return Object.freeze({
+  return freezePublic({
     id: price.id,
     providerId: price.provider_id,
     model: price.model,
@@ -286,7 +269,7 @@ function toPublicModelPrice(price: ModelPrice): PublicModelPrice {
 }
 
 function toPublicModelMapping(mapping: ModelMapping): PublicModelMapping {
-  return Object.freeze({
+  return freezePublic({
     providerId: mapping.provider_id,
     providerName: mapping.provider_name,
     originalModel: mapping.original_model,
@@ -302,7 +285,7 @@ function createAuthService(): PluginAuthService {
     return user?.is_active === 1;
   };
 
-  return Object.freeze({
+  return freezePublic({
     isAdminTelegramUser(tgUserId) {
       return tgUserId === config.ADMIN_ID;
     },
@@ -331,7 +314,7 @@ function createStorageService(pluginId: string): PluginStorageService {
     return Boolean(row && row.values.length > 0);
   };
 
-  return Object.freeze({
+  return freezePublic({
     get<T = unknown>(key: string): T | null {
       validateName("storage key", key);
       ensureStorageTable();
@@ -382,93 +365,49 @@ function createStorageService(pluginId: string): PluginStorageService {
 }
 
 function createEventsService(pluginId: string, logger: PluginLogger): PluginEventsService {
-  return Object.freeze({
+  return freezePublic({
     on<T = unknown>(eventName: string, handler: PluginEventHandler<T>): PluginUnsubscribe {
       validateName("event name", eventName);
       if (typeof handler !== "function") throw new Error("event handler must be a function");
-      const listener: EventListener = { pluginId, handler: handler as PluginEventHandler, once: false, logger };
-      const listeners = eventListeners.get(eventName) ?? [];
-      listeners.push(listener);
-      eventListeners.set(eventName, listeners);
-      return () => removeEventListener(eventName, listener);
+      return pluginEventBus.addListener(eventName, { pluginId, handler: handler as PluginEventHandler, once: false, logger });
     },
     once<T = unknown>(eventName: string, handler: PluginEventHandler<T>): PluginUnsubscribe {
       validateName("event name", eventName);
       if (typeof handler !== "function") throw new Error("event handler must be a function");
-      const listener: EventListener = { pluginId, handler: handler as PluginEventHandler, once: true, logger };
-      const listeners = eventListeners.get(eventName) ?? [];
-      listeners.push(listener);
-      eventListeners.set(eventName, listeners);
-      return () => removeEventListener(eventName, listener);
+      return pluginEventBus.addListener(eventName, { pluginId, handler: handler as PluginEventHandler, once: true, logger });
     },
     async emit<T = unknown>(eventName: string, payload: T): Promise<void> {
       validateName("event name", eventName);
-      const listeners = [...(eventListeners.get(eventName) ?? [])];
-      for (const listener of listeners) {
-        try {
-          await listener.handler(payload);
-        } catch (err) {
-          listener.logger.error(`event handler failed: ${eventName}`, err);
-        } finally {
-          if (listener.once) removeEventListener(eventName, listener);
-        }
-      }
+      await pluginEventBus.emit(eventName, payload);
     },
     listenerCount(eventName: string): number {
       validateName("event name", eventName);
-      return eventListeners.get(eventName)?.length ?? 0;
+      return pluginEventBus.listenerCount(eventName);
     },
   });
 }
 
 function createSchedulerService(pluginId: string, logger: PluginLogger): PluginSchedulerService {
-  return Object.freeze({
+  return freezePublic({
     setTimeout(handler, delayMs) {
       if (typeof handler !== "function") throw new Error("timer handler must be a function");
-      const normalizedDelay = normalizeTimerMs(delayMs, "delayMs");
-      const timerId = `${pluginId}:${++nextTimerId}`;
-      const handle = globalThis.setTimeout(async () => {
-        getPluginTimerMap(pluginId).delete(timerId);
-        try {
-          await handler();
-        } catch (err) {
-          logger.error(`scheduled timeout failed: ${timerId}`, err);
-        }
-      }, normalizedDelay);
-      getPluginTimerMap(pluginId).set(timerId, { handle, interval: false });
-      return timerId;
+      return pluginTimerRegistry.setTimeout(pluginId, handler, delayMs, logger);
     },
     setInterval(handler, intervalMs) {
       if (typeof handler !== "function") throw new Error("timer handler must be a function");
-      const normalizedInterval = normalizeTimerMs(intervalMs, "intervalMs");
-      const timerId = `${pluginId}:${++nextTimerId}`;
-      const handle = globalThis.setInterval(async () => {
-        try {
-          await handler();
-        } catch (err) {
-          logger.error(`scheduled interval failed: ${timerId}`, err);
-        }
-      }, normalizedInterval);
-      getPluginTimerMap(pluginId).set(timerId, { handle, interval: true });
-      return timerId;
+      return pluginTimerRegistry.setInterval(pluginId, handler, intervalMs, logger);
     },
     clear(timerId) {
-      const timers = getPluginTimerMap(pluginId);
-      const timer = timers.get(timerId);
-      if (!timer) return false;
-      if (timer.interval) globalThis.clearInterval(timer.handle);
-      else globalThis.clearTimeout(timer.handle);
-      timers.delete(timerId);
-      return true;
+      return pluginTimerRegistry.clear(pluginId, timerId);
     },
     clearAll() {
-      cleanupPluginTimers(pluginId);
+      pluginTimerRegistry.clearAllForPlugin(pluginId);
     },
   });
 }
 
 function createProvidersService(): PluginProvidersService {
-  return Object.freeze({
+  return freezePublic({
     list(options = {}) {
       return getProviders(Boolean(options.enabledOnly)).map((provider) => toPublicProvider(provider)).filter((provider): provider is PublicProvider => provider !== null);
     },
@@ -476,12 +415,12 @@ function createProvidersService(): PluginProvidersService {
       return toPublicProvider(getProviderById(id));
     },
     listModels() {
-      return Object.freeze([...getAllCachedModelNames()]) as string[];
+      return freezePublic([...getAllCachedModelNames()]) as string[];
     },
     lookupModel(modelName) {
       const provider = lookupModelCached(modelName);
       if (!provider) return null;
-      return Object.freeze({
+      return freezePublic({
         providerId: provider.providerId,
         providerName: provider.providerName,
         apiType: provider.providerType,
@@ -502,7 +441,7 @@ function createProvidersService(): PluginProvidersService {
 }
 
 function createDbService(): PluginDbService {
-  return Object.freeze({
+  return freezePublic({
     getUserByTelegramId(tgUserId) {
       return toPublicUser(getUserByTgId(tgUserId));
     },
@@ -530,28 +469,10 @@ function createDbService(): PluginDbService {
   });
 }
 
-function cleanupPluginTimers(pluginId: string): void {
-  const timers = pluginTimers.get(pluginId);
-  if (!timers) return;
-  for (const timer of timers.values()) {
-    if (timer.interval) globalThis.clearInterval(timer.handle);
-    else globalThis.clearTimeout(timer.handle);
-  }
-  timers.clear();
-  pluginTimers.delete(pluginId);
-}
-
-function cleanupPluginEvents(pluginId: string): void {
-  for (const [eventName, listeners] of eventListeners.entries()) {
-    const next = listeners.filter((listener) => listener.pluginId !== pluginId);
-    if (next.length === 0) eventListeners.delete(eventName);
-    else eventListeners.set(eventName, next);
-  }
-}
-
+/** Builds the full per-plugin `context.services` facade. */
 export function createPluginServices(pluginId: string, logger: PluginLogger): PluginServices {
   validateName("plugin id", pluginId);
-  const services: PluginServices = Object.freeze({
+  const services: PluginServices = freezePublic({
     auth: createAuthService(),
     storage: createStorageService(pluginId),
     events: createEventsService(pluginId, logger),
@@ -562,12 +483,13 @@ export function createPluginServices(pluginId: string, logger: PluginLogger): Pl
   return services;
 }
 
+/** Releases a plugin's timers/event listeners, or (with no `pluginId`) resets all plugin state — used at shutdown and by tests. */
 export function cleanupPluginServices(pluginId?: string): void {
   if (pluginId) {
-    cleanupPluginTimers(pluginId);
-    cleanupPluginEvents(pluginId);
+    pluginTimerRegistry.clearAllForPlugin(pluginId);
+    pluginEventBus.removeAllForPlugin(pluginId);
     return;
   }
-  for (const id of [...pluginTimers.keys()]) cleanupPluginTimers(id);
-  eventListeners.clear();
+  pluginTimerRegistry.clearAll();
+  pluginEventBus.clear();
 }
