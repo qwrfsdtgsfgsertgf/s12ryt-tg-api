@@ -100,6 +100,76 @@ function resolvePluginPath(source: string): string {
   return path.isAbsolute(source) ? source : path.resolve(process.cwd(), source);
 }
 
+async function readEntryFromJson(filePath: string, fields: string[]): Promise<string | null> {
+  try {
+    const raw = await fs.readFile(filePath, "utf8");
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    for (const field of fields) {
+      const value = parsed[field];
+      if (typeof value === "string" && value.trim()) return value.trim();
+    }
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      console.warn(`[plugins] Failed to read ${filePath}:`, err);
+    }
+  }
+  return null;
+}
+
+async function resolvePluginEntryPath(source: string): Promise<string | null> {
+  const absolutePath = resolvePluginPath(source);
+  let stat;
+
+  try {
+    stat = await fs.stat(absolutePath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      console.warn(`[plugins] Skipping ${absolutePath}: path does not exist.`);
+      return null;
+    }
+    throw err;
+  }
+
+  if (stat.isDirectory()) {
+    const pluginMain = await readEntryFromJson(path.join(absolutePath, "plugin.json"), ["main"]);
+    const packageMain = await readEntryFromJson(path.join(absolutePath, "package.json"), ["module", "main"]);
+    const candidates = [
+      pluginMain,
+      packageMain,
+      "index.mjs",
+      "index.js",
+    ].filter((item): item is string => typeof item === "string" && item.length > 0);
+
+    for (const candidate of candidates) {
+      const entryPath = path.resolve(absolutePath, candidate);
+      const ext = path.extname(entryPath).toLowerCase();
+      if (ext !== ".js" && ext !== ".mjs") continue;
+      try {
+        const entryStat = await fs.stat(entryPath);
+        if (entryStat.isFile()) return entryPath;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+      }
+    }
+
+    console.warn(`[plugins] Skipping ${absolutePath}: directory has no .js/.mjs entry file.`);
+    return null;
+  }
+
+  if (!stat.isFile()) {
+    console.warn(`[plugins] Skipping ${absolutePath}: path is not a regular file.`);
+    return null;
+  }
+
+  const ext = path.extname(absolutePath).toLowerCase();
+  if (ext !== ".js" && ext !== ".mjs") {
+    console.warn(`[plugins] Skipping ${absolutePath}: plugin entry must be a .js or .mjs file.`);
+    return null;
+  }
+
+  return absolutePath;
+}
+
 function validatePlugin(candidate: unknown, source: string): NodeJsPlugin {
   if (!candidate || typeof candidate !== "object") {
     throw new Error(`Plugin at ${source} must export an object`);
@@ -241,7 +311,9 @@ export async function loadNodeJsPlugins(pluginPaths: string[] = config.NODEJS_PL
   const ids = new Set<string>();
 
   for (const item of sources) {
-    const absolutePath = resolvePluginPath(item.source);
+    const absolutePath = await resolvePluginEntryPath(item.source);
+    if (!absolutePath) continue;
+
     try {
       const loaded = await importPluginFromPath(absolutePath);
       if (ids.has(loaded.id) || loadedPlugins.some((plugin) => plugin.id === loaded.id)) {

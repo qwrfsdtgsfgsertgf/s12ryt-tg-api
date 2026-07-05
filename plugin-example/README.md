@@ -37,6 +37,8 @@ Web 安裝會把插件保存到 Node.js 的 `data/plugins/`，並寫入 manifest
 NODEJS_PLUGIN_PATHS=../plugin-example/dist/index.js
 ```
 
+`NODEJS_PLUGIN_PATHS` 可以指向存在的 `.js` / `.mjs` 入口檔，也可以指向包含 `plugin.json` 的插件目錄；目錄模式會依序尋找 `plugin.json` 的 `main`、`package.json` 的 `module` / `main`、`index.mjs`、`index.js`。路徑不存在或不是可載入入口時，主程式會略過該項並印出警告。
+
 也可以用逗號或分號載入多個插件：
 
 ```env
