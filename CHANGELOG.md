@@ -2,6 +2,23 @@
 
 所有版本變更記錄。本檔案由 `npm run release` 自動維護。
 
+## [1.8.5] - 2026-07-05
+
+### ✨ Features
+- demonstrate plugin services (56a5a10)
+- add stable plugin services (1f5447a)
+- add plugin management system (3fb9324)
+- add system usage monitor (b6da843)
+
+### 🐛 Bug Fixes
+- improve console accessibility and responsive layout (c8fa1f1)
+
+### 📝 Documentation
+- reorganize root readme (45be151)
+- document plugin services (2057467)
+- point to local plugin example (d5dd975)
+- link standalone plugin example (b96790d)
+
 ## [1.8.4] - 2026-07-02
 
 ### 🐛 Bug Fixes
