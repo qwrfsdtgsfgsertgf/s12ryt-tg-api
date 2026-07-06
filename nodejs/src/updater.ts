@@ -213,6 +213,14 @@ export interface UpdateResult {
   newHash?: string;
 }
 
+/**
+ * 更新方法選擇。
+ * - `auto`（預設）：自動偵測，有預編譯包走 prebuilt，否則走 Blue-Green
+ * - `prebuilt`：強制使用預編譯包，若 Release 無 prebuilt asset 則報錯
+ * - `blue-green`：強制走源碼 tarball + npm install + build
+ */
+export type UpdateMethod = "auto" | "prebuilt" | "blue-green";
+
 export interface BackupInfo {
   /** 備份目錄名稱（例如 ".backup-1718534400000"） */
   name: string;
@@ -1166,25 +1174,43 @@ export async function performPrebuiltUpdate(
 }
 
 /**
- * 執行更新（自動偵測最佳路徑）
+ * 執行更新
  *
- * 優先順序：
- *   1. 預編譯包（prebuilt）— 最快，零 install 零 build，適用於容器/低資源環境
- *   2. Blue-Green（源碼 tarball + npm install + build）— fallback，舊版本 Release 用
+ * @param onProgress 進度回呼（可選）
+ * @param method 更新方法選擇（預設 "auto"）
+ *   - `auto`：自動偵測，有預編譯包走 prebuilt，否則走 Blue-Green
+ *   - `prebuilt`：強制預編譯包，若 Release 無 prebuilt asset 則回傳失敗
+ *   - `blue-green`：強制源碼 tarball + npm install + build
  */
 export async function performUpdate(
   onProgress?: ProgressCallback,
+  method: UpdateMethod = "auto",
 ): Promise<UpdateResult> {
   const release = await getLatestRelease();
 
-  // 優先使用預編譯包
+  // 強制 Blue-Green
+  if (method === "blue-green") {
+    console.log("[updater] 用戶指定 Blue-Green 更新路徑");
+    const tarballUrl = release?.tarballUrl ?? `${GITHUB_API_BASE}/tarball/main`;
+    return performBlueGreenUpdate(tarballUrl, onProgress);
+  }
+
+  // 預編譯包（auto 偵測或 prebuilt 強制）
   const prebuiltAsset = findPrebuiltAsset(release);
   if (prebuiltAsset) {
     console.log(`[updater] 偵測到預編譯包：${prebuiltAsset.name}，使用輕量更新路徑`);
     return performPrebuiltUpdate(prebuiltAsset, onProgress);
   }
 
-  // Fallback: Blue-Green（源碼 + 編譯）
+  // 無預編譯包
+  if (method === "prebuilt") {
+    return {
+      success: false,
+      message: "此 Release 沒有預編譯包（prebuilt asset），無法使用預編譯更新路徑，請改用 Blue-Green。",
+    };
+  }
+
+  // auto fallback: Blue-Green（源碼 + 編譯）
   console.log("[updater] 此 Release 沒有預編譯包，使用 Blue-Green 更新路徑");
   const tarballUrl = release?.tarballUrl ?? `${GITHUB_API_BASE}/tarball/main`;
   return performBlueGreenUpdate(tarballUrl, onProgress);

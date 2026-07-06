@@ -2933,6 +2933,22 @@
           let updateHtml = "";
           if (checkData.hasUpdate) {
             const release = checkData.latestRelease;
+            // 偵測 Release 是否提供預編譯包（prebuilt asset）
+            const hasPrebuilt = Array.isArray(release?.assets) && release.assets.some(a => {
+              const name = a.name || "";
+              const url = a.browser_download_url || a.url || "";
+              return name === "s12ryt-tg-api-dist.tar.gz"
+                || /s12ryt-tg-api-dist.*\.tar\.gz$/i.test(name)
+                || /s12ryt-tg-api-dist.*\.tar\.gz$/i.test(url);
+            });
+            // 更新方式標籤（純文字，不用 emoji）
+            const methodLabel = (m) => {
+              if (m === "prebuilt") return "預編譯包（零編譯快速更新）";
+              if (m === "blue-green") return "Blue-Green 原子交換";
+              if (m === "tarball") return "tarball 下載";
+              if (m === "git") return "git pull";
+              return m;
+            };
             updateHtml = `
               <div style="padding:12px;background:var(--bg-accent);border-radius:8px;margin-bottom:12px;">
                 <p>${ic.sparkles} <strong>有新版本可用！</strong></p>
@@ -2940,21 +2956,26 @@
                 <p style="font-size:12px;color:var(--text-secondary);">${esc(release?.name || "")}</p>
                 ${checkData.commitsBehind > 0 ? `<p style="font-size:12px;color:var(--text-secondary);">落後 ${checkData.commitsBehind} 個 commit</p>` : ""}
               </div>
-              <button class="btn btn-primary" id="btn-do-update">立即更新並重啟</button>
+              <div class="hint" style="margin-bottom:8px;">選擇更新方式：</div>
+              <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                ${hasPrebuilt ? `<button class="btn btn-primary" id="btn-update-prebuilt">${ic.download} 預編譯包（快速，零編譯）</button>` : ""}
+                <button class="btn ${hasPrebuilt ? "btn-secondary" : "btn-primary"}" id="btn-update-bluegreen">${ic.refresh} Blue-Green（源碼編譯）</button>
+              </div>
             `;
             resultDiv.innerHTML = updateHtml;
 
-            $("#btn-do-update").onclick = () => {
-              confirm("確定要更新並重啟嗎？更新期間服務會短暫中斷。", async () => {
-                const updateBtn = $("#btn-do-update");
-                updateBtn.disabled = true;
-                updateBtn.textContent = "更新中...";
+            const runUpdate = (method) => {
+              confirm(`確定要使用${method === "prebuilt" ? "預編譯包" : "Blue-Green"}方式更新並重啟嗎？更新期間服務會短暫中斷。`, async () => {
+                // 停用所有更新按鈕，避免重複點擊；被點的按鈕顯示進度
+                const targetBtn = method === "prebuilt" ? $("#btn-update-prebuilt") : $("#btn-update-bluegreen");
+                resultDiv.querySelectorAll("button[id^='btn-update-']").forEach(b => { b.disabled = true; });
+                if (targetBtn) targetBtn.textContent = "更新中...";
                 try {
-                  const updateData = await API.post("/web/api/admin/update", { restart: true });
+                  const updateData = await API.post("/web/api/admin/update", { method, restart: true });
                   resultDiv.innerHTML = `
                     <div style="padding:12px;background:var(--bg-accent);border-radius:8px;">
                       <p>${updateData.success ? ic.check : ic.alert} ${esc(updateData.message)}</p>
-                      ${updateData.method ? `<p style="font-size:12px;">更新方式: ${esc(updateData.method === "blue-green" ? "🔄 Blue-Green 原子交換" : updateData.method === "tarball" ? "📦 tarball 下載" : "📥 git pull")}</p>` : ""}
+                      ${updateData.method ? `<p style="font-size:12px;">更新方式: ${esc(methodLabel(updateData.method))}</p>` : ""}
                       <p style="font-size:12px;color:var(--text-secondary);">如果頁面沒有自動重連，請稍後手動刷新。</p>
                     </div>
                   `;
@@ -2965,6 +2986,9 @@
                 }
               });
             };
+            const prebuiltBtn = $("#btn-update-prebuilt");
+            if (prebuiltBtn) prebuiltBtn.onclick = () => runUpdate("prebuilt");
+            $("#btn-update-bluegreen").onclick = () => runUpdate("blue-green");
           } else {
             resultDiv.innerHTML = `<div style="padding:12px;background:var(--bg-accent);border-radius:8px;"><p>${ic.check} 已是最新版本</p></div>`;
             toast("已是最新版本", "success");

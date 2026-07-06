@@ -1699,7 +1699,11 @@ router.get("/api/admin/check-update", async (_req: Request, res: Response) => {
 /** POST /web/api/admin/update — 執行更新 */
 router.post("/api/admin/update", async (req: Request, res: Response) => {
   try {
-    const result = await performUpdate();
+    // 接受前端指定更新方法（auto / prebuilt / blue-green），非法值回退 auto
+    const rawMethod = req.body?.method;
+    const method: "auto" | "prebuilt" | "blue-green" =
+      rawMethod === "prebuilt" || rawMethod === "blue-green" ? rawMethod : "auto";
+    const result = await performUpdate(undefined, method);
     // 如果成功且需要重啟
     if (result.success && req.body.restart !== false) {
       res.json({ ...result, willRestart: true });
