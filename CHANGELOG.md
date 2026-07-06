@@ -2,6 +2,12 @@
 
 所有版本變更記錄。本檔案由 `npm run release` 自動維護。
 
+## [1.8.7] - 2026-07-06
+
+### ✨ Features
+- choose update method in system page (6251963)
+- prebuilt bundle update path (CI builds dist, update deploys in seconds) (9de2212)
+
 ## [1.8.6] - 2026-07-06
 
 ### ✨ Features

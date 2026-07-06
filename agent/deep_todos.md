@@ -1,5 +1,17 @@
 # Deep Todos
 
+## 2026-07-06 - 串流 token usage 注入與輸入 token 估算修復
+
+- [x] **串流客戶端斷線資源洩漏修復**（commit `1c7cc83`）：`forwardStreamAndExtractUsage` 和 `extractUsageFromProviderStream`（server.ts）加上 `res?: Response` 參數 + `res.on('close', onClientClose)` 監聽；前者改用手動 `iterator = stream[Symbol.asyncIterator]()` + `while` 迴圈以便呼叫 `iterator.return()`，後者複用既有冪等的 `cancelProviderStream()`。5 個呼叫點全部傳入 `res`（chat/completions forward ~L810、responses 直通 forward ~L957、messages 直通 forward ~L1296、responses 轉換 extract ~L1124、messages 轉換 extract ~L1426）。provider 端 streaming generator 已有完整 `finally`（`requestTimeout.abort()` + `reader.cancel()` + `reader.releaseLock()`），無需改動。
+- [x] **輸入 token 估算補全 — tools/functions**（commit `34919b3`）：`extractInputTextFromBody`（usageTracker.ts）纳入 `JSON.stringify(body.tools)` 與 `JSON.stringify(body.functions)`，解決含工具定義的請求 input token 嚴重低報。
+- [x] **輸入 token 估算補全 — Anthropic 欄位**（commit `976e7ff`）：`extractInputTextFromBody` 處理 `body.system`（string 或 array）、`tool_result` content blocks、`tool_use` name+input blocks。
+- [x] **Chat completions SSE usage 注入**（commit `6f66e5d`）：`forwardStreamAndExtractUsage` 攔截 `data: [DONE]`，provider 未返回 usage 時跑 fallback token 估算並注入合成 usage chunk。改用 SSE 行級 forwarding（decode→split→rejoin→encode）取代 raw byte 透傳，以便攔截終止事件。
+- [x] **Anthropic messages SSE usage 注入**（commit `57056de`）：攔截 `event: message_stop` + 對應 data，注入合成 `message_delta`（帶 `input_tokens`/`output_tokens`）後再 forward `message_stop`。同時修復 messages 直通呼叫點（~L1340）原本漏傳 `res` 參數的問題。
+- [x] **Responses + 轉換路徑 usage 注入**（commit `20f9af7`）：Responses 直通路徑攔截 `event: response.completed`，patch JSON 補 usage。轉換路徑（`extractUsageFromProviderStream`）將 fake chat-completions 格式 usage chunk 注入 passThrough stream，converter（streamResponsesApi/streamAnthropicApi）自動讀取並以各自格式發出，converter 程式碼零改動。
+- [x] **新增 `full_request_integration.test.ts`**（commit `c30bebe`）：用真實 194KB 請求（110 個 tools）驗證，BPE=32,422 tokens、heuristic=35,560 tokens、tools 占輸入 85.4%；量化修復前後差異（舊估算 5,188 vs 新估算 35,560，漏報 85.4%）。
+- [x] **CI 修復**（commit `5901f24`）：`full_request_integration.test.ts` 在 CI 因 vitest `describe.skipIf` 仍執行 factory 函數（用來收集 test 定義）導致 `readFileSync` 拋 ENOENT。用 `existsSync` 結果保護 factory 內檔案讀取，檔案不存在時 factory 為 no-op。
+- [x] 驗證：本地 401 測試全通過（394 base + 7 integration），`tsc` build 通過。
+
 ## 2026-07-05 - 插件系統優雅化重構（拆分 manager.ts/services.ts 全域狀態）
 
 - [x] 盤點 `nodejs/src/plugins/` 現況（`manager.ts` 430 行、`services.ts` 573 行皆含大量 module-level 可變全域狀態）與對外使用點（`nodejs/src/index.ts`、`nodejs/src/api/server.ts`、`nodejs/src/web/routes.ts`）。
