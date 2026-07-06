@@ -467,6 +467,8 @@ export async function forwardStreamAndExtractUsage(
   let outputText = "";
   let providerReturnedUsage = false;
   let donePending = false; // [DONE] intercepted; forwarded after usage injection
+  let messageStopPending = false; // Anthropic message_stop intercepted
+  let anthropicStopEventSeen = false; // "event: message_stop" seen, awaiting data line
 
   // --- Client disconnect handling ---
   // When the downstream client closes the connection, proactively terminate
@@ -490,16 +492,30 @@ export async function forwardStreamAndExtractUsage(
       const lines = sseBuffer.split("\n");
       sseBuffer = lines.pop() ?? ""; // keep incomplete trailing line
 
-      // Forward lines as-is, but intercept [DONE] so we can inject a usage
-      // chunk before the terminal signal. This is transparent for non-[DONE]
-      // lines — each line is re-emitted with its original trailing newline.
+      // Forward lines as-is, but intercept terminal signals so we can inject a
+      // usage event before the stream ends. Three protocols are handled:
+      //   - OpenAI chat: "data: [DONE]"
+      //   - Anthropic:   "event: message_stop" + data with "type":"message_stop"
+      // Each terminal is held and re-emitted after the synthetic usage chunk.
       let toForward = "";
       for (const line of lines) {
-        if (line.trim() === "data: [DONE]") {
+        const trimmed = line.trim();
+        if (trimmed === "data: [DONE]") {
           donePending = true; // hold [DONE] until after usage injection
+        } else if (trimmed === "event: message_stop") {
+          anthropicStopEventSeen = true; // hold event line, await matching data
+        } else if (anthropicStopEventSeen && trimmed.includes('"type":"message_stop"')) {
+          messageStopPending = true; // hold message_stop until after usage injection
+          anthropicStopEventSeen = false;
         } else {
+          if (anthropicStopEventSeen) {
+            // Edge case: event line seen but next line wasn't the matching data.
+            // Release the held event line to preserve stream integrity.
+            toForward += "event: message_stop\n";
+            anthropicStopEventSeen = false;
+          }
           toForward += line + "\n";
-          extractUsageFromSSE(line.trim());
+          extractUsageFromSSE(trimmed);
         }
       }
       if (toForward) write(encoder.encode(toForward));
@@ -514,11 +530,21 @@ export async function forwardStreamAndExtractUsage(
       if (sseBuffer) {
         let toForward = "";
         for (const line of sseBuffer.split("\n")) {
-          if (line.trim() === "data: [DONE]") {
+          const trimmed = line.trim();
+          if (trimmed === "data: [DONE]") {
             donePending = true;
+          } else if (trimmed === "event: message_stop") {
+            anthropicStopEventSeen = true;
+          } else if (anthropicStopEventSeen && trimmed.includes('"type":"message_stop"')) {
+            messageStopPending = true;
+            anthropicStopEventSeen = false;
           } else {
+            if (anthropicStopEventSeen) {
+              toForward += "event: message_stop\n";
+              anthropicStopEventSeen = false;
+            }
             toForward += line + "\n";
-            extractUsageFromSSE(line.trim());
+            extractUsageFromSSE(trimmed);
           }
         }
         if (toForward) write(encoder.encode(toForward));
@@ -553,6 +579,23 @@ export async function forwardStreamAndExtractUsage(
     // Forward the intercepted [DONE] terminal signal
     if (!clientClosed && donePending) {
       write(encoder.encode("data: [DONE]\n\n"));
+    }
+
+    // Anthropic: inject synthetic message_delta with usage before message_stop.
+    // message_stop is the terminal signal for the Anthropic Messages SSE format.
+    // We emit the usage-bearing message_delta first, then the held message_stop.
+    if (!clientClosed && messageStopPending && !providerReturnedUsage && (inputTokens > 0 || outputTokens > 0)) {
+      const deltaChunk = `event: message_delta\ndata: ${JSON.stringify({
+        type: "message_delta",
+        delta: { stop_reason: "end_turn", stop_sequence: null },
+        usage: { input_tokens: inputTokens, output_tokens: outputTokens },
+      })}\n\n`;
+      write(encoder.encode(deltaChunk));
+    }
+
+    // Forward the intercepted Anthropic message_stop terminal signal
+    if (!clientClosed && messageStopPending) {
+      write(encoder.encode('event: message_stop\ndata: {"type":"message_stop"}\n\n'));
     }
   } catch (err) {
     // If the client disconnected, upstream AbortErrors are expected — swallow them.
@@ -1342,6 +1385,7 @@ app.post(
                   (chunk) => { writeAndFlush(res, chunk); },
                   extractInputTextFromBody(body),
                   "anthropic", _resolved.config, modelName,
+                  res,
                 );
                 await recordUsageAndCost(
                   req.auth, String(_resolved.providerId), modelName,

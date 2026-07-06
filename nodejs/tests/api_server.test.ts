@@ -1005,4 +1005,59 @@ describe("TestStreamClientDisconnect", () => {
     const promptTokenMatches = allOutput.match(/prompt_tokens/g) || [];
     expect(promptTokenMatches.length).toBe(1);
   });
+
+  it("forwardStream (anthropic): injects message_delta with usage before message_stop when provider omits usage", async () => {
+    const enc = new TextEncoder();
+    async function* gen(): AsyncGenerator<Uint8Array> {
+      yield enc.encode('event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"type":"text_delta","text":"Hello anthropic output text"}}\n\n');
+      yield enc.encode('event: message_stop\ndata: {"type":"message_stop"}\n\n');
+    }
+
+    const written: Uint8Array[] = [];
+    const usage = await forwardStreamAndExtractUsage(
+      gen(), (c) => written.push(c),
+      "test input text", undefined, undefined, "claude-test",
+      mockRes(),
+    );
+
+    const allOutput = written.map((c) => new TextDecoder().decode(c)).join("");
+
+    // Content forwarded
+    expect(allOutput).toContain("Hello anthropic output text");
+    // message_stop forwarded
+    expect(allOutput).toContain("message_stop");
+    // Synthetic message_delta with usage injected (provider didn't return one)
+    expect(allOutput).toContain("input_tokens");
+    expect(allOutput).toContain("output_tokens");
+    // Usage message_delta appears BEFORE message_stop
+    expect(allOutput.indexOf("message_delta")).toBeLessThan(allOutput.indexOf("message_stop"));
+    // Usage values are non-zero (estimated from fallback)
+    expect(usage.input_tokens).toBeGreaterThan(0);
+    expect(usage.output_tokens).toBeGreaterThan(0);
+  });
+
+  it("forwardStream (anthropic): does NOT inject message_delta when provider already returned usage", async () => {
+    const enc = new TextEncoder();
+    async function* gen(): AsyncGenerator<Uint8Array> {
+      yield enc.encode('event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"type":"text_delta","text":"Hi"}}\n\n');
+      yield enc.encode('event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":10,"output_tokens":5}}\n\n');
+      yield enc.encode('event: message_stop\ndata: {"type":"message_stop"}\n\n');
+    }
+
+    const written: Uint8Array[] = [];
+    const usage = await forwardStreamAndExtractUsage(
+      gen(), (c) => written.push(c),
+      "Hi", undefined, undefined, "claude-test",
+      mockRes(),
+    );
+
+    const allOutput = written.map((c) => new TextDecoder().decode(c)).join("");
+
+    // Provider returned usage — values used directly
+    expect(usage.input_tokens).toBe(10);
+    expect(usage.output_tokens).toBe(5);
+    // Only ONE output_tokens occurrence (the provider's message_delta), no synthetic injection
+    const outputTokenMatches = allOutput.match(/output_tokens/g) || [];
+    expect(outputTokenMatches.length).toBe(1);
+  });
 });
