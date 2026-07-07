@@ -9,7 +9,7 @@
 
 import path from "path";
 
-const MAX_PLUGIN_BYTES = 1024 * 1024;
+const MAX_PLUGIN_BYTES = 10 * 1024 * 1024;
 
 /**
  * Normalize a plugin's declared `name` into a URL-safe, stable route id.
@@ -46,5 +46,5 @@ export function assertPluginFilename(filename: string): void {
 export function assertPluginSize(content: string): void {
   const bytes = Buffer.byteLength(content, "utf8");
   if (bytes === 0) throw new Error("插件檔案不能是空檔案");
-  if (bytes > MAX_PLUGIN_BYTES) throw new Error("插件檔案超過 1MB 上限");
+  if (bytes > MAX_PLUGIN_BYTES) throw new Error("插件檔案超過 10MB 上限");
 }

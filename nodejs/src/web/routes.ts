@@ -130,7 +130,7 @@ function sanitizeProviderTestUrl(url: string, apiType: string): string {
 
 const PROVIDER_DEFAULT_USER_AGENT_SETTING = "provider_default_user_agent";
 const MAX_USER_AGENT_LENGTH = 256;
-const MAX_PLUGIN_SOURCE_BYTES = 1024 * 1024;
+const MAX_PLUGIN_SOURCE_BYTES = 10 * 1024 * 1024;
 
 type ResolvedGitHubPlugin = {
   rawUrl: string;
@@ -192,11 +192,11 @@ async function fetchTextWithLimit(url: string, timeoutMs = 15000): Promise<strin
     if (!response.ok) throw new Error(`下載失敗: HTTP ${response.status}`);
     const length = response.headers.get("content-length");
     if (length && Number(length) > MAX_PLUGIN_SOURCE_BYTES) {
-      throw new Error("插件檔案超過 1MB 上限");
+      throw new Error("插件檔案超過 10MB 上限");
     }
     const text = await response.text();
     if (Buffer.byteLength(text, "utf8") > MAX_PLUGIN_SOURCE_BYTES) {
-      throw new Error("插件檔案超過 1MB 上限");
+      throw new Error("插件檔案超過 10MB 上限");
     }
     return text;
   } finally {

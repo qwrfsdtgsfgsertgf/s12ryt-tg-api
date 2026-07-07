@@ -141,7 +141,7 @@ setup(context) {
 - 插件只在 Node.js 版本中載入，不依賴已停止維護的 Python 版本。
 - 插件可由 Web Console 管理員匯入檔案或 GitHub 連結；`NODEJS_PLUGIN_PATHS` 僅作為進階手動載入方式。
 - 插件檔案會在主程式程序內執行，請只載入可信任程式碼。
-- Web 安裝目前限制 `.js` / `.mjs` 入口檔，大小上限 1MB。
+- Web 安裝目前限制 `.js` / `.mjs` 入口檔，大小上限 10MB。
 - 插件路由預設沿用 API Key 認證、rate limit 與 quota middleware。
 - 插件 Bot 指令的業務權限需要插件自行檢查。
 - `context.services.providers` 和 `context.services.db` 會遮蔽 API Key、provider base URL 等敏感資料；不要改用核心內部 DB 函式繞過這層限制。

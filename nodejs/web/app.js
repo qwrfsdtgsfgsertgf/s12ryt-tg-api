@@ -2749,7 +2749,7 @@
           <div class="form-group">
             <label for="plugin-file">插件入口檔</label>
             <input type="file" id="plugin-file" accept=".js,.mjs">
-            <div class="form-hint">支援 .js / .mjs，大小上限 1MB。檔案內容會由伺服器端驗證後載入。</div>
+            <div class="form-hint">支援 .js / .mjs，大小上限 10MB。檔案內容會由伺服器端驗證後載入。</div>
           </div>
           <button class="btn btn-primary" id="btn-install-plugin-file">${ic.plug} 安裝檔案</button>
         </div>
@@ -2792,7 +2792,7 @@
       const file = input?.files?.[0];
       if (!file) { toast("請先選擇插件檔案", "warning"); return; }
       if (!/\.m?js$/i.test(file.name)) { toast("只支援 .js 或 .mjs 插件檔", "error"); return; }
-      if (file.size > 1024 * 1024) { toast("插件檔案超過 1MB 上限", "error"); return; }
+      if (file.size > 10 * 1024 * 1024) { toast("插件檔案超過 10MB 上限", "error"); return; }
 
       fileBtn.disabled = true;
       try {
