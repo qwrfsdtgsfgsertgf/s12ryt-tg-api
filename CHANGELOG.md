@@ -2,6 +2,17 @@
 
 所有版本變更記錄。本檔案由 `npm run release` 自動維護。
 
+## [1.9.0] - 2026-07-10
+
+### ✨ Features
+- raise plugin size limit from 1MB to 10MB (b35a6e7)
+
+### 🐛 Bug Fixes
+- createPool accepts URI string, not {connectionString} (367129c)
+
+### 📦 Other
+- ﻿feat(db): multi-backend support (SQLite/PostgreSQL/MySQL) (b671248)
+
 ## [1.8.7] - 2026-07-06
 
 ### ✨ Features
