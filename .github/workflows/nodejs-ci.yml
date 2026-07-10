@@ -52,3 +52,98 @@ jobs:
 
       - name: Test
         run: npm test
+
+  # PostgreSQL integration test ??runs the postgresDriver test suite
+  # (tests/postgresDriver.test.ts) against a real Postgres service container.
+  # The default `ci` job has no TEST_DATABASE_URL, so PG tests are skipped there
+  # and the SQLite suite (439 tests) still guards against regressions.
+  pg-test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: nodejs
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: testdb
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      TEST_DATABASE_URL: postgres://test:test@localhost:5432/testdb
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: nodejs/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci --engine-strict
+
+      - name: Build
+        run: npm run build
+
+      - name: Test (with PostgreSQL)
+        run: npm test
+
+  # MySQL integration test - runs the mysqlDriver test suite
+  # (tests/mysqlDriver.test.ts) against a real MySQL service container.
+  # Uses TEST_MYSQL_URL (distinct from TEST_DATABASE_URL) so the PG driver
+  # suite stays skipped in this job.
+  mysql-test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: nodejs
+
+    services:
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_ROOT_PASSWORD: rootpw
+          MYSQL_USER: test
+          MYSQL_PASSWORD: test
+          MYSQL_DATABASE: testdb
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      TEST_MYSQL_URL: mysql://test:test@127.0.0.1:3306/testdb
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: nodejs/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci --engine-strict
+
+      - name: Build
+        run: npm run build
+
+      - name: Test (with MySQL)
+        run: npm test

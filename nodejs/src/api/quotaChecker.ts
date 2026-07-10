@@ -23,7 +23,7 @@ import {
   type UsageQuota,
 } from "../db/database.js";
 
-export function quotaCheckMiddleware(req: Request, res: Response, next: NextFunction): void {
+export async function quotaCheckMiddleware(req: Request, res: Response, next: NextFunction): Promise<void> {
   const auth = req.auth;
   if (!auth) {
     next();
@@ -43,7 +43,7 @@ export function quotaCheckMiddleware(req: Request, res: Response, next: NextFunc
     limits = shared;
   } else {
     try {
-      limits = getCachedEffectiveLimits(Number(auth.userId), Number(auth.apiKeyId));
+      limits = await getCachedEffectiveLimits(Number(auth.userId), Number(auth.apiKeyId));
     } catch (err) {
       console.error("[quotaChecker] Failed to get effective limits:", err);
       next();
@@ -59,10 +59,10 @@ export function quotaCheckMiddleware(req: Request, res: Response, next: NextFunc
   let daily: UsageQuota | undefined;
   let monthly: UsageQuota | undefined;
   if (needDaily) {
-    daily = getDailyUsage(Number(auth.userId), Number(auth.apiKeyId));
+    daily = await getDailyUsage(Number(auth.userId), Number(auth.apiKeyId));
   }
   if (needMonthly) {
-    monthly = getMonthlyUsage(Number(auth.userId), Number(auth.apiKeyId));
+    monthly = await getMonthlyUsage(Number(auth.userId), Number(auth.apiKeyId));
   }
 
   // --- Check daily token quota ---

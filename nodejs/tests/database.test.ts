@@ -2,9 +2,9 @@
  * Unit tests for src/db/database.ts
  *
  * Strategy:
- * - Each test suite uses its own temporary database file via initDbAsync().
+ * - Each test suite uses its own temporary database file via await initDbAsync().
  * - beforeEach creates a fresh DB; afterEach closes it.
- * - saveDb() is spied on to suppress filesystem writes during tests.
+ * - await saveDb() is spied on to suppress filesystem writes during tests.
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
@@ -110,30 +110,30 @@ function cleanupTempDir(): void {
 }
 
 // Suppress console.log / console.error noise during tests
-beforeEach(() => {
+beforeEach(async () => {
   vi.spyOn(console, "log").mockImplementation(() => {});
   vi.spyOn(console, "error").mockImplementation(() => {});
 });
 
-afterEach(() => {
+afterEach(async () => {
   vi.restoreAllMocks();
 });
 
 // ===========================================================================
 // Provider Tests
 // ===========================================================================
-describe("Provider CRUD", () => {
+describe("Provider CRUD", async () => {
   beforeEach(async () => {
     await initDbAsync(makeTempDbPath());
   });
 
-  afterEach(() => {
-    closeDb();
+  afterEach(async () => {
+    await closeDb();
     cleanupTempDir();
   });
 
-  it("should add a provider and retrieve it", () => {
-    addProvider({
+  it("should add a provider and retrieve it", async () => {
+    await addProvider({
       name: "OpenAI",
       api_type: "openai_chat",
       base_url: "https://api.openai.com/v1",
@@ -144,7 +144,7 @@ describe("Provider CRUD", () => {
       output_price: 0.015,
     });
 
-    const providers = getProviders();
+    const providers = await getProviders();
     expect(providers).toHaveLength(1);
     expect(providers[0].name).toBe("OpenAI");
     expect(providers[0].api_type).toBe("openai_chat");
@@ -157,8 +157,8 @@ describe("Provider CRUD", () => {
     expect(providers[0].output_price).toBe(0.015);
   });
 
-  it("should reject duplicate provider name", () => {
-    addProvider({
+  it("should reject duplicate provider name", async () => {
+    await addProvider({
       name: "OpenAI",
       api_type: "openai_chat",
       base_url: "https://api.openai.com/v1",
@@ -168,8 +168,7 @@ describe("Provider CRUD", () => {
       output_price: null,
     });
 
-    expect(() =>
-      addProvider({
+    await expect(addProvider({
         name: "OpenAI",
         api_type: "openai_chat",
         base_url: "https://api.openai.com/v2",
@@ -178,11 +177,11 @@ describe("Provider CRUD", () => {
         input_price: null,
         output_price: null,
       })
-    ).toThrow();
+    ).rejects.toThrow();
   });
 
-  it("should get provider by id", () => {
-    addProvider({
+  it("should get provider by id", async () => {
+    await addProvider({
       name: "Anthropic",
       api_type: "anthropic",
       base_url: "https://api.anthropic.com",
@@ -192,19 +191,19 @@ describe("Provider CRUD", () => {
       output_price: 0.015,
     });
 
-    const provider = getProviderById(1);
+    const provider = await getProviderById(1);
     expect(provider).toBeDefined();
     expect(provider!.name).toBe("Anthropic");
     expect(provider!.api_type).toBe("anthropic");
   });
 
-  it("should return undefined for non-existent provider id", () => {
-    const provider = getProviderById(999);
+  it("should return undefined for non-existent provider id", async () => {
+    const provider = await getProviderById(999);
     expect(provider).toBeUndefined();
   });
 
-  it("should update a provider", () => {
-    addProvider({
+  it("should update a provider", async () => {
+    await addProvider({
       name: "Google",
       api_type: "google",
       base_url: "https://generativelanguage.googleapis.com",
@@ -214,17 +213,17 @@ describe("Provider CRUD", () => {
       output_price: null,
     });
 
-    updateProvider(1, { name: "Google AI", enabled: 0, models: "gemini-pro,gemini-ultra" });
+    await updateProvider(1, { name: "Google AI", enabled: 0, models: "gemini-pro,gemini-ultra" });
 
-    const updated = getProviderById(1);
+    const updated = await getProviderById(1);
     expect(updated).toBeDefined();
     expect(updated!.name).toBe("Google AI");
     expect(updated!.enabled).toBe(0);
     expect(updated!.models).toBe("gemini-pro,gemini-ultra");
   });
 
-  it("should throw when updating with no fields", () => {
-    addProvider({
+  it("should throw when updating with no fields", async () => {
+    await addProvider({
       name: "OpenAI",
       api_type: "openai_chat",
       base_url: "https://api.openai.com/v1",
@@ -234,11 +233,11 @@ describe("Provider CRUD", () => {
       output_price: null,
     });
 
-    expect(() => updateProvider(1, {})).toThrow("No fields to update");
+    await expect(updateProvider(1, {})).rejects.toThrow("No fields to update");
   });
 
-  it("should delete a provider by id", () => {
-    addProvider({
+  it("should delete a provider by id", async () => {
+    await addProvider({
       name: "OpenAI",
       api_type: "openai_chat",
       base_url: "https://api.openai.com/v1",
@@ -247,7 +246,7 @@ describe("Provider CRUD", () => {
       input_price: null,
       output_price: null,
     });
-    addProvider({
+    await addProvider({
       name: "Anthropic",
       api_type: "anthropic",
       base_url: "https://api.anthropic.com",
@@ -257,20 +256,20 @@ describe("Provider CRUD", () => {
       output_price: null,
     });
 
-    deleteProvider([1]);
+    await deleteProvider([1]);
 
-    const remaining = getProviders();
+    const remaining = await getProviders();
     expect(remaining).toHaveLength(1);
     expect(remaining[0].name).toBe("Anthropic");
   });
 
-  it("should enable foreign key enforcement after initialization", () => {
+  it("should enable foreign key enforcement after initialization", async () => {
     const result = getDb().exec("PRAGMA foreign_keys");
     expect(result[0].values[0][0]).toBe(1);
   });
 
-  it("should delete model prices when deleting a provider", () => {
-    addProvider({
+  it("should delete model prices when deleting a provider", async () => {
+    await addProvider({
       name: "OpenAI",
       api_type: "openai_chat",
       base_url: "https://api.openai.com/v1",
@@ -279,25 +278,25 @@ describe("Provider CRUD", () => {
       input_price: null,
       output_price: null,
     });
-    batchUpsertModelPrices(1, [
+    await batchUpsertModelPrices(1, [
       { model: "gpt-4o", input_price: 1.25, output_price: 5 },
     ]);
 
-    expect(getModelPricesByProvider(1)).toHaveLength(1);
+    expect(await getModelPricesByProvider(1)).toHaveLength(1);
 
     getDb().run("PRAGMA foreign_keys = OFF");
     try {
-      deleteProvider([1]);
+      await deleteProvider([1]);
     } finally {
       getDb().run("PRAGMA foreign_keys = ON");
     }
 
-    expect(getProviders()).toHaveLength(0);
-    expect(getModelPricesByProvider(1)).toHaveLength(0);
+    expect(await getProviders()).toHaveLength(0);
+    expect(await getModelPricesByProvider(1)).toHaveLength(0);
   });
 
-  it("should delete model mappings when deleting a provider", () => {
-    addProvider({
+  it("should delete model mappings when deleting a provider", async () => {
+    await addProvider({
       name: "OpenAI",
       api_type: "openai_chat",
       base_url: "https://api.openai.com/v1",
@@ -306,24 +305,24 @@ describe("Provider CRUD", () => {
       input_price: null,
       output_price: null,
     });
-    upsertModelMapping(1, "gpt-4o", "public-gpt");
+    await upsertModelMapping(1, "gpt-4o", "public-gpt");
 
-    expect(getModelMappings()).toHaveLength(1);
+    expect(await getModelMappings()).toHaveLength(1);
 
-    deleteProvider([1]);
+    await deleteProvider([1]);
 
-    expect(getProviders()).toHaveLength(0);
-    expect(getModelMappings()).toHaveLength(0);
-    expect(exportDatabase().tables.model_mappings).toHaveLength(0);
+    expect(await getProviders()).toHaveLength(0);
+    expect(await getModelMappings()).toHaveLength(0);
+    expect((await exportDatabase()).tables.model_mappings).toHaveLength(0);
   });
 
-  it("should reject model mappings for missing providers", () => {
-    expect(() => upsertModelMapping(999, "ghost-model", "public-ghost")).toThrow("Provider not found");
-    expect(getModelMappings()).toHaveLength(0);
+  it("should reject model mappings for missing providers", async () => {
+    await expect(upsertModelMapping(999, "ghost-model", "public-ghost")).rejects.toThrow("Provider not found");
+    expect(await getModelMappings()).toHaveLength(0);
   });
 
-  it("should reject invalid batch model mappings without clearing existing mappings", () => {
-    addProvider({
+  it("should reject invalid batch model mappings without clearing existing mappings", async () => {
+    await addProvider({
       name: "OpenAI",
       api_type: "openai_chat",
       base_url: "https://api.openai.com/v1",
@@ -332,13 +331,13 @@ describe("Provider CRUD", () => {
       input_price: null,
       output_price: null,
     });
-    upsertModelMapping(1, "gpt-4o", "public-gpt");
+    await upsertModelMapping(1, "gpt-4o", "public-gpt");
 
-    expect(() => replaceModelMappings([
+    await expect(replaceModelMappings([
       { provider_id: 999, original_model: "ghost-model", display_name: "public-ghost" },
-    ])).toThrow("Provider not found for model mapping: 999");
+    ])).rejects.toThrow("Provider not found for model mapping: 999");
 
-    expect(getModelMappings()).toEqual([
+    expect(await getModelMappings()).toEqual([
       {
         provider_id: 1,
         provider_name: "OpenAI",
@@ -353,42 +352,42 @@ describe("Provider CRUD", () => {
       "INSERT INTO model_mappings (provider_id, original_model, display_name) VALUES (?, ?, ?)",
       [999, "ghost-model", "public-ghost"]
     );
-    saveDb();
+    await saveDb();
 
-    closeDb();
+    await closeDb();
     await initDbAsync(dbFile);
 
-    expect(exportDatabase().tables.model_mappings).toHaveLength(0);
+    expect((await exportDatabase()).tables.model_mappings).toHaveLength(0);
   });
 
-  it("should delete multiple providers", () => {
-    addProvider({ name: "P1", api_type: "openai_chat", base_url: "https://p1", api_key: "k1", models: "", input_price: null, output_price: null });
-    addProvider({ name: "P2", api_type: "openai_chat", base_url: "https://p2", api_key: "k2", models: "", input_price: null, output_price: null });
-    addProvider({ name: "P3", api_type: "openai_chat", base_url: "https://p3", api_key: "k3", models: "", input_price: null, output_price: null });
+  it("should delete multiple providers", async () => {
+    await addProvider({ name: "P1", api_type: "openai_chat", base_url: "https://p1", api_key: "k1", models: "", input_price: null, output_price: null });
+    await addProvider({ name: "P2", api_type: "openai_chat", base_url: "https://p2", api_key: "k2", models: "", input_price: null, output_price: null });
+    await addProvider({ name: "P3", api_type: "openai_chat", base_url: "https://p3", api_key: "k3", models: "", input_price: null, output_price: null });
 
-    deleteProvider([1, 3]);
+    await deleteProvider([1, 3]);
 
-    const remaining = getProviders();
+    const remaining = await getProviders();
     expect(remaining).toHaveLength(1);
     expect(remaining[0].name).toBe("P2");
   });
 
-  it("should filter providers by enabled status", () => {
-    addProvider({ name: "Enabled1", api_type: "openai_chat", base_url: "https://e1", api_key: "k1", models: "", input_price: null, output_price: null });
-    addProvider({ name: "Disabled1", api_type: "openai_chat", base_url: "https://d1", api_key: "k2", models: "", input_price: null, output_price: null });
+  it("should filter providers by enabled status", async () => {
+    await addProvider({ name: "Enabled1", api_type: "openai_chat", base_url: "https://e1", api_key: "k1", models: "", input_price: null, output_price: null });
+    await addProvider({ name: "Disabled1", api_type: "openai_chat", base_url: "https://d1", api_key: "k2", models: "", input_price: null, output_price: null });
 
-    updateProvider(2, { enabled: 0 });
+    await updateProvider(2, { enabled: 0 });
 
-    const all = getProviders(false);
-    const enabled = getProviders(true);
+    const all = await getProviders(false);
+    const enabled = await getProviders(true);
 
     expect(all).toHaveLength(2);
     expect(enabled).toHaveLength(1);
     expect(enabled[0].name).toBe("Enabled1");
   });
 
-  it("should allow null prices for provider", () => {
-    addProvider({
+  it("should allow null prices for provider", async () => {
+    await addProvider({
       name: "FreeProvider",
       api_type: "google",
       base_url: "https://free",
@@ -398,7 +397,7 @@ describe("Provider CRUD", () => {
       output_price: null,
     });
 
-    const provider = getProviderById(1);
+    const provider = await getProviderById(1);
     expect(provider!.input_price).toBeNull();
     expect(provider!.output_price).toBeNull();
   });
@@ -407,108 +406,108 @@ describe("Provider CRUD", () => {
 // ===========================================================================
 // User Tests
 // ===========================================================================
-describe("User CRUD", () => {
+describe("User CRUD", async () => {
   beforeEach(async () => {
     await initDbAsync(makeTempDbPath());
   });
 
-  afterEach(() => {
-    closeDb();
+  afterEach(async () => {
+    await closeDb();
     cleanupTempDir();
   });
 
-  it("should add a user and retrieve by tg_user_id", () => {
-    addUser(12345678, "testuser");
+  it("should add a user and retrieve by tg_user_id", async () => {
+    await addUser(12345678, "testuser");
 
-    const user = getUserByTgId(12345678);
+    const user = await getUserByTgId(12345678);
     expect(user).toBeDefined();
     expect(user!.tg_user_id).toBe(12345678);
     expect(user!.username).toBe("testuser");
     expect(user!.is_active).toBe(1);
   });
 
-  it("should add user with null username", () => {
-    addUser(99999);
+  it("should add user with null username", async () => {
+    await addUser(99999);
 
-    const user = getUserByTgId(99999);
+    const user = await getUserByTgId(99999);
     expect(user).toBeDefined();
     expect(user!.username).toBeNull();
   });
 
-  it("should reject duplicate tg_user_id", () => {
-    addUser(11111, "user1");
+  it("should reject duplicate tg_user_id", async () => {
+    await addUser(11111, "user1");
 
-    expect(() => addUser(11111, "user2")).toThrow();
+    await expect(addUser(11111, "user2")).rejects.toThrow();
   });
 
-  it("should get user by id", () => {
-    addUser(22222, "byIdUser");
+  it("should get user by id", async () => {
+    await addUser(22222, "byIdUser");
 
-    const user = getUserById(1);
+    const user = await getUserById(1);
     expect(user).toBeDefined();
     expect(user!.username).toBe("byIdUser");
   });
 
-  it("should return undefined for non-existent user id", () => {
-    const user = getUserById(999);
+  it("should return undefined for non-existent user id", async () => {
+    const user = await getUserById(999);
     expect(user).toBeUndefined();
   });
 
-  it("should return undefined for non-existent tg_user_id", () => {
-    const user = getUserByTgId(999999);
+  it("should return undefined for non-existent tg_user_id", async () => {
+    const user = await getUserByTgId(999999);
     expect(user).toBeUndefined();
   });
 
-  it("should get all users", () => {
-    addUser(100, "userA");
-    addUser(200, "userB");
-    addUser(300, "userC");
+  it("should get all users", async () => {
+    await addUser(100, "userA");
+    await addUser(200, "userB");
+    await addUser(300, "userC");
 
-    const users = getUsers();
+    const users = await getUsers();
     expect(users).toHaveLength(3);
     expect(users[0].tg_user_id).toBe(100);
     expect(users[2].tg_user_id).toBe(300);
   });
 
-  it("should get users excluding admin id", () => {
-    addUser(1000, "admin");
-    addUser(2000, "user1");
-    addUser(3000, "user2");
+  it("should get users excluding admin id", async () => {
+    await addUser(1000, "admin");
+    await addUser(2000, "user1");
+    await addUser(3000, "user2");
 
-    const users = getUsers(1000);
+    const users = await getUsers(1000);
     expect(users).toHaveLength(2);
     expect(users.every((u) => u.tg_user_id !== 1000)).toBe(true);
   });
 
-  it("should update user status", () => {
-    addUser(55555, "statusUser");
+  it("should update user status", async () => {
+    await addUser(55555, "statusUser");
 
-    updateUserStatus(1, 0);
+    await updateUserStatus(1, 0);
 
-    const user = getUserByTgId(55555);
+    const user = await getUserByTgId(55555);
     expect(user!.is_active).toBe(0);
   });
 
-  it("should delete a user", () => {
-    addUser(77777, "deleteMe");
-    addUser(88888, "keepMe");
+  it("should delete a user", async () => {
+    await addUser(77777, "deleteMe");
+    await addUser(88888, "keepMe");
 
-    deleteUser(1);
+    await deleteUser(1);
 
-    const users = getUsers();
+    const users = await getUsers();
     expect(users).toHaveLength(1);
     expect(users[0].tg_user_id).toBe(88888);
   });
 
-  it("should update user tg_user_id", () => {
-    addUser(10000, "migrateMe");
+  it("should update user tg_user_id", async () => {
+    await addUser(10000, "migrateMe");
 
-    updateUserTgId(10000, 20000);
+    await updateUserTgId(10000, 20000);
 
-    const oldUser = getUserByTgId(10000);
+    const oldUser = await getUserByTgId(10000);
     expect(oldUser).toBeUndefined();
 
-    const newUser = getUserByTgId(20000);
+    const newUser = await getUserByTgId(20000);
     expect(newUser).toBeDefined();
     expect(newUser!.username).toBe("migrateMe");
   });
@@ -517,64 +516,64 @@ describe("User CRUD", () => {
 // ===========================================================================
 // API Key Tests
 // ===========================================================================
-describe("API Key CRUD", () => {
+describe("API Key CRUD", async () => {
   beforeEach(async () => {
     await initDbAsync(makeTempDbPath());
     // Add a user that most tests depend on
-    addUser(12345, "keyuser");
+    await addUser(12345, "keyuser");
   });
 
-  afterEach(() => {
-    closeDb();
+  afterEach(async () => {
+    await closeDb();
     cleanupTempDir();
   });
 
-  it("should add an API key for existing user", () => {
-    const result = addApiKey(12345);
+  it("should add an API key for existing user", async () => {
+    const result = await addApiKey(12345);
 
     expect(result.key).toMatch(/^sk-s12ryt-/);
 
-    const keys = getKeysByUser(12345);
+    const keys = await getKeysByUser(12345);
     expect(keys).toHaveLength(1);
     expect(keys[0].key).toBe(result.key);
     expect(keys[0].is_active).toBe(1);
   });
 
-  it("should throw when adding key for non-existent user", () => {
-    expect(() => addApiKey(99999)).toThrow("User with tg_user_id 99999 not found");
+  it("should throw when adding key for non-existent user", async () => {
+    await expect(addApiKey(99999)).rejects.toThrow("User with tg_user_id 99999 not found");
   });
 
-  it("should get key by value", () => {
-    const { key } = addApiKey(12345);
+  it("should get key by value", async () => {
+    const { key } = await addApiKey(12345);
 
-    const found = getKeyByValue(key);
+    const found = await getKeyByValue(key);
     expect(found).toBeDefined();
     expect(found!.key).toBe(key);
   });
 
-  it("should return undefined for non-existent key value", () => {
-    const found = getKeyByValue("sk-s12ryt-nonexistent");
+  it("should return undefined for non-existent key value", async () => {
+    const found = await getKeyByValue("sk-s12ryt-nonexistent");
     expect(found).toBeUndefined();
   });
 
-  it("should delete an API key", () => {
-    addApiKey(12345);
+  it("should delete an API key", async () => {
+    await addApiKey(12345);
 
-    const keys = getKeysByUser(12345);
+    const keys = await getKeysByUser(12345);
     expect(keys).toHaveLength(1);
 
-    deleteApiKey(keys[0].id);
+    await deleteApiKey(keys[0].id);
 
-    const keysAfterDelete = getKeysByUser(12345);
+    const keysAfterDelete = await getKeysByUser(12345);
     expect(keysAfterDelete).toHaveLength(0);
   });
 
-  it("should get all keys with user info", () => {
-    addUser(67890, "anotheruser");
-    addApiKey(12345);
-    addApiKey(67890);
+  it("should get all keys with user info", async () => {
+    await addUser(67890, "anotheruser");
+    await addApiKey(12345);
+    await addApiKey(67890);
 
-    const allKeys = getAllKeys();
+    const allKeys = await getAllKeys();
     expect(allKeys).toHaveLength(2);
 
     // First key belongs to keyuser (tg 12345)
@@ -586,19 +585,19 @@ describe("API Key CRUD", () => {
     expect(allKeys[1].username).toBe("anotheruser");
   });
 
-  it("should generate unique keys", () => {
-    const key1 = addApiKey(12345);
-    const key2 = addApiKey(12345);
+  it("should generate unique keys", async () => {
+    const key1 = await addApiKey(12345);
+    const key2 = await addApiKey(12345);
 
     expect(key1.key).not.toBe(key2.key);
-    expect(getKeysByUser(12345)).toHaveLength(2);
+    expect(await getKeysByUser(12345)).toHaveLength(2);
   });
 });
 
 // ===========================================================================
 // Usage Tests
 // ===========================================================================
-describe("Usage CRUD", () => {
+describe("Usage CRUD", async () => {
   let providerId: number;
   let apiKeyId: number;
 
@@ -606,8 +605,8 @@ describe("Usage CRUD", () => {
     await initDbAsync(makeTempDbPath());
 
     // Set up prerequisite data
-    addUser(11111, "usageUser");
-    addProvider({
+    await addUser(11111, "usageUser");
+    await addProvider({
       name: "TestProvider",
       api_type: "openai_chat",
       base_url: "https://test",
@@ -618,21 +617,21 @@ describe("Usage CRUD", () => {
     });
 
     providerId = 1; // first provider
-    const { key } = addApiKey(11111);
-    const apiKeyRecord = getKeyByValue(key);
+    const { key } = await addApiKey(11111);
+    const apiKeyRecord = await getKeyByValue(key);
     apiKeyId = apiKeyRecord!.id;
   });
 
-  afterEach(() => {
-    closeDb();
+  afterEach(async () => {
+    await closeDb();
     cleanupTempDir();
   });
 
-  it("should record usage", () => {
+  it("should record usage", async () => {
     recordUsage(apiKeyId, providerId, 100, 50, 0.5, 0.75, "gpt-4o");
-    flushUsageQueue();
+    await flushUsageQueue();
 
-    const usage = getUsageByUser(11111);
+    const usage = await getUsageByUser(11111);
     expect(usage).toHaveLength(1);
     expect(usage[0].input_tokens).toBe(100);
     expect(usage[0].output_tokens).toBe(50);
@@ -642,24 +641,24 @@ describe("Usage CRUD", () => {
     expect(usage[0].provider_name).toBe("TestProvider");
   });
 
-  it("should get usage by provider", () => {
+  it("should get usage by provider", async () => {
     recordUsage(apiKeyId, providerId, 200, 100, 1.0, 1.5, "gpt-4o");
-    flushUsageQueue();
+    await flushUsageQueue();
 
-    const usage = getUsageByProvider(providerId);
+    const usage = await getUsageByProvider(providerId);
     expect(usage).toHaveLength(1);
     expect(usage[0].input_tokens).toBe(200);
     expect(usage[0].provider_name).toBe("TestProvider");
   });
 
-  it("should return empty array for user with no usage", () => {
-    addUser(22222, "noUsageUser");
-    const usage = getUsageByUser(22222);
+  it("should return empty array for user with no usage", async () => {
+    await addUser(22222, "noUsageUser");
+    const usage = await getUsageByUser(22222);
     expect(usage).toHaveLength(0);
   });
 
-  it("should return empty array for provider with no usage", () => {
-    addProvider({
+  it("should return empty array for provider with no usage", async () => {
+    await addProvider({
       name: "EmptyProvider",
       api_type: "anthropic",
       base_url: "https://empty",
@@ -669,12 +668,12 @@ describe("Usage CRUD", () => {
       output_price: null,
     });
 
-    const usage = getUsageByProvider(2);
+    const usage = await getUsageByProvider(2);
     expect(usage).toHaveLength(0);
   });
 
-  it("should get total usage with no records", () => {
-    const total = getTotalUsage();
+  it("should get total usage with no records", async () => {
+    const total = await getTotalUsage();
     expect(total.total_input_tokens).toBe(0);
     expect(total.total_output_tokens).toBe(0);
     expect(total.total_input_cost).toBe(0);
@@ -686,12 +685,12 @@ describe("Usage CRUD", () => {
     expect(total.by_user).toEqual({});
   });
 
-  it("should calculate total usage correctly", () => {
+  it("should calculate total usage correctly", async () => {
     recordUsage(apiKeyId, providerId, 100, 50, 0.5, 0.75, "gpt-4o");
     recordUsage(apiKeyId, providerId, 200, 100, 1.0, 1.5, "gpt-4o-mini");
-    flushUsageQueue();
+    await flushUsageQueue();
 
-    const total = getTotalUsage();
+    const total = await getTotalUsage();
     expect(total.total_input_tokens).toBe(300);
     expect(total.total_output_tokens).toBe(150);
     expect(total.total_input_cost).toBe(1.5);
@@ -711,10 +710,10 @@ describe("Usage CRUD", () => {
     expect(total.by_user["usageUser"].cost).toBeCloseTo(3.75, 5);
   });
 
-  it("should break down total usage by provider and user", () => {
+  it("should break down total usage by provider and user", async () => {
     // Second provider + second user
-    addUser(22222, "secondUser");
-    addProvider({
+    await addUser(22222, "secondUser");
+    await addProvider({
       name: "OtherProvider",
       api_type: "anthropic",
       base_url: "https://other",
@@ -723,16 +722,16 @@ describe("Usage CRUD", () => {
       input_price: null,
       output_price: null,
     });
-    const { key: key2 } = addApiKey(22222);
-    const apiKey2 = getKeyByValue(key2)!.id;
+    const { key: key2 } = await addApiKey(22222);
+    const apiKey2 = (await getKeyByValue(key2))!.id;
 
     // User 1 → TestProvider
     recordUsage(apiKeyId, 1, 100, 50, 0.5, 0.75, "gpt-4o");
     // User 2 → OtherProvider
     recordUsage(apiKey2, 2, 300, 200, 2.0, 3.0, "claude-3");
-    flushUsageQueue();
+    await flushUsageQueue();
 
-    const total = getTotalUsage();
+    const total = await getTotalUsage();
     expect(total.record_count).toBe(2);
     expect(total.total_requests).toBe(2);
 
@@ -754,52 +753,52 @@ describe("Usage CRUD", () => {
 // ===========================================================================
 // Settings Tests
 // ===========================================================================
-describe("Settings CRUD", () => {
+describe("Settings CRUD", async () => {
   beforeEach(async () => {
     await initDbAsync(makeTempDbPath());
   });
 
-  afterEach(() => {
-    closeDb();
+  afterEach(async () => {
+    await closeDb();
     cleanupTempDir();
   });
 
-  it("should return null for non-existent setting", () => {
-    const value = getSetting("nonexistent");
+  it("should return null for non-existent setting", async () => {
+    const value = await getSetting("nonexistent");
     expect(value).toBeNull();
   });
 
-  it("should set and get a setting", () => {
-    setSetting("test_key", "test_value");
-    expect(getSetting("test_key")).toBe("test_value");
+  it("should set and get a setting", async () => {
+    await setSetting("test_key", "test_value");
+    expect(await getSetting("test_key")).toBe("test_value");
   });
 
-  it("should upsert a setting (update existing key)", () => {
-    setSetting("my_setting", "value1");
-    expect(getSetting("my_setting")).toBe("value1");
+  it("should upsert a setting (update existing key)", async () => {
+    await setSetting("my_setting", "value1");
+    expect(await getSetting("my_setting")).toBe("value1");
 
-    setSetting("my_setting", "value2");
-    expect(getSetting("my_setting")).toBe("value2");
+    await setSetting("my_setting", "value2");
+    expect(await getSetting("my_setting")).toBe("value2");
   });
 
-  it("should handle multiple different settings", () => {
-    setSetting("key_a", "alpha");
-    setSetting("key_b", "beta");
-    setSetting("key_c", "gamma");
+  it("should handle multiple different settings", async () => {
+    await setSetting("key_a", "alpha");
+    await setSetting("key_b", "beta");
+    await setSetting("key_c", "gamma");
 
-    expect(getSetting("key_a")).toBe("alpha");
-    expect(getSetting("key_b")).toBe("beta");
-    expect(getSetting("key_c")).toBe("gamma");
+    expect(await getSetting("key_a")).toBe("alpha");
+    expect(await getSetting("key_b")).toBe("beta");
+    expect(await getSetting("key_c")).toBe("gamma");
   });
 });
 
 // ===========================================================================
 // Database Lifecycle Tests
 // ===========================================================================
-describe("Database lifecycle", () => {
+describe("Database lifecycle", async () => {
   it("should throw if getDb() called before init", async () => {
     // Ensure no DB is active - close if any
-    try { closeDb(); } catch { /* ok */ }
+    try { await closeDb(); } catch { /* ok */ }
 
     // We need to re-import or the module-level db is still null
     // Since closeDb sets db=null, getDb should throw
@@ -807,7 +806,7 @@ describe("Database lifecycle", () => {
     // So we'll test initDb sync throws
     const { getDb } = await import("../src/db/database.js");
     // After close, db is null
-    try { closeDb(); } catch { /* ok */ }
+    try { await closeDb(); } catch { /* ok */ }
 
     expect(() => getDb()).toThrow("Database not initialized");
   });
@@ -817,17 +816,17 @@ describe("Database lifecycle", () => {
 
     // First session: add data
     await initDbAsync(dbPath);
-    addUser(55555, "persistent_user");
-    setSetting("persisted", "yes");
-    closeDb();
+    await addUser(55555, "persistent_user");
+    await setSetting("persisted", "yes");
+    await closeDb();
 
     // Second session: verify data persisted
     await initDbAsync(dbPath);
-    const user = getUserByTgId(55555);
+    const user = await getUserByTgId(55555);
     expect(user).toBeDefined();
     expect(user!.username).toBe("persistent_user");
-    expect(getSetting("persisted")).toBe("yes");
-    closeDb();
+    expect(await getSetting("persisted")).toBe("yes");
+    await closeDb();
 
     cleanupTempDir();
   });
@@ -836,30 +835,30 @@ describe("Database lifecycle", () => {
 // ===========================================================================
 // Permission System — User Groups CRUD
 // ===========================================================================
-describe("Permission System — User Groups", () => {
+describe("Permission System — User Groups", async () => {
   beforeEach(async () => {
     await initDbAsync(makeTempDbPath());
   });
 
-  afterEach(() => {
-    closeDb();
+  afterEach(async () => {
+    await closeDb();
     cleanupTempDir();
   });
 
-  it("should seed a default user group on init", () => {
-    const groups = getUserGroups();
+  it("should seed a default user group on init", async () => {
+    const groups = await getUserGroups();
     expect(groups.length).toBeGreaterThanOrEqual(1);
 
-    const defaultGroup = getDefaultUserGroup();
+    const defaultGroup = await getDefaultUserGroup();
     expect(defaultGroup).toBeDefined();
     expect(defaultGroup!.name).toBe("default");
     expect(defaultGroup!.is_default).toBe(1);
     expect(defaultGroup!.rpm_limit).toBe(0);
   });
 
-  it("should add a user group and retrieve it", () => {
-    addUserGroup({ name: "vip", display_name: "VIP Users", rpm_limit: 100, tpm_limit: 50000 });
-    const group = getUserGroupByName("vip");
+  it("should add a user group and retrieve it", async () => {
+    await addUserGroup({ name: "vip", display_name: "VIP Users", rpm_limit: 100, tpm_limit: 50000 });
+    const group = await getUserGroupByName("vip");
     expect(group).toBeDefined();
     expect(group!.display_name).toBe("VIP Users");
     expect(group!.rpm_limit).toBe(100);
@@ -867,68 +866,68 @@ describe("Permission System — User Groups", () => {
     expect(group!.is_default).toBe(0);
   });
 
-  it("should get user group by id", () => {
-    addUserGroup({ name: "premium", rpm_limit: 200 });
-    const group = getUserGroupByName("premium");
-    const byId = getUserGroupById(group!.id);
+  it("should get user group by id", async () => {
+    await addUserGroup({ name: "premium", rpm_limit: 200 });
+    const group = await getUserGroupByName("premium");
+    const byId = await getUserGroupById(group!.id);
     expect(byId).toBeDefined();
     expect(byId!.name).toBe("premium");
   });
 
-  it("should update a user group", () => {
-    addUserGroup({ name: "basic", rpm_limit: 10 });
-    const group = getUserGroupByName("basic");
-    updateUserGroup(group!.id, { rpm_limit: 50, tpm_limit: 10000 });
-    const updated = getUserGroupById(group!.id);
+  it("should update a user group", async () => {
+    await addUserGroup({ name: "basic", rpm_limit: 10 });
+    const group = await getUserGroupByName("basic");
+    await updateUserGroup(group!.id, { rpm_limit: 50, tpm_limit: 10000 });
+    const updated = await getUserGroupById(group!.id);
     expect(updated!.rpm_limit).toBe(50);
     expect(updated!.tpm_limit).toBe(10000);
   });
 
-  it("should not delete the default group", () => {
-    const defaultGroup = getDefaultUserGroup();
-    expect(() => deleteUserGroup(defaultGroup!.id)).toThrow("Cannot delete the default user group");
+  it("should not delete the default group", async () => {
+    const defaultGroup = await getDefaultUserGroup();
+    await expect(deleteUserGroup(defaultGroup!.id)).rejects.toThrow("Cannot delete the default user group");
   });
 
-  it("should delete a non-default group and move users to default", () => {
-    addUserGroup({ name: "temp-group" });
-    const tempGroup = getUserGroupByName("temp-group");
-    const defaultGroup = getDefaultUserGroup();
+  it("should delete a non-default group and move users to default", async () => {
+    await addUserGroup({ name: "temp-group" });
+    const tempGroup = await getUserGroupByName("temp-group");
+    const defaultGroup = await getDefaultUserGroup();
 
     // Add user and assign to temp group
-    addUser(11111, "testuser");
-    const user = getUserByTgId(11111);
-    setUserGroup(user!.id, tempGroup!.id);
+    await addUser(11111, "testuser");
+    const user = await getUserByTgId(11111);
+    await setUserGroup(user!.id, tempGroup!.id);
 
-    deleteUserGroup(tempGroup!.id);
+    await deleteUserGroup(tempGroup!.id);
 
     // User should now be in default group
-    const afterUser = getUserWithLimits(user!.id);
+    const afterUser = await getUserWithLimits(user!.id);
     expect(afterUser!.group_id).toBe(defaultGroup!.id);
 
     // temp-group should no longer exist
-    expect(getUserGroupByName("temp-group")).toBeUndefined();
+    expect(await getUserGroupByName("temp-group")).toBeUndefined();
   });
 
-  it("should reject assigning a missing user group", () => {
-    addUser(22222, "invalid-group-user");
-    const user = getUserByTgId(22222);
+  it("should reject assigning a missing user group", async () => {
+    await addUser(22222, "invalid-group-user");
+    const user = await getUserByTgId(22222);
 
-    expect(() => setUserGroup(user!.id, 999)).toThrow("User group not found");
-    expect(getUserWithLimits(user!.id)!.group_id).toBeNull();
+    await expect(setUserGroup(user!.id, 999)).rejects.toThrow("User group not found");
+    expect((await getUserWithLimits(user!.id))!.group_id).toBeNull();
   });
 
   it("should repair missing user group references during initialization", async () => {
-    const defaultGroup = getDefaultUserGroup();
-    addUser(33333, "orphan-group-user");
-    const user = getUserByTgId(33333);
+    const defaultGroup = await getDefaultUserGroup();
+    await addUser(33333, "orphan-group-user");
+    const user = await getUserByTgId(33333);
 
     getDb().run("UPDATE users SET group_id = ? WHERE id = ?", [999, user!.id]);
-    saveDb();
-    closeDb();
+    await saveDb();
+    await closeDb();
 
     await initDbAsync(dbFile);
 
-    const repairedUser = getUserWithLimits(user!.id);
+    const repairedUser = await getUserWithLimits(user!.id);
     expect(repairedUser!.group_id).toBe(defaultGroup!.id);
   });
 });
@@ -936,20 +935,20 @@ describe("Permission System — User Groups", () => {
 // ===========================================================================
 // Permission System — Effective Limits Calculation
 // ===========================================================================
-describe("Permission System — Effective Limits", () => {
+describe("Permission System — Effective Limits", async () => {
   beforeEach(async () => {
     await initDbAsync(makeTempDbPath());
   });
 
-  afterEach(() => {
-    closeDb();
+  afterEach(async () => {
+    await closeDb();
     cleanupTempDir();
   });
 
-  it("should return unlimited (all zeros) for user in default group with no overrides", () => {
-    addUser(22222, "limitless-user");
-    const user = getUserByTgId(22222);
-    const limits = getEffectiveLimits(user!.id, null);
+  it("should return unlimited (all zeros) for user in default group with no overrides", async () => {
+    await addUser(22222, "limitless-user");
+    const user = await getUserByTgId(22222);
+    const limits = await getEffectiveLimits(user!.id, null);
     expect(limits.rpm).toBe(0);
     expect(limits.tpm).toBe(0);
     expect(limits.concurrency).toBe(0);
@@ -960,75 +959,75 @@ describe("Permission System — Effective Limits", () => {
     expect(limits.expiresAt).toBeNull();
   });
 
-  it("should apply group limits when user is in a group", () => {
-    addUserGroup({ name: "rate-limited", rpm_limit: 30, tpm_limit: 10000, concurrency_limit: 5 });
-    const group = getUserGroupByName("rate-limited");
+  it("should apply group limits when user is in a group", async () => {
+    await addUserGroup({ name: "rate-limited", rpm_limit: 30, tpm_limit: 10000, concurrency_limit: 5 });
+    const group = await getUserGroupByName("rate-limited");
 
-    addUser(33333, "limited-user");
-    const user = getUserByTgId(33333);
-    setUserGroup(user!.id, group!.id);
+    await addUser(33333, "limited-user");
+    const user = await getUserByTgId(33333);
+    await setUserGroup(user!.id, group!.id);
 
-    const limits = getEffectiveLimits(user!.id, null);
+    const limits = await getEffectiveLimits(user!.id, null);
     expect(limits.rpm).toBe(30);
     expect(limits.tpm).toBe(10000);
     expect(limits.concurrency).toBe(5);
   });
 
-  it("should let user override take priority over group", () => {
-    addUserGroup({ name: "standard", rpm_limit: 60, tpm_limit: 20000 });
-    const group = getUserGroupByName("standard");
+  it("should let user override take priority over group", async () => {
+    await addUserGroup({ name: "standard", rpm_limit: 60, tpm_limit: 20000 });
+    const group = await getUserGroupByName("standard");
 
-    addUser(44444, "override-user");
-    const user = getUserByTgId(44444);
-    setUserGroup(user!.id, group!.id);
-    setUserOverrides(user!.id, { rpm_override: 10 }); // stricter override
+    await addUser(44444, "override-user");
+    const user = await getUserByTgId(44444);
+    await setUserGroup(user!.id, group!.id);
+    await setUserOverrides(user!.id, { rpm_override: 10 }); // stricter override
 
-    const limits = getEffectiveLimits(user!.id, null);
+    const limits = await getEffectiveLimits(user!.id, null);
     expect(limits.rpm).toBe(10); // override wins
     expect(limits.tpm).toBe(20000); // from group
   });
 
-  it("should let API key override take priority over user and group", () => {
-    addUserGroup({ name: "tier2", rpm_limit: 60 });
-    const group = getUserGroupByName("tier2");
+  it("should let API key override take priority over user and group", async () => {
+    await addUserGroup({ name: "tier2", rpm_limit: 60 });
+    const group = await getUserGroupByName("tier2");
 
-    addUser(55555, "apikey-override-user");
-    const user = getUserByTgId(55555);
-    setUserGroup(user!.id, group!.id);
-    setUserOverrides(user!.id, { rpm_override: 30 });
+    await addUser(55555, "apikey-override-user");
+    const user = await getUserByTgId(55555);
+    await setUserGroup(user!.id, group!.id);
+    await setUserOverrides(user!.id, { rpm_override: 30 });
 
     // Create an API key for the user
-    const keyResult = addApiKey(55555);
-    const apiKey = getKeyByValue(keyResult.key);
-    setApiKeyOverrides(apiKey!.id, { rpm_override: 5 }); // API key override wins
+    const keyResult = await addApiKey(55555);
+    const apiKey = await getKeyByValue(keyResult.key);
+    await setApiKeyOverrides(apiKey!.id, { rpm_override: 5 }); // API key override wins
 
-    const limits = getEffectiveLimits(user!.id, apiKey!.id);
+    const limits = await getEffectiveLimits(user!.id, apiKey!.id);
     expect(limits.rpm).toBe(5);
   });
 
-  it("should resolve expiry date from user level", () => {
+  it("should resolve expiry date from user level", async () => {
     const futureDate = "2099-12-31T23:59:59";
-    addUser(66666, "expiring-user");
-    const user = getUserByTgId(66666);
-    setUserOverrides(user!.id, { expires_at: futureDate });
+    await addUser(66666, "expiring-user");
+    const user = await getUserByTgId(66666);
+    await setUserOverrides(user!.id, { expires_at: futureDate });
 
-    const limits = getEffectiveLimits(user!.id, null);
+    const limits = await getEffectiveLimits(user!.id, null);
     expect(limits.expiresAt).toBe(futureDate);
   });
 
-  it("should let API key expiry override user expiry", () => {
+  it("should let API key expiry override user expiry", async () => {
     const userFuture = "2099-12-31T23:59:59";
     const apiKeyPast = "2000-01-01T00:00:00";
 
-    addUser(77777, "dual-expiry-user");
-    const user = getUserByTgId(77777);
-    setUserOverrides(user!.id, { expires_at: userFuture });
+    await addUser(77777, "dual-expiry-user");
+    const user = await getUserByTgId(77777);
+    await setUserOverrides(user!.id, { expires_at: userFuture });
 
-    const keyResult = addApiKey(77777);
-    const apiKey = getKeyByValue(keyResult.key);
-    setApiKeyOverrides(apiKey!.id, { expires_at: apiKeyPast });
+    const keyResult = await addApiKey(77777);
+    const apiKey = await getKeyByValue(keyResult.key);
+    await setApiKeyOverrides(apiKey!.id, { expires_at: apiKeyPast });
 
-    const limits = getEffectiveLimits(user!.id, apiKey!.id);
+    const limits = await getEffectiveLimits(user!.id, apiKey!.id);
     expect(limits.expiresAt).toBe(apiKeyPast);
   });
 });
@@ -1036,82 +1035,82 @@ describe("Permission System — Effective Limits", () => {
 // ===========================================================================
 // Permission System — Quota Queries
 // ===========================================================================
-describe("Permission System — Quota Queries", () => {
+describe("Permission System — Quota Queries", async () => {
   beforeEach(async () => {
     await initDbAsync(makeTempDbPath());
   });
 
-  afterEach(() => {
-    closeDb();
+  afterEach(async () => {
+    await closeDb();
     cleanupTempDir();
   });
 
-  it("should return zero usage for new user", () => {
-    addUser(88888, "no-usage-user");
-    const user = getUserByTgId(88888);
+  it("should return zero usage for new user", async () => {
+    await addUser(88888, "no-usage-user");
+    const user = await getUserByTgId(88888);
 
-    const daily = getDailyUsage(user!.id, null);
+    const daily = await getDailyUsage(user!.id, null);
     expect(daily.total_input_tokens + daily.total_output_tokens).toBe(0);
     expect(daily.total_cost).toBe(0);
 
-    const monthly = getMonthlyUsage(user!.id, null);
+    const monthly = await getMonthlyUsage(user!.id, null);
     expect(monthly.total_input_tokens + monthly.total_output_tokens).toBe(0);
     expect(monthly.total_cost).toBe(0);
   });
 
-  it("should calculate daily usage from usage table", () => {
+  it("should calculate daily usage from usage table", async () => {
     // Setup: user, provider, api key
-    addUser(99990, "quota-user");
-    const user = getUserByTgId(99990);
-    addProvider({
+    await addUser(99990, "quota-user");
+    const user = await getUserByTgId(99990);
+    await addProvider({
       name: "TestProvider",
       api_type: "openai_chat",
       base_url: "https://example.com/v1",
       api_key: "sk-provider-key",
       models: "gpt-4o",
     });
-    const provider = getProviders()[0];
-    const keyResult = addApiKey(99990);
-    const apiKey = getKeyByValue(keyResult.key);
+    const provider = (await getProviders())[0];
+    const keyResult = await addApiKey(99990);
+    const apiKey = await getKeyByValue(keyResult.key);
 
     // Record usage
     recordUsage(apiKey!.id, provider!.id, 1000, 500, 0.01, 0.02, "gpt-4o");
     recordUsage(apiKey!.id, provider!.id, 2000, 1000, 0.02, 0.04, "gpt-4o");
-    flushUsageQueue();
+    await flushUsageQueue();
 
-    const daily = getDailyUsage(user!.id, null);
+    const daily = await getDailyUsage(user!.id, null);
     expect(daily.total_input_tokens + daily.total_output_tokens).toBe(4500); // (1000+500) + (2000+1000)
     expect(daily.total_cost).toBeCloseTo(0.09, 5); // (0.01+0.02) + (0.02+0.04)
   });
 
-  it("should filter usage by specific api key", () => {
-    addUser(99991, "multi-key-user");
-    const user = getUserByTgId(99991);
-    addProvider({
+  it("should filter usage by specific api key", async () => {
+    await addUser(99991, "multi-key-user");
+    const user = await getUserByTgId(99991);
+    await addProvider({
       name: "Provider2",
       api_type: "openai_chat",
       base_url: "https://example.com/v1",
       api_key: "sk-provider-key2",
       models: "gpt-4o",
     });
-    const provider = getProviders()[0];
+    const provider = (await getProviders())[0];
 
-    const key1 = addApiKey(99991);
-    const apiKey1 = getKeyByValue(key1.key);
-    const key2 = addApiKey(99991);
-    const apiKey2 = getKeyByValue(key2.key);
+    const key1 = await addApiKey(99991);
+    const apiKey1 = await getKeyByValue(key1.key);
+    const key2 = await addApiKey(99991);
+    const apiKey2 = await getKeyByValue(key2.key);
 
     recordUsage(apiKey1!.id, provider!.id, 3000, 1000, 0.05, 0.05, "gpt-4o");
     recordUsage(apiKey2!.id, provider!.id, 5000, 2000, 0.10, 0.10, "gpt-4o");
-    flushUsageQueue();
+    await flushUsageQueue();
 
     // Per-key usage
-    const key1Daily = getDailyUsage(user!.id, apiKey1!.id);
+    const key1Daily = await getDailyUsage(user!.id, apiKey1!.id);
     expect(key1Daily.total_input_tokens + key1Daily.total_output_tokens).toBe(4000); // 3000+1000 only from key1
     expect(key1Daily.total_cost).toBeCloseTo(0.10, 5);
 
     // Total user usage (all keys)
-    const totalDaily = getDailyUsage(user!.id, null);
+    const totalDaily = await getDailyUsage(user!.id, null);
     expect(totalDaily.total_input_tokens + totalDaily.total_output_tokens).toBe(11000); // 4000 + 7000
     expect(totalDaily.total_cost).toBeCloseTo(0.30, 5);
   });
@@ -1120,16 +1119,16 @@ describe("Permission System — Quota Queries", () => {
 // ===========================================================================
 // Permission System — isExpired helper
 // ===========================================================================
-describe("Permission System — isExpired", () => {
-  it("should return false for null expiry", () => {
+describe("Permission System — isExpired", async () => {
+  it("should return false for null expiry", async () => {
     expect(isExpired(null)).toBe(false);
   });
 
-  it("should return false for future date", () => {
+  it("should return false for future date", async () => {
     expect(isExpired("2099-12-31T23:59:59")).toBe(false);
   });
 
-  it("should return true for past date", () => {
+  it("should return true for past date", async () => {
     expect(isExpired("2000-01-01T00:00:00")).toBe(true);
   });
 });
@@ -1137,18 +1136,18 @@ describe("Permission System — isExpired", () => {
 // ===========================================================================
 // Backup / Restore
 // ===========================================================================
-describe("Backup / Restore", () => {
+describe("Backup / Restore", async () => {
   beforeEach(async () => {
     await initDbAsync(makeTempDbPath());
   });
 
-  afterEach(() => {
-    closeDb();
+  afterEach(async () => {
+    await closeDb();
     cleanupTempDir();
   });
 
-  it("exportDatabase returns all 10 backup tables with version 1", () => {
-    const data = exportDatabase();
+  it("exportDatabase returns all 10 backup tables with version 1", async () => {
+    const data = await exportDatabase();
     expect(data.version).toBe(1);
     expect(typeof data.exportedAt).toBe("string");
     // All 10 tables should be present (even if empty)
@@ -1164,8 +1163,8 @@ describe("Backup / Restore", () => {
     }
   });
 
-  it("exportDatabase includes inserted data", () => {
-    addProvider({
+  it("exportDatabase includes inserted data", async () => {
+    await addProvider({
       name: "OpenAI",
       api_type: "openai_chat",
       base_url: "https://api.openai.com/v1",
@@ -1174,10 +1173,10 @@ describe("Backup / Restore", () => {
       input_price: 0.005,
       output_price: 0.015,
     });
-    addUser(111, "alice");
-    setSetting("api_url", "http://example.com");
+    await addUser(111, "alice");
+    await setSetting("api_url", "http://example.com");
 
-    const data = exportDatabase();
+    const data = await exportDatabase();
     expect(data.tables.providers).toHaveLength(1);
     expect(data.tables.providers[0].name).toBe("OpenAI");
     expect(data.tables.users).toHaveLength(1);
@@ -1188,7 +1187,7 @@ describe("Backup / Restore", () => {
     expect(apiUrlSetting!.value).toBe("http://example.com");
   });
 
-  it("getBackupSummary returns correct counts and metadata", () => {
+  it("getBackupSummary returns correct counts and metadata", async () => {
     const data: BackupData = {
       version: 1,
       exportedAt: "2024-06-15T12:00:00.000Z",
@@ -1214,9 +1213,9 @@ describe("Backup / Restore", () => {
     expect(summary.counts.api_keys).toBe(0);
   });
 
-  it("importDatabase restores data and overwrites existing (round-trip)", () => {
+  it("importDatabase restores data and overwrites existing (round-trip)", async () => {
     // Setup initial data
-    addProvider({
+    await addProvider({
       name: "P1",
       api_type: "openai_chat",
       base_url: "http://localhost",
@@ -1225,13 +1224,13 @@ describe("Backup / Restore", () => {
       input_price: 1,
       output_price: 2,
     });
-    addUser(111, "alice");
+    await addUser(111, "alice");
 
     // Export
-    const data = exportDatabase();
+    const data = await exportDatabase();
 
     // Add extra data that should be wiped on import
-    addProvider({
+    await addProvider({
       name: "Extra",
       api_type: "anthropic",
       base_url: "http://localhost",
@@ -1242,19 +1241,19 @@ describe("Backup / Restore", () => {
     });
 
     // Import original backup (should wipe "Extra")
-    importDatabase(data);
+    await importDatabase(data);
 
-    const providers = getProviders();
+    const providers = await getProviders();
     expect(providers).toHaveLength(1);
     expect(providers[0].name).toBe("P1");
 
-    const users = getUsers();
+    const users = await getUsers();
     expect(users).toHaveLength(1);
     expect((users[0] as Record<string, unknown>).tg_user_id).toBe(111);
   });
 
-  it("importDatabase clears all data when importing empty backup", () => {
-    addProvider({
+  it("importDatabase clears all data when importing empty backup", async () => {
+    await addProvider({
       name: "P1",
       api_type: "openai_chat",
       base_url: "http://localhost",
@@ -1274,25 +1273,25 @@ describe("Backup / Restore", () => {
       },
     };
 
-    importDatabase(emptyBackup);
+    await importDatabase(emptyBackup);
 
-    expect(getProviders()).toHaveLength(0);
-    expect(getUsers()).toHaveLength(0);
+    expect(await getProviders()).toHaveLength(0);
+    expect(await getUsers()).toHaveLength(0);
   });
 
-  it("importDatabase rejects foreign key violations and rolls back", () => {
-    addUser(111, "alice");
-    addApiKey(111);
-    const data = exportDatabase();
+  it("importDatabase rejects foreign key violations and rolls back", async () => {
+    await addUser(111, "alice");
+    await addApiKey(111);
+    const data = await exportDatabase();
     const tampered: BackupData = JSON.parse(JSON.stringify(data));
     tampered.tables.api_keys[0].user_id = 999999;
 
-    expect(() => importDatabase(tampered)).toThrow(/foreign key violations|Invalid backup/);
-    expect(getKeysByUser(111)).toHaveLength(1);
+    await expect(importDatabase(tampered)).rejects.toThrow(/foreign key violations|Invalid backup/);
+    expect(await getKeysByUser(111)).toHaveLength(1);
   });
 
-  it("importDatabase rejects orphan model prices and rolls back", () => {
-    addProvider({
+  it("importDatabase rejects orphan model prices and rolls back", async () => {
+    await addProvider({
       name: "OpenAI",
       api_type: "openai_chat",
       base_url: "https://api.openai.com/v1",
@@ -1327,22 +1326,20 @@ describe("Backup / Restore", () => {
       },
     };
 
-    expect(() => importDatabase(orphanBackup)).toThrow(/model_prices.*providers|foreign key violations|Invalid backup/);
-    expect(getProviders()).toHaveLength(1);
+    await expect(importDatabase(orphanBackup)).rejects.toThrow(/model_prices.*providers|foreign key violations|Invalid backup/);
+    expect(await getProviders()).toHaveLength(1);
   });
 
-  it("importDatabase throws on invalid format", () => {
-    expect(() => importDatabase(null as unknown as BackupData)).toThrow();
-    expect(() => importDatabase({} as BackupData)).toThrow();
-    expect(() =>
-      importDatabase({ version: 1, exportedAt: "", tables: null } as unknown as BackupData),
-    ).toThrow();
-    expect(() =>
-      importDatabase({ version: 1, exportedAt: "", tables: "not-object" } as unknown as BackupData),
-    ).toThrow();
+  it("importDatabase throws on invalid format", async () => {
+    await expect(importDatabase(null as unknown as BackupData)).rejects.toThrow();
+    await expect(importDatabase({} as BackupData)).rejects.toThrow();
+    await expect(importDatabase({ version: 1, exportedAt: "", tables: null } as unknown as BackupData),
+    ).rejects.toThrow();
+    await expect(importDatabase({ version: 1, exportedAt: "", tables: "not-object" } as unknown as BackupData),
+    ).rejects.toThrow();
   });
 
-  it("importDatabase handles rows with missing columns (backward compat)", () => {
+  it("importDatabase handles rows with missing columns (backward compat)", async () => {
     // Simulate old backup missing newer columns (e.g., key_strategy)
     const data: BackupData = {
       version: 1,
@@ -1368,14 +1365,14 @@ describe("Backup / Restore", () => {
       },
     };
 
-    importDatabase(data);
+    await importDatabase(data);
 
-    const providers = getProviders();
+    const providers = await getProviders();
     expect(providers).toHaveLength(1);
     expect(providers[0].name).toBe("OldProvider");
   });
 
-  it("importDatabase ignores unknown columns in backup (forward compat)", () => {
+  it("importDatabase ignores unknown columns in backup (forward compat)", async () => {
     const data: BackupData = {
       version: 1,
       exportedAt: "2024-01-01T00:00:00.000Z",
@@ -1401,12 +1398,12 @@ describe("Backup / Restore", () => {
     };
 
     // Should not throw — unknown columns silently dropped
-    expect(() => importDatabase(data)).not.toThrow();
-    expect(getProviders()).toHaveLength(1);
+    await expect(importDatabase(data)).resolves.toBeUndefined();
+    expect(await getProviders()).toHaveLength(1);
   });
 
-  it("full round-trip: export → clear → import → export produces same data", () => {
-    addProvider({
+  it("full round-trip: export → clear → import → export produces same data", async () => {
+    await addProvider({
       name: "P1",
       api_type: "openai_chat",
       base_url: "http://localhost",
@@ -1415,7 +1412,7 @@ describe("Backup / Restore", () => {
       input_price: 1.5,
       output_price: 2.5,
     });
-    addProvider({
+    await addProvider({
       name: "P2",
       api_type: "anthropic",
       base_url: "http://localhost",
@@ -1424,11 +1421,11 @@ describe("Backup / Restore", () => {
       input_price: 3,
       output_price: 4,
     });
-    addUser(111, "alice");
-    addUser(222, "bob");
-    setSetting("api_url", "http://example.com");
+    await addUser(111, "alice");
+    await addUser(222, "bob");
+    await setSetting("api_url", "http://example.com");
 
-    const data1 = exportDatabase();
+    const data1 = await exportDatabase();
 
     // Wipe and re-import
     const emptyBackup: BackupData = {
@@ -1439,10 +1436,10 @@ describe("Backup / Restore", () => {
         model_restrictions: [], user_groups: [], model_mappings: [],
       },
     };
-    importDatabase(emptyBackup);
-    importDatabase(data1);
+    await importDatabase(emptyBackup);
+    await importDatabase(data1);
 
-    const data2 = exportDatabase();
+    const data2 = await exportDatabase();
 
     // Compare table counts
     for (const table of Object.keys(data1.tables)) {

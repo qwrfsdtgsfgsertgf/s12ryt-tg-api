@@ -1,5 +1,25 @@
 # Deep Todos
 
+## 2026-07-06 - Web UI 更新方法選擇按鈕
+
+- [x] **updater.ts: performUpdate 加 method 參數**(commit `6251963`):新增 `export type UpdateMethod = "auto" | "prebuilt" | "blue-green"`;`performUpdate(onProgress?, method = "auto")` 改為三分支邏輯 — `blue-green` 強制走 tarball Blue-Green 路徑、`prebuilt` 強制走 prebuilt(無 asset 則回報錯誤)、`auto` 維持既有自動偵測(有 prebuilt asset 優先,否則 Blue-Green)。
+- [x] **routes.ts: POST /api/admin/update 接 body.method**(commit `6251963`):讀 `body.method`,白名單驗證(`rawMethod === "prebuilt" || rawMethod === "blue-green"`),其餘一律歸類為 `auto`;將驗證後的 `method` 傳給 `performUpdate(undefined, method)`。舊版前端未傳 `method` 自動 fallback 到 `auto`,完全向後相容。
+- [x] **app.js: pageSystem 檢查更新區改一排方法按鈕**(commit `6251963`):單一更新按鈕 → 一排 SVG 圖示按鈕;從 `release.assets` 偵測 `hasPrebuilt`(有 prebuilt asset 才顯示 prebuilt 按鈕);prebuilt 按鈕用 `ic.download`、Blue-Green 按鈕用 `ic.refresh`;`runUpdate(method)` 發 POST 帶 `{method, restart:true}`;被點擊按鈕顯示「更新中...」並停用全部 `btn-update-*` 防重複點擊。
+- [x] **修 method 顯示 bug**(commit `6251963`):原 `blue-green`/`tarball`/git pull 三分支缺少 `prebuilt` case,導致 prebuilt 更新結果錯誤 fallback 到 git pull 顯示。新增 `methodLabel()` 函式涵蓋全部 4 種 method(`prebuilt`/`blue-green`/`tarball`/`git`),純文字無 emoji。
+- [x] 驗證:`tsc --noEmit` 零錯誤;`vitest run` 409 passed(18 檔案,含 updater 36 測試),無回歸。
+
+## 2026-07-06 - Prebuilt bundle 更新路徑(CI 預編譯,秒級部署)
+
+- [x] **CI 預編譯 release asset**(commit `9de2212`):`.github/workflows/release.yml` 的 `latest-release` 與 `tagged-release` 兩個 job 都新增 prebuilt bundle 建置步驟 — `npm ci` + `npm run build` + `npm prune --omit=dev`,打包 `dist`/`node_modules`/`web`/`scripts`/`start.js`/`package.json` 為固定檔名 `s12ryt-tg-api-dist.tar.gz` 並上傳為 Release asset。
+- [x] **updater.ts: ReleaseAsset 介面與 assets 解析**(commit `9de2212`):新增 `ReleaseAsset` 介面(`{name, browser_download_url, size}`);`ReleaseInfo` 加 `assets: ReleaseAsset[]` 欄位;`getLatestRelease` 從 API response 解析 assets。
+- [x] **updater.ts: findPrebuiltAsset**(commit `9de2212`):優先精確檔名比對 `s12ryt-tg-api-dist.tar.gz`,fallback 用 pattern 比對(`/-dist\.tar\.gz$/` 或含 `dist` 與 `tar.gz`)。
+- [x] **updater.ts: downloadPrebuiltAndExtract**(commit `9de2212`):下載 tarball → 解壓 → 用 `SWAP_ITEMS` 過濾(與 `shouldStageItem` 不同,**保留 `node_modules`**)。解壓後根目錄平坦(`dist/`、`node_modules/`、`web/` 等直接在根)。
+- [x] **updater.ts: performPrebuiltUpdate**(commit `9de2212`):download → extract → validate → atomic swap,**零 npm install、零 tsc build**。`SWAP_ITEMS` 新增 `start.js` 讓啟動器一起更新。
+- [x] **updater.ts: performUpdate 自動偵測**(commit `9de2212`):有 prebuilt asset → 走輕量 prebuilt 路徑;無 asset(舊版 release)→ fallback 到 Blue-Green。`UpdateResult.method` 新增 `'prebuilt'`。
+- [x] **測試**(commit `9de2212`):新增 8 個測試 — `findPrebuiltAsset` 6 個情境(精確名/pattern/無 asset/多 asset/大小寫/URL 含 dist)+ `getLatestRelease` assets 解析 2 個情境。總計 409 passed。
+- [x] **使用場景**:Pterodactyl 容器(原始碼部署 + `start.js` 啟動器,非 `node dist/`)。`/update` 從 3-10 分鐘降至 10-30 秒(下載 + swap + restart)。
+- [x] **向後相容**:舊版 release 無 prebuilt asset → `findPrebuiltAsset` 回 null → 自動 fallback Blue-Green。舊版 v1.8.6 前端第一次更新仍走 Blue-Green(舊碼無 prebuilt 邏輯),之後更新才用 prebuilt。
+
 ## 2026-07-06 - 串流 token usage 注入與輸入 token 估算修復
 
 - [x] **串流客戶端斷線資源洩漏修復**（commit `1c7cc83`）：`forwardStreamAndExtractUsage` 和 `extractUsageFromProviderStream`（server.ts）加上 `res?: Response` 參數 + `res.on('close', onClientClose)` 監聽；前者改用手動 `iterator = stream[Symbol.asyncIterator]()` + `while` 迴圈以便呼叫 `iterator.return()`，後者複用既有冪等的 `cancelProviderStream()`。5 個呼叫點全部傳入 `res`（chat/completions forward ~L810、responses 直通 forward ~L957、messages 直通 forward ~L1296、responses 轉換 extract ~L1124、messages 轉換 extract ~L1426）。provider 端 streaming generator 已有完整 `finally`（`requestTimeout.abort()` + `reader.cancel()` + `reader.releaseLock()`），無需改動。
@@ -101,3 +121,16 @@
 - [x] 更新 README 中的快速開始、工程描述、專案結構與技術棧。
 - [x] 更新插件範例 README 中對 Python 版本的描述。
 - [x] 執行文件搜尋驗證，確認舊 `cd python` / `python/` 路徑未殘留於 Markdown 文件。
+
+## 2026-07-09 - 雲端資料庫遷移工程（階段 0/1 完成，階段 2 待新 session）
+
+- [x] **設計文件** `agent/db-cloud-migration-design.md`（12 章：路線對比/方言對照/5 機制改造/6 階段計畫/7 風險）。
+- [x] **使用者決策**：策略 B（可選後端）/ 路線 A（抽象 driver）/ TEXT 統一型別 / MySQL 8.0+ / PG+MySQL 都要。
+- [x] **階段 0** `nodejs/src/db/driver/types.ts`（DbDriver 介面）+ `nodejs/src/db/dialect.ts`（NOW 常數）。
+- [x] **階段 1** `nodejs/src/db/driver/sqliteDriver.ts`（SqliteDriver + getRawDatabase）+ `nodejs/src/db/driver/factory.ts`（createDriver 分流，PG/MySQL 佔位 throw）+ `tests/sqliteDriver.test.ts`（23）+ `tests/driverFactory.test.ts`（7）。
+- [x] **驗證**：tsc 零錯；vitest 20 檔 439 tests 全綠（409 原 + 30 新）；database.ts/database.test.ts 零改動（git 確認）。
+- [x] **階段 2 調查**：database.ts 全文 2430 行完整讀取，改造規則提煉至 `agent/stage2-async-migration.md`。
+- [ ] **階段 2**（待新 session）：database.ts 全面 async 化 + 14 呼叫檔 await + database.test.ts async 化。⭐接手必讀 `agent/stage2-async-migration.md`。大爆炸改動，需完整 session 收尾。
+- [ ] 階段 3：PostgresDriver（pg.Pool + $1 placeholder + RETURNING id）+ PG DDL + backup transaction 版。
+- [ ] 階段 4：MysqlDriver（mysql2 Pool + LAST_INSERT_ID）+ MySQL DDL。
+- [ ] 階段 5：環境變數文檔、Docker Compose PG/MySQL 範例、SQLite→雲端遷移工具、agent 文件。

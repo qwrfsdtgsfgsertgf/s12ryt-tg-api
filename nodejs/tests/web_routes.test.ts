@@ -180,20 +180,20 @@ afterAll(() => {
 // ===========================================================================
 
 /** Get a valid admin session token */
-function adminSession(): string {
+async function adminSession(): Promise<string> {
   clearAllAuth();
   const otp = generateLoginToken(MOCK_ADMIN_ID);
-  return exchangeToken(otp)!.sessionToken;
+  return (await exchangeToken(otp))!.sessionToken;
 }
 
 /** Get a valid non-admin user session token (requires getUserByTgId mock) */
-function userSession(tgUserId = 99999): string {
+async function userSession(tgUserId = 99999): Promise<string> {
   clearAllAuth();
-  vi.mocked(db.getUserByTgId).mockReturnValue({
+  vi.mocked(db.getUserByTgId).mockResolvedValue({
     id: 1, tg_user_id: tgUserId, username: "testuser", is_active: 1,
   });
   const otp = generateLoginToken(tgUserId);
-  return exchangeToken(otp)!.sessionToken;
+  return (await exchangeToken(otp))!.sessionToken;
 }
 
 // ===========================================================================
@@ -204,7 +204,7 @@ describe("Auth Routes", () => {
   beforeEach(() => {
     clearAllAuth();
     vi.mocked(db.getUserByTgId).mockReset();
-    vi.mocked(db.getUserByTgId).mockReturnValue(undefined);
+    vi.mocked(db.getUserByTgId).mockResolvedValue(undefined);
   });
 
   describe("POST /web/api/auth/login", () => {
@@ -247,7 +247,7 @@ describe("Auth Routes", () => {
 
   describe("POST /web/api/auth/logout", () => {
     it("destroys session", async () => {
-      const session = adminSession();
+      const session = await adminSession();
       const res = await request(app)
         .post("/web/api/auth/logout")
         .set("Authorization", `Bearer ${session}`);
@@ -259,8 +259,8 @@ describe("Auth Routes", () => {
 
   describe("GET /web/api/auth/me", () => {
     it("returns admin info without DB record", async () => {
-      vi.mocked(db.getUserByTgId).mockReturnValue(undefined);
-      const session = adminSession();
+      vi.mocked(db.getUserByTgId).mockResolvedValue(undefined);
+      const session = await adminSession();
       const res = await request(app)
         .get("/web/api/auth/me")
         .set("Authorization", `Bearer ${session}`);
@@ -273,10 +273,10 @@ describe("Auth Routes", () => {
     });
 
     it("returns user info with DB record", async () => {
-      vi.mocked(db.getUserByTgId).mockReturnValue({
+      vi.mocked(db.getUserByTgId).mockResolvedValue({
         id: 1, tg_user_id: 99999, username: "testuser", is_active: 1,
       });
-      const session = userSession(99999);
+      const session = await userSession(99999);
       const res = await request(app)
         .get("/web/api/auth/me")
         .set("Authorization", `Bearer ${session}`);
@@ -295,7 +295,7 @@ describe("Auth Routes", () => {
 describe("User Routes — Models", () => {
   it("returns cached model list", async () => {
     vi.mocked(db.getAllCachedModelNames).mockReturnValue(["gpt-4o", "claude-3.5-sonnet"]);
-    const session = adminSession();
+    const session = await adminSession();
     const res = await request(app)
       .get("/web/api/models")
       .set("Authorization", `Bearer ${session}`);
@@ -321,8 +321,8 @@ describe("User Routes — Keys", () => {
 
   describe("GET /web/api/keys", () => {
     it("returns empty list when no keys", async () => {
-      vi.mocked(db.getKeysByUser).mockReturnValue([]);
-      const session = adminSession();
+      vi.mocked(db.getKeysByUser).mockResolvedValue([]);
+      const session = await adminSession();
       const res = await request(app)
         .get("/web/api/keys")
         .set("Authorization", `Bearer ${session}`);
@@ -332,10 +332,10 @@ describe("User Routes — Keys", () => {
     });
 
     it("masks key preview in response", async () => {
-      vi.mocked(db.getKeysByUser).mockReturnValue([
+      vi.mocked(db.getKeysByUser).mockResolvedValue([
         { id: 1, key: "sk-s12ryt-verylongkey1234567890", is_active: 1, created_at: "2024-01-01" },
       ]);
-      const session = adminSession();
+      const session = await adminSession();
       const res = await request(app)
         .get("/web/api/keys")
         .set("Authorization", `Bearer ${session}`);
@@ -349,10 +349,10 @@ describe("User Routes — Keys", () => {
   describe("POST /web/api/keys — auto-create user fix", () => {
     it("auto-creates user record for admin without DB entry", async () => {
       // Admin has no DB record
-      vi.mocked(db.getUserByTgId).mockReturnValue(undefined);
-      vi.mocked(db.addApiKey).mockReturnValue({ key: "sk-new-key-12345" });
+      vi.mocked(db.getUserByTgId).mockResolvedValue(undefined);
+      vi.mocked(db.addApiKey).mockResolvedValue({ key: "sk-new-key-12345" });
 
-      const session = adminSession();
+      const session = await adminSession();
       const res = await request(app)
         .post("/web/api/keys")
         .set("Authorization", `Bearer ${session}`);
@@ -365,12 +365,12 @@ describe("User Routes — Keys", () => {
     });
 
     it("does NOT call addUser when user already exists", async () => {
-      vi.mocked(db.getUserByTgId).mockReturnValue({
+      vi.mocked(db.getUserByTgId).mockResolvedValue({
         id: 5, tg_user_id: MOCK_ADMIN_ID, is_active: 1,
       });
-      vi.mocked(db.addApiKey).mockReturnValue({ key: "sk-new-key-67890" });
+      vi.mocked(db.addApiKey).mockResolvedValue({ key: "sk-new-key-67890" });
 
-      const session = adminSession();
+      const session = await adminSession();
       const res = await request(app)
         .post("/web/api/keys")
         .set("Authorization", `Bearer ${session}`);
@@ -381,14 +381,14 @@ describe("User Routes — Keys", () => {
     });
 
     it("returns 500 when addApiKey throws", async () => {
-      vi.mocked(db.getUserByTgId).mockReturnValue({
+      vi.mocked(db.getUserByTgId).mockResolvedValue({
         id: 1, tg_user_id: MOCK_ADMIN_ID, is_active: 1,
       });
       vi.mocked(db.addApiKey).mockImplementation(() => {
         throw new Error("DB error");
       });
 
-      const session = adminSession();
+      const session = await adminSession();
       const res = await request(app)
         .post("/web/api/keys")
         .set("Authorization", `Bearer ${session}`);
@@ -399,7 +399,7 @@ describe("User Routes — Keys", () => {
 
   describe("GET /web/api/keys/:id", () => {
     it("returns 400 for invalid key ID", async () => {
-      const session = adminSession();
+      const session = await adminSession();
       const res = await request(app)
         .get("/web/api/keys/abc")
         .set("Authorization", `Bearer ${session}`);
@@ -409,10 +409,10 @@ describe("User Routes — Keys", () => {
 
     it("returns 403 when key belongs to another user (IDOR)", async () => {
       // getKeysByUser returns a list NOT containing the requested id
-      vi.mocked(db.getKeysByUser).mockReturnValue([
+      vi.mocked(db.getKeysByUser).mockResolvedValue([
         { id: 1, key: "sk-key1", is_active: 1 },
       ]);
-      const session = adminSession();
+      const session = await adminSession();
       const res = await request(app)
         .get("/web/api/keys/999")
         .set("Authorization", `Bearer ${session}`);
@@ -421,7 +421,7 @@ describe("User Routes — Keys", () => {
     });
 
     it("returns full key value for own key", async () => {
-      vi.mocked(db.getKeysByUser).mockReturnValue([
+      vi.mocked(db.getKeysByUser).mockResolvedValue([
         {
           id: 5,
           key: "sk-s12ryt-mykey123456",
@@ -429,7 +429,7 @@ describe("User Routes — Keys", () => {
           created_at: "2024-01-01",
         },
       ]);
-      const session = adminSession();
+      const session = await adminSession();
       const res = await request(app)
         .get("/web/api/keys/5")
         .set("Authorization", `Bearer ${session}`);
@@ -443,7 +443,7 @@ describe("User Routes — Keys", () => {
 
   describe("DELETE /web/api/keys/:id", () => {
     it("returns 400 for invalid key ID", async () => {
-      const session = adminSession();
+      const session = await adminSession();
       const res = await request(app)
         .delete("/web/api/keys/abc")
         .set("Authorization", `Bearer ${session}`);
@@ -452,10 +452,10 @@ describe("User Routes — Keys", () => {
     });
 
     it("returns 403 when key belongs to another user", async () => {
-      vi.mocked(db.getKeysByUser).mockReturnValue([
+      vi.mocked(db.getKeysByUser).mockResolvedValue([
         { id: 1, key: "sk-key1", is_active: 1 },
       ]);
-      const session = adminSession();
+      const session = await adminSession();
       const res = await request(app)
         .delete("/web/api/keys/999")
         .set("Authorization", `Bearer ${session}`);
@@ -464,11 +464,11 @@ describe("User Routes — Keys", () => {
     });
 
     it("deletes own key successfully", async () => {
-      vi.mocked(db.getKeysByUser).mockReturnValue([
+      vi.mocked(db.getKeysByUser).mockResolvedValue([
         { id: 5, key: "sk-key5", is_active: 1 },
       ]);
-      vi.mocked(db.deleteApiKey).mockReturnValue(undefined);
-      const session = adminSession();
+      vi.mocked(db.deleteApiKey).mockResolvedValue(undefined);
+      const session = await adminSession();
       const res = await request(app)
         .delete("/web/api/keys/5")
         .set("Authorization", `Bearer ${session}`);
@@ -485,8 +485,8 @@ describe("User Routes — Keys", () => {
 
 describe("User Routes — Usage", () => {
   it("returns usage records and summary", async () => {
-    vi.mocked(db.getUsageByUser).mockReturnValue([]);
-    const session = adminSession();
+    vi.mocked(db.getUsageByUser).mockResolvedValue([]);
+    const session = await adminSession();
     const res = await request(app)
       .get("/web/api/usage")
       .set("Authorization", `Bearer ${session}`);
@@ -511,8 +511,8 @@ describe("User Routes — Coding", () => {
 
   describe("GET /web/api/coding", () => {
     it("returns null config when no coding config", async () => {
-      vi.mocked(db.getCodingConfigByTgId).mockReturnValue(null);
-      const session = adminSession();
+      vi.mocked(db.getCodingConfigByTgId).mockResolvedValue(null);
+      const session = await adminSession();
       const res = await request(app)
         .get("/web/api/coding")
         .set("Authorization", `Bearer ${session}`);
@@ -524,8 +524,8 @@ describe("User Routes — Coding", () => {
 
   describe("PUT /web/api/coding", () => {
     it("returns 404 when user does not exist", async () => {
-      vi.mocked(db.getUserByTgId).mockReturnValue(undefined);
-      const session = adminSession();
+      vi.mocked(db.getUserByTgId).mockResolvedValue(undefined);
+      const session = await adminSession();
       const res = await request(app)
         .put("/web/api/coding")
         .set("Authorization", `Bearer ${session}`)
@@ -535,13 +535,13 @@ describe("User Routes — Coding", () => {
     });
 
     it("updates coding config for existing user", async () => {
-      vi.mocked(db.getUserByTgId).mockReturnValue({
+      vi.mocked(db.getUserByTgId).mockResolvedValue({
         id: 1, tg_user_id: MOCK_ADMIN_ID, is_active: 1,
       });
-      vi.mocked(db.setCodingConfig).mockReturnValue({
+      vi.mocked(db.setCodingConfig).mockResolvedValue({
         is_active: 1, fallback_models: "", max_retries: 3,
       });
-      const session = adminSession();
+      const session = await adminSession();
       const res = await request(app)
         .put("/web/api/coding")
         .set("Authorization", `Bearer ${session}`)
@@ -559,8 +559,8 @@ describe("User Routes — Coding", () => {
 
 describe("User Routes — Limits", () => {
   it("returns 404 when user does not exist", async () => {
-    vi.mocked(db.getUserByTgId).mockReturnValue(undefined);
-    const session = adminSession();
+    vi.mocked(db.getUserByTgId).mockResolvedValue(undefined);
+    const session = await adminSession();
     const res = await request(app)
       .get("/web/api/limits")
       .set("Authorization", `Bearer ${session}`);
@@ -569,10 +569,10 @@ describe("User Routes — Limits", () => {
   });
 
   it("returns limits for existing user", async () => {
-    vi.mocked(db.getUserByTgId).mockReturnValue({
+    vi.mocked(db.getUserByTgId).mockResolvedValue({
       id: 1, tg_user_id: MOCK_ADMIN_ID, is_active: 1,
     });
-    const session = adminSession();
+    const session = await adminSession();
     const res = await request(app)
       .get("/web/api/limits")
       .set("Authorization", `Bearer ${session}`);
@@ -586,8 +586,8 @@ describe("User Routes — Limits", () => {
 
 describe("User Routes — Restrictions", () => {
   it("returns 404 when user does not exist", async () => {
-    vi.mocked(db.getUserByTgId).mockReturnValue(undefined);
-    const session = adminSession();
+    vi.mocked(db.getUserByTgId).mockResolvedValue(undefined);
+    const session = await adminSession();
     const res = await request(app)
       .get("/web/api/restrictions")
       .set("Authorization", `Bearer ${session}`);
@@ -596,11 +596,11 @@ describe("User Routes — Restrictions", () => {
   });
 
   it("returns restrictions for existing user", async () => {
-    vi.mocked(db.getUserByTgId).mockReturnValue({
+    vi.mocked(db.getUserByTgId).mockResolvedValue({
       id: 1, tg_user_id: MOCK_ADMIN_ID, is_active: 1,
     });
-    vi.mocked(db.getModelRestrictionsForUser).mockReturnValue([]);
-    const session = adminSession();
+    vi.mocked(db.getModelRestrictionsForUser).mockResolvedValue([]);
+    const session = await adminSession();
     const res = await request(app)
       .get("/web/api/restrictions")
       .set("Authorization", `Bearer ${session}`);
@@ -616,8 +616,8 @@ describe("User Routes — Restrictions", () => {
 
 describe("User Routes — URL", () => {
   it("returns API URL from settings", async () => {
-    vi.mocked(db.getSetting).mockReturnValue("http://custom-api.example.com");
-    const session = adminSession();
+    vi.mocked(db.getSetting).mockResolvedValue("http://custom-api.example.com");
+    const session = await adminSession();
     const res = await request(app)
       .get("/web/api/url")
       .set("Authorization", `Bearer ${session}`);
@@ -627,8 +627,8 @@ describe("User Routes — URL", () => {
   });
 
   it("falls back to DEFAULT_API_URL when setting missing", async () => {
-    vi.mocked(db.getSetting).mockReturnValue(null);
-    const session = adminSession();
+    vi.mocked(db.getSetting).mockResolvedValue(null);
+    const session = await adminSession();
     const res = await request(app)
       .get("/web/api/url")
       .set("Authorization", `Bearer ${session}`);
@@ -657,7 +657,7 @@ describe("Admin Routes — Version & Update", () => {
         hash: "abc1234", date: "2024-01-01", message: "feat: test", tag: "v1.2.0",
       });
       vi.mocked(updater.isWorkingDirClean).mockReturnValue(true);
-      const session = adminSession();
+      const session = await adminSession();
       const res = await request(app)
         .get("/web/api/admin/version")
         .set("Authorization", `Bearer ${session}`);
@@ -680,7 +680,7 @@ describe("Admin Routes — Version & Update", () => {
         commitsBehind: 3,
         newCommits: ["feat: a", "fix: b", "docs: c"],
       });
-      const session = adminSession();
+      const session = await adminSession();
       const res = await request(app)
         .get("/web/api/admin/check-update")
         .set("Authorization", `Bearer ${session}`);
@@ -692,7 +692,7 @@ describe("Admin Routes — Version & Update", () => {
 
     it("returns 500 when fetchAndCheckUpdate throws", async () => {
       vi.mocked(updater.fetchAndCheckUpdate).mockRejectedValue(new Error("network"));
-      const session = adminSession();
+      const session = await adminSession();
       const res = await request(app)
         .get("/web/api/admin/check-update")
         .set("Authorization", `Bearer ${session}`);
@@ -706,7 +706,7 @@ describe("Admin Routes — Version & Update", () => {
       vi.mocked(updater.performUpdate).mockResolvedValue({
         success: true, message: "ok", method: "blue-green",
       });
-      const session = adminSession();
+      const session = await adminSession();
       const res = await request(app)
         .post("/web/api/admin/update")
         .set("Authorization", `Bearer ${session}`)
@@ -722,7 +722,7 @@ describe("Admin Routes — Version & Update", () => {
       vi.mocked(updater.performUpdate).mockResolvedValue({
         success: true, message: "ok", method: "blue-green",
       });
-      const session = adminSession();
+      const session = await adminSession();
       const res = await request(app)
         .post("/web/api/admin/update")
         .set("Authorization", `Bearer ${session}`)
@@ -736,7 +736,7 @@ describe("Admin Routes — Version & Update", () => {
 
   describe("POST /web/api/admin/restart", () => {
     it("restarts with default delay", async () => {
-      const session = adminSession();
+      const session = await adminSession();
       const res = await request(app)
         .post("/web/api/admin/restart")
         .set("Authorization", `Bearer ${session}`)
@@ -748,7 +748,7 @@ describe("Admin Routes — Version & Update", () => {
     });
 
     it("restarts with custom delay", async () => {
-      const session = adminSession();
+      const session = await adminSession();
       const res = await request(app)
         .post("/web/api/admin/restart")
         .set("Authorization", `Bearer ${session}`)
@@ -775,7 +775,7 @@ describe("Admin Routes — Backups & Rollback", () => {
       vi.mocked(updater.getBackupList).mockReturnValue([
         { name: ".backup-1718534400000", timestamp: 1718534400000, createdAt: new Date(1718534400000) },
       ]);
-      const session = adminSession();
+      const session = await adminSession();
       const res = await request(app)
         .get("/web/api/admin/backups")
         .set("Authorization", `Bearer ${session}`);
@@ -787,7 +787,7 @@ describe("Admin Routes — Backups & Rollback", () => {
 
     it("returns empty list when no backups", async () => {
       vi.mocked(updater.getBackupList).mockReturnValue([]);
-      const session = adminSession();
+      const session = await adminSession();
       const res = await request(app)
         .get("/web/api/admin/backups")
         .set("Authorization", `Bearer ${session}`);
@@ -802,7 +802,7 @@ describe("Admin Routes — Backups & Rollback", () => {
       vi.mocked(updater.rollbackAndRestart).mockReturnValue({
         success: true, message: "已回滾到備份",
       });
-      const session = adminSession();
+      const session = await adminSession();
       const res = await request(app)
         .post("/web/api/admin/rollback")
         .set("Authorization", `Bearer ${session}`);
@@ -824,7 +824,7 @@ describe("Admin Routes — Providers", () => {
     vi.mocked(db.addProvider).mockReset();
     vi.mocked(db.updateProvider).mockReset();
     vi.mocked(db.getSetting).mockReset();
-    vi.mocked(db.getSetting).mockReturnValue(null);
+    vi.mocked(db.getSetting).mockResolvedValue(null);
     vi.mocked(db.setSetting).mockReset();
     (globalThis as any).fetch = vi.fn().mockResolvedValue({
       ok: false,
@@ -834,7 +834,7 @@ describe("Admin Routes — Providers", () => {
   });
 
   it("redacts Google API key from provider test-model error URL", async () => {
-    vi.mocked(db.getProviders).mockReturnValue([
+    vi.mocked(db.getProviders).mockResolvedValue([
       {
         id: 1,
         name: "Gemini",
@@ -848,7 +848,7 @@ describe("Admin Routes — Providers", () => {
         output_price: 0,
       } as any,
     ]);
-    const session = adminSession();
+    const session = await adminSession();
 
     const res = await request(app)
       .post("/web/api/admin/providers/1/test-model")
@@ -865,7 +865,7 @@ describe("Admin Routes — Providers", () => {
   });
 
   it("saves sanitized provider User-Agent when adding provider", async () => {
-    const session = adminSession();
+    const session = await adminSession();
 
     const res = await request(app)
       .post("/web/api/admin/providers")
@@ -886,7 +886,7 @@ describe("Admin Routes — Providers", () => {
   });
 
   it("rejects provider User-Agent with newline characters", async () => {
-    const session = adminSession();
+    const session = await adminSession();
 
     const res = await request(app)
       .post("/web/api/admin/providers")
@@ -904,7 +904,7 @@ describe("Admin Routes — Providers", () => {
   });
 
   it("saves sanitized provider User-Agent when updating provider", async () => {
-    const session = adminSession();
+    const session = await adminSession();
 
     const res = await request(app)
       .put("/web/api/admin/providers/1")
@@ -923,7 +923,7 @@ describe("Admin Routes — Providers", () => {
       if (key === "provider_default_user_agent") return "GlobalUA/1.0";
       return null;
     });
-    const session = adminSession();
+    const session = await adminSession();
 
     const getRes = await request(app)
       .get("/web/api/admin/settings")
@@ -945,7 +945,7 @@ describe("Admin Routes — Providers", () => {
   });
 
   it("rejects global provider User-Agent with newline characters", async () => {
-    const session = adminSession();
+    const session = await adminSession();
 
     const res = await request(app)
       .put("/web/api/admin/settings")
@@ -976,12 +976,12 @@ describe("Access Control", () => {
   });
 
   it("returns 403 when non-admin accesses admin route", async () => {
-    vi.mocked(db.getUserByTgId).mockReturnValue({
+    vi.mocked(db.getUserByTgId).mockResolvedValue({
       id: 1, tg_user_id: 99999, username: "user", is_active: 1,
     });
     clearAllAuth();
     const otp = generateLoginToken(99999);
-    const { sessionToken } = exchangeToken(otp)!;
+    const { sessionToken } = (await exchangeToken(otp))!;
 
     const res = await request(app)
       .get("/web/api/admin/version")
@@ -991,13 +991,13 @@ describe("Access Control", () => {
   });
 
   it("non-admin can access user routes", async () => {
-    vi.mocked(db.getUserByTgId).mockReturnValue({
+    vi.mocked(db.getUserByTgId).mockResolvedValue({
       id: 1, tg_user_id: 99999, username: "user", is_active: 1,
     });
-    vi.mocked(db.getKeysByUser).mockReturnValue([]);
+    vi.mocked(db.getKeysByUser).mockResolvedValue([]);
     clearAllAuth();
     const otp = generateLoginToken(99999);
-    const { sessionToken } = exchangeToken(otp)!;
+    const { sessionToken } = (await exchangeToken(otp))!;
 
     const res = await request(app)
       .get("/web/api/keys")
@@ -1013,7 +1013,7 @@ describe("Access Control", () => {
 
 describe("Error Handling", () => {
   it("returns 404 for unknown /api/* route", async () => {
-    const session = adminSession();
+    const session = await adminSession();
     const res = await request(app)
       .get("/web/api/nonexistent")
       .set("Authorization", `Bearer ${session}`);
@@ -1023,7 +1023,7 @@ describe("Error Handling", () => {
   });
 
   it("returns 204 for favicon.ico (with auth)", async () => {
-    const session = adminSession();
+    const session = await adminSession();
     const res = await request(app)
       .get("/web/favicon.ico")
       .set("Authorization", `Bearer ${session}`);

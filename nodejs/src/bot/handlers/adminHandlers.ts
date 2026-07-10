@@ -158,7 +158,7 @@ async function providerConversation(
 ): Promise<void> {
   while (true) {
     await ctx.reply(PROVIDER_MENU_TEXT, {
-      reply_markup: webButton(ctx.from!.id, "providers"),
+      reply_markup: await webButton(ctx.from!.id, "providers"),
     });
     ctx = await conversation.wait();
     const choice = ctx.msg?.text?.trim() ?? "";
@@ -495,8 +495,8 @@ async function doAddProvider(
 
   // Save to DB
   try {
-    await conversation.external(() => {
-      addProvider({
+    await conversation.external(async () => {
+      await addProvider({
         name,
         api_type: apiType as Provider["api_type"],
         base_url: baseUrl,
@@ -507,9 +507,9 @@ async function doAddProvider(
       });
 
       // Get the newly created provider's ID
-      const newProvider = getProviders().find((p) => p.name === name);
+      const newProvider = (await getProviders()).find((p) => p.name === name);
       if (newProvider && modelPricingEntries.length > 0) {
-        batchUpsertModelPrices(newProvider.id, modelPricingEntries);
+        await batchUpsertModelPrices(newProvider.id, modelPricingEntries);
       }
     });
 
@@ -540,7 +540,7 @@ async function doDelProvider(
   conversation: MyConversation,
   ctx: MyContext
 ): Promise<void> {
-  const providers = getProviders();
+  const providers = await getProviders();
   if (providers.length === 0) {
     await ctx.reply("📭 目前沒有任何 Provider。");
     return;
@@ -565,7 +565,7 @@ async function doDelProvider(
   }
 
   try {
-    await conversation.external(() => { deleteProvider(selectedIds); });
+    await conversation.external(async () => { await deleteProvider(selectedIds); });
     await ctx.reply(`✅ 已刪除 ${selectedIds.length} 個 Provider。`);
   } catch (err) {
     await ctx.reply(`❌ 刪除失敗：${(err as Error).message}`);
@@ -577,7 +577,7 @@ async function doDelProvider(
 // ========================
 
 async function doListProviders(ctx: MyContext): Promise<void> {
-  const providers = getProviders();
+  const providers = await getProviders();
   if (providers.length === 0) {
     await ctx.reply("📭 目前沒有任何 Provider。");
     return;
@@ -586,14 +586,14 @@ async function doListProviders(ctx: MyContext): Promise<void> {
   const lines: string[] = [];
 
   for (const p of providers) {
-    const usage = getUsageByProvider(p.id);
+    const usage = await getUsageByProvider(p.id);
     const totalInputTokens = usage.reduce((s, u) => s + u.input_tokens, 0);
     const totalOutputTokens = usage.reduce((s, u) => s + u.output_tokens, 0);
     const totalInputCost = usage.reduce((s, u) => s + u.input_cost, 0);
     const totalOutputCost = usage.reduce((s, u) => s + u.output_cost, 0);
 
     // Get per-model pricing
-    const modelPrices = getModelPricesByProvider(p.id);
+    const modelPrices = await getModelPricesByProvider(p.id);
     const priceLines = modelPrices.length > 0
       ? modelPrices.map((mp) => `     ${mp.model}：輸入 $${mp.input_price ?? "—"} / 輸出 $${mp.output_price ?? "—"}`).join("\n")
       : `     （無模型定價）`;
@@ -623,7 +623,7 @@ async function doEditProvider(
   conversation: MyConversation,
   ctx: MyContext
 ): Promise<void> {
-  const providers = getProviders();
+  const providers = await getProviders();
   if (providers.length === 0) {
     await ctx.reply("📭 目前沒有任何 Provider。");
     return;
@@ -740,7 +740,7 @@ async function doEditProvider(
       const pricingMap = await conversation.external(() => fetchModelsPricing(newModelList));
 
       // Show current DB model prices for comparison
-      const dbPrices = getModelPricesByProvider(provider.id);
+      const dbPrices = await getModelPricesByProvider(provider.id);
       const dbPriceMap = new Map(dbPrices.map((p) => [p.model, p]));
 
       const pricingEntries: Array<{ model: string; input_price: number | null; output_price: number | null }> = [];
@@ -785,7 +785,7 @@ async function doEditProvider(
           await conversation.external(() => updateProvider(provider.id, { models: String(processedValue) }));
           try {
             const validEntries = pricingEntries.filter((e) => e.input_price !== null || e.output_price !== null);
-            await conversation.external(() => { batchUpsertModelPrices(provider.id, validEntries); });
+            await conversation.external(async () => { await batchUpsertModelPrices(provider.id, validEntries); });
             await ctx.reply(`✅ 已更新模型和 ${validEntries.length} 個模型的定價。`);
           } catch (err) {
             await ctx.reply(`⚠️ 定價更新失敗：${(err as Error).message}`);
@@ -804,7 +804,7 @@ async function doEditProvider(
             if (!isNaN(inp) && !isNaN(out)) {
               const uniformEntries = newModelList.map((m) => ({ model: m, input_price: inp, output_price: out }));
               try {
-                await conversation.external(() => { batchUpsertModelPrices(provider.id, uniformEntries); });
+                await conversation.external(async () => { await batchUpsertModelPrices(provider.id, uniformEntries); });
                 await ctx.reply(`✅ 已為 ${newModelList.length} 個模型設定統一定價：$${inp}/$${out}（每 1M tokens）`);
               } catch (err) {
                 await ctx.reply(`❌ 更新失敗：${(err as Error).message}`);
@@ -840,7 +840,7 @@ async function doEditProvider(
           }
           if (manualEntries.length > 0) {
             try {
-              await conversation.external(() => { batchUpsertModelPrices(provider.id, manualEntries); });
+              await conversation.external(async () => { await batchUpsertModelPrices(provider.id, manualEntries); });
               const savedLines = manualEntries.map((e) => `   ${e.model}：$${e.input_price}/$${e.output_price}`).join("\n");
               await ctx.reply(`✅ 已設定 ${manualEntries.length} 個模型的定價：\n${savedLines}`);
             } catch (err) {
@@ -869,7 +869,7 @@ async function doEditProvider(
     const pricingMap = await conversation.external(() => fetchModelsPricing(currentModels));
 
     // Show current model_prices from DB vs models.dev
-    const dbPrices = getModelPricesByProvider(provider.id);
+    const dbPrices = await getModelPricesByProvider(provider.id);
     const dbPriceMap = new Map(dbPrices.map((p) => [p.model, p]));
 
     const lines: string[] = [];
@@ -911,7 +911,7 @@ async function doEditProvider(
 
       if (priceChoice === "1") {
         try {
-          await conversation.external(() => { batchUpsertModelPrices(provider.id, pricingEntries); });
+          await conversation.external(async () => { await batchUpsertModelPrices(provider.id, pricingEntries); });
           await ctx.reply("✅ 已從 models.dev 更新所有模型定價。");
         } catch (err) {
           await ctx.reply(`❌ 更新失敗：${(err as Error).message}`);
@@ -929,7 +929,7 @@ async function doEditProvider(
           if (!isNaN(inp) && !isNaN(out)) {
             const uniformEntries = currentModels.map((m) => ({ model: m, input_price: inp, output_price: out }));
             try {
-              await conversation.external(() => { batchUpsertModelPrices(provider.id, uniformEntries); });
+              await conversation.external(async () => { await batchUpsertModelPrices(provider.id, uniformEntries); });
               await ctx.reply(`✅ 已為 ${currentModels.length} 個模型設定統一定價：$${inp}/$${out}（每 1M tokens）`);
             } catch (err) {
               await ctx.reply(`❌ 更新失敗：${(err as Error).message}`);
@@ -966,7 +966,7 @@ async function doEditProvider(
         }
         if (manualEntries.length > 0) {
           try {
-            await conversation.external(() => { batchUpsertModelPrices(provider.id, manualEntries); });
+            await conversation.external(async () => { await batchUpsertModelPrices(provider.id, manualEntries); });
             const savedLines = manualEntries.map((e) => `   ${e.model}：$${e.input_price}/$${e.output_price}`).join("\n");
             await ctx.reply(`✅ 已設定 ${manualEntries.length} 個模型的定價：\n${savedLines}`);
           } catch (err) {
@@ -1009,7 +1009,7 @@ async function doEditProvider(
       }
       if (manualEntries.length > 0) {
         try {
-          await conversation.external(() => { batchUpsertModelPrices(provider.id, manualEntries); });
+          await conversation.external(async () => { await batchUpsertModelPrices(provider.id, manualEntries); });
           const savedLines = manualEntries.map((e) => `   ${e.model}：$${e.input_price}/$${e.output_price}`).join("\n");
           await ctx.reply(`✅ 已設定 ${manualEntries.length} 個模型的定價：\n${savedLines}`);
         } catch (err) {
@@ -1045,7 +1045,7 @@ async function doEditProvider(
   }
 
   try {
-    await conversation.external(() => { updateProvider(provider.id, { [field.key]: processedValue }); });
+    await conversation.external(async () => { await updateProvider(provider.id, { [field.key]: processedValue }); });
     await ctx.reply(`✅ 已更新「${provider.name}」的${field.label}。`);
   } catch (err) {
     await ctx.reply(`❌ 更新失敗：${(err as Error).message}`);
@@ -1057,7 +1057,7 @@ async function doEditProvider(
 // ========================
 
 async function uuCommand(ctx: MyContext): Promise<void> {
-  const users = getUsers();
+  const users = await getUsers();
   if (users.length === 0) {
     await ctx.reply("📭 目前沒有任何使用者。");
     return;
@@ -1066,7 +1066,7 @@ async function uuCommand(ctx: MyContext): Promise<void> {
   const lines: string[] = ["👥 *使用者用量統計*\n"];
 
   for (const user of users) {
-    const usage = getUsageByUser(user.tg_user_id);
+    const usage = await getUsageByUser(user.tg_user_id);
     const totalInputTokens = usage.reduce((s, u) => s + u.input_tokens, 0);
     const totalOutputTokens = usage.reduce((s, u) => s + u.output_tokens, 0);
     const totalInputCost = usage.reduce((s, u) => s + u.input_cost, 0);
@@ -1085,7 +1085,7 @@ async function uuCommand(ctx: MyContext): Promise<void> {
 
   await ctx.reply(lines.join("\n"), {
     parse_mode: "Markdown",
-    reply_markup: webButton(ctx.from!.id, "all-usage"),
+    reply_markup: await webButton(ctx.from!.id, "all-usage"),
   });
 }
 
@@ -1097,9 +1097,9 @@ async function subUrlConversation(
   conversation: MyConversation,
   ctx: MyContext
 ): Promise<void> {
-  const currentUrl = getSetting("api_url") ?? config.DEFAULT_API_URL;
+  const currentUrl = (await getSetting("api_url")) ?? config.DEFAULT_API_URL;
   await ctx.reply(`目前 API URL：${currentUrl}\n\n請輸入新的 URL：`, {
-    reply_markup: webButton(ctx.from!.id, "settings"),
+    reply_markup: await webButton(ctx.from!.id, "settings"),
   });
 
   ctx = await conversation.wait();
@@ -1110,7 +1110,7 @@ async function subUrlConversation(
   }
 
   try {
-    await conversation.external(() => { setSetting("api_url", newUrl); });
+    await conversation.external(async () => { await setSetting("api_url", newUrl); });
     await ctx.reply(`✅ API URL 已更新為：${newUrl}`);
   } catch (err) {
     await ctx.reply(`❌ 更新失敗：${(err as Error).message}`);
@@ -1137,7 +1137,7 @@ async function adminUserConversation(
 ): Promise<void> {
   while (true) {
     await ctx.reply(ADMIN_USER_MENU_TEXT, {
-      reply_markup: webButton(ctx.from!.id, "users"),
+      reply_markup: await webButton(ctx.from!.id, "users"),
     });
     ctx = await conversation.wait();
     const choice = ctx.msg?.text?.trim() ?? "";
@@ -1154,7 +1154,7 @@ async function adminUserConversation(
         continue;
       }
       try {
-        await conversation.external(() => { addUser(tgUserId); });
+        await conversation.external(async () => { await addUser(tgUserId); });
         await ctx.reply(`✅ 已新增使用者 (TG ID: ${tgUserId})。`);
       } catch (err) {
         await ctx.reply(`❌ 新增失敗：${(err as Error).message}`);
@@ -1164,7 +1164,7 @@ async function adminUserConversation(
 
     if (choice === "2") {
       // ── 停用用戶 ──
-      const users = getUsers(config.ADMIN_ID);
+      const users = await getUsers(config.ADMIN_ID);
       if (users.length === 0) {
         await ctx.reply("📭 沒有可停用的使用者（排除管理員）。");
         continue;
@@ -1187,7 +1187,7 @@ async function adminUserConversation(
       }
       for (const user of selectedUsers) {
         try {
-          await conversation.external(() => { updateUserStatus(user.id, 0); });
+          await conversation.external(async () => { await updateUserStatus(user.id, 0); });
           try {
             await ctx.api.sendMessage(user.tg_user_id, "你的帳號已被管理員停用");
           } catch { /* user may have blocked the bot */ }
@@ -1201,7 +1201,7 @@ async function adminUserConversation(
 
     if (choice === "3") {
       // ── 刪除用戶 ──
-      const users = getUsers(config.ADMIN_ID);
+      const users = await getUsers(config.ADMIN_ID);
       if (users.length === 0) {
         await ctx.reply("📭 沒有可刪除的使用者（排除管理員）。");
         continue;
@@ -1224,7 +1224,7 @@ async function adminUserConversation(
       }
       for (const user of selectedUsers) {
         try {
-          await conversation.external(() => { deleteUser(user.id); });
+          await conversation.external(async () => { await deleteUser(user.id); });
         } catch (err) {
           await ctx.reply(`❌ 刪除 ${user.tg_user_id} 失敗：${(err as Error).message}`);
         }
@@ -1235,7 +1235,7 @@ async function adminUserConversation(
 
     if (choice === "4") {
       // ── 編輯用戶 TG ID ──
-      const users = getUsers();
+      const users = await getUsers();
       if (users.length === 0) {
         await ctx.reply("📭 目前沒有任何使用者。");
         continue;
@@ -1264,7 +1264,7 @@ async function adminUserConversation(
         continue;
       }
       try {
-        await conversation.external(() => { updateUserTgId(user.tg_user_id, newTgId); });
+        await conversation.external(async () => { await updateUserTgId(user.tg_user_id, newTgId); });
         await ctx.reply(`✅ 已更新使用者 TG ID：${user.tg_user_id} → ${newTgId}`);
       } catch (err) {
         await ctx.reply(`❌ 更新失敗：${(err as Error).message}`);
@@ -1274,7 +1274,7 @@ async function adminUserConversation(
 
     if (choice === "5") {
       // ── 移除用戶 API Key ──
-      const keys = getAllKeys();
+      const keys = await getAllKeys();
       if (keys.length === 0) {
         await ctx.reply("📭 目前沒有任何 API Key。");
         continue;
@@ -1296,9 +1296,9 @@ async function adminUserConversation(
         continue;
       }
       try {
-        await conversation.external(() => {
-          for (const id of selectedIds) {
-            deleteApiKey(id);
+        await conversation.external(async () => {
+            for (const id of selectedIds) {
+              await deleteApiKey(id);
           }
         });
         await ctx.reply(`✅ 已刪除 ${selectedIds.length} 個 API Key。`);
@@ -1310,7 +1310,7 @@ async function adminUserConversation(
 
     if (choice === "6") {
       // ── 模型限制管理 ──
-      const users = getUsers();
+      const users = await getUsers();
       if (users.length === 0) {
         await ctx.reply("📭 沒有可管理的使用者。");
         continue;
@@ -1334,8 +1334,8 @@ async function adminUserConversation(
       }
 
       // Show current restrictions for this user
-      const restrictions = getModelRestrictionsForUser(selectedUser.id);
-      const userKeys = getKeysByUser(selectedUser.tg_user_id);
+      const restrictions = await getModelRestrictionsForUser(selectedUser.id);
+      const userKeys = await getKeysByUser(selectedUser.tg_user_id);
       let infoMsg = `📋 用戶 ${selectedUser.username ? "@" + selectedUser.username : selectedUser.tg_user_id} 的模型限制：\n\n`;
 
       // User-level restriction
@@ -1389,7 +1389,7 @@ async function adminUserConversation(
         const models = modelInput === "*" ? allModels.join(",") : modelInput;
 
         try {
-          await conversation.external(() => { setModelRestriction(selectedUser.id, null, mode as "whitelist" | "blacklist", models); });
+          await conversation.external(async () => { await setModelRestriction(selectedUser.id, null, mode as "whitelist" | "blacklist", models); });
           await ctx.reply("✅ 已設定用戶級別模型限制。");
         } catch (err) {
           await ctx.reply(`❌ 設定失敗：${(err as Error).message}`);
@@ -1435,7 +1435,7 @@ async function adminUserConversation(
         const models = modelInput === "*" ? allModels.join(",") : modelInput;
 
         try {
-          await conversation.external(() => { setModelRestriction(selectedUser.id, selectedKey.id, mode as "whitelist" | "blacklist", models); });
+          await conversation.external(async () => { await setModelRestriction(selectedUser.id, selectedKey.id, mode as "whitelist" | "blacklist", models); });
           await ctx.reply("✅ 已設定 API Key 級別模型限制。");
         } catch (err) {
           await ctx.reply(`❌ 設定失敗：${(err as Error).message}`);
@@ -1475,7 +1475,7 @@ async function adminUserConversation(
 
         const target = deleteTargets[delIndex - 1];
         try {
-          await conversation.external(() => { deleteModelRestriction(selectedUser.id, target.apiKeyId); });
+          await conversation.external(async () => { await deleteModelRestriction(selectedUser.id, target.apiKeyId); });
           await ctx.reply(`✅ 已刪除模型限制（${target.label}）。`);
         } catch (err) {
           await ctx.reply(`❌ 刪除失敗：${(err as Error).message}`);

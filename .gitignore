@@ -40,3 +40,5 @@ thoughts/
 nodejs.zip
 *.zip
 
+# plugin-example 
+plugin-example/

@@ -1,21 +1,55 @@
 /**
- * Database layer using sql.js (pure WASM SQLite).
+ * Database layer (async, dialect-agnostic via DbDriver).
  *
- * Performance optimizations:
- * 1. `runSql()` no longer calls `saveDb()` after every write — relies on 30s auto-save.
- * 2. Provider/model routing cache — avoids full-table scan per API request.
- * 3. API Key LRU cache — avoids 2 DB queries per auth check.
+ * Stage 2 of the cloud-DB migration: all DB-touching functions are async and
+ * route through the {@link DbDriver} abstraction. SQLite-specific schema setup
+ * (createTables) and backup/restore shadow-DB logic still operate on the raw
+ * sql.js handle retrieved from {@link SqliteDriver.getRawDatabase}.
+ *
+ * Performance optimizations preserved:
+ * 1. Provider/model routing cache (hot path reads stay sync).
+ * 2. API Key LRU cache (cache-miss falls back to async DB query).
+ * 3. Effective-limits TTL cache (cache-miss falls back to async DB query).
  * 4. Usage write queue — batches inserts, flushes periodically.
  */
 
-import initSqlJs, { type Database as SqlJsDatabase, type SqlValue } from "sql.js";
-import path from "path";
-import fs from "fs";
+import { type Database as SqlJsDatabase, type SqlValue } from "sql.js";
 import { v7 as uuidv7 } from "uuid";
 import { clearProviderKeyState } from "../api/keySelector.js";
+import type { DbDriver, SqlParam } from "./driver/types.js";
+import { createDriver } from "./driver/factory.js";
+import { NOW, periodCondition, buildUpsertSql, quoteIdent, castAsText } from "./dialect.js";
+import { BACKUP_TABLES, TABLE_COLUMNS } from "./schema/tables.js";
+import { PG_DDL, PG_INDEXES, PG_SEED_DEFAULT_GROUP } from "./schema/postgres.js";
+import { MYSQL_DDL, MYSQL_INDEXES, MYSQL_SEED_DEFAULT_GROUP } from "./schema/mysql.js";
 
+/**
+ * Active driver (owns the connection lifecycle). Assigned by initDbAsync.
+ * Cloud drivers (stage 3/4) replace this transparently.
+ */
+let driver: DbDriver | null = null;
+
+/**
+ * Raw sql.js handle, only populated for the SQLite dialect. Used by the
+ * SQLite-only backup/restore shadow-DB preflight and createTables. null on
+ * cloud backends.
+ */
 let db: SqlJsDatabase | null = null;
+
 let dbPath: string = "";
+
+/** Return the active driver or throw a contract error if not initialised. */
+function drv(): DbDriver {
+  if (!driver) {
+    throw new Error("Database not initialized. Call initDbAsync() first.");
+  }
+  return driver;
+}
+
+/** Current-timestamp SQL expression for the active dialect. */
+function nowExpr(): string {
+  return NOW[drv().dialect];
+}
 
 // ---------------------------------------------------------------------------
 // Initialization
@@ -35,36 +69,42 @@ export function initDb(_databasePath: string): SqlJsDatabase {
 }
 
 /**
- * Async database initialization (required by sql.js).
+ * Async database initialization.
+ *
+ * Creates the dialect driver (SQLite now, Postgres/MySQL in stage 3/4), runs
+ * the SQLite schema setup when on SQLite, primes the provider cache, and
+ * starts the usage write-queue flush timer. Auto-save to disk is managed
+ * internally by the SQLite driver (30s cadence).
  */
-export async function initDbAsync(databasePath: string): Promise<SqlJsDatabase> {
+export async function initDbAsync(databasePath: string, databaseUrl?: string): Promise<SqlJsDatabase | null> {
   dbPath = databasePath;
-  const dir = path.dirname(databasePath);
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
-  }
+  driver = await createDriver({ sqlitePath: databasePath, databaseUrl });
 
-  const SQL = await initSqlJs();
-
-  // Load existing database from file if it exists
-  if (fs.existsSync(databasePath)) {
-    const fileBuffer = fs.readFileSync(databasePath);
-    db = new SQL.Database(fileBuffer);
+  if (driver.dialect === "sqlite") {
+    // SQLite path: build/migrate schema on the raw sql.js handle.
+    // createTables is synchronous by design (DDL + legacy migrations are SQLite-specific).
+    const { SqliteDriver } = await import("./driver/sqliteDriver.js");
+    if (!(driver instanceof SqliteDriver)) {
+      throw new Error("Driver dialect is sqlite but instance is not SqliteDriver");
+    }
+    const sqliteDb = driver.getRawDatabase();
+    db = sqliteDb;
+    createTables(sqliteDb);
+    await driver.sync();
   } else {
-    db = new SQL.Database();
+    // Cloud backend (PostgreSQL/MySQL): no raw sql.js handle.
+    // Schema is managed via async migrations through the driver.
+    db = null;
+    await runMigrations(driver);
   }
 
-  db.run("PRAGMA foreign_keys = ON");
-  createTables(db);
-  db.run("PRAGMA foreign_keys = ON");
-  rebuildProviderCache();
+  await rebuildProviderCache();
   startUsageFlushTimer();
-
-  // Save to disk periodically
-  setupAutoSave(db);
 
   return db;
 }
+
+
 
 function createTables(db: SqlJsDatabase): void {
   db.run(`
@@ -172,7 +212,6 @@ function createTables(db: SqlJsDatabase): void {
     "session_model_counts TEXT DEFAULT '{}'",
   ];
   for (const col of sessionColumns) {
-    const colName = col.split(" ")[0];
     try {
       db.run(`ALTER TABLE coding_configs ADD COLUMN ${col}`);
     } catch {
@@ -193,12 +232,8 @@ function createTables(db: SqlJsDatabase): void {
     );
   `);
 
-  // Index for fast lookup
   db.run(`CREATE INDEX IF NOT EXISTS idx_model_restrictions_user ON model_restrictions(user_id, api_key_id)`);
 
-  // -------------------------------------------------------------------------
-  // user_groups table — rate limit / concurrency / quota profiles
-  // -------------------------------------------------------------------------
   db.run(`
     CREATE TABLE IF NOT EXISTS user_groups (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -217,7 +252,6 @@ function createTables(db: SqlJsDatabase): void {
     );
   `);
 
-  // Migration: add limit / expiry columns to users table
   const userLimitColumns = [
     "group_id INTEGER",
     "expires_at TEXT",
@@ -230,7 +264,6 @@ function createTables(db: SqlJsDatabase): void {
     "monthly_cost_override REAL",
   ];
   for (const col of userLimitColumns) {
-    const colName = col.split(" ")[0];
     try {
       db.run(`ALTER TABLE users ADD COLUMN ${col}`);
     } catch {
@@ -238,7 +271,6 @@ function createTables(db: SqlJsDatabase): void {
     }
   }
 
-  // Migration: add limit / expiry columns to api_keys table
   const apiKeyLimitColumns = [
     "expires_at TEXT",
     "rpm_override INTEGER",
@@ -250,7 +282,6 @@ function createTables(db: SqlJsDatabase): void {
     "monthly_cost_override REAL",
   ];
   for (const col of apiKeyLimitColumns) {
-    const colName = col.split(" ")[0];
     try {
       db.run(`ALTER TABLE api_keys ADD COLUMN ${col}`);
     } catch {
@@ -258,7 +289,6 @@ function createTables(db: SqlJsDatabase): void {
     }
   }
 
-  // Migration: add allowed_models column to user_groups table
   try {
     db.run("ALTER TABLE user_groups ADD COLUMN allowed_models TEXT NOT NULL DEFAULT ''");
   } catch {
@@ -313,7 +343,7 @@ function createTables(db: SqlJsDatabase): void {
 
     db.run("PRAGMA foreign_keys = ON");
     db.run(
-      "INSERT INTO settings (key, value) VALUES ('migration_openai_split', '1')"
+      buildUpsertSql(drv().dialect, "settings", ["key", "value"], ["key"], ["value"], false)
     );
     console.log("[db] Migration complete: openai → openai_chat");
   }
@@ -335,11 +365,10 @@ function createTables(db: SqlJsDatabase): void {
         }
       }
     }
-    db.run("INSERT INTO settings (key, value) VALUES ('migration_multi_key', '1')");
+    db.run(buildUpsertSql(drv().dialect, "settings", ["key", "value"], ["key"], ["value"], false));
     console.log("[db] Migration complete: single api_key → JSON array");
   }
 
-  // Migration: add key_strategy column to providers table
   try {
     db.run(`ALTER TABLE providers ADD COLUMN key_strategy TEXT NOT NULL DEFAULT 'failover'`);
     console.log("[db] Migration complete: providers.key_strategy column added");
@@ -347,7 +376,6 @@ function createTables(db: SqlJsDatabase): void {
     // Column already exists — ignore
   }
 
-  // Migration: add optional per-provider User-Agent label.
   try {
     db.run(`ALTER TABLE providers ADD COLUMN user_agent TEXT NOT NULL DEFAULT ''`);
     console.log("[db] Migration complete: providers.user_agent column added");
@@ -355,9 +383,6 @@ function createTables(db: SqlJsDatabase): void {
     // Column already exists — ignore
   }
 
-  // -------------------------------------------------------------------------
-  // model_mappings table — display name aliases for provider models
-  // -------------------------------------------------------------------------
   db.run(`
     CREATE TABLE IF NOT EXISTS model_mappings (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -368,99 +393,109 @@ function createTables(db: SqlJsDatabase): void {
     );
   `);
 
-  // Clean up historical orphan provider children. These rows are unreachable
-  // after their provider is deleted and can make future backups invalid or noisy.
+  // Clean up historical orphan provider children.
   db.run(`DELETE FROM model_prices WHERE provider_id NOT IN (SELECT id FROM providers)`);
   db.run(`DELETE FROM model_mappings WHERE provider_id NOT IN (SELECT id FROM providers)`);
 
-  // -------------------------------------------------------------------------
-  // Performance indexes — speeds up quota queries (hottest path: per-request)
-  // -------------------------------------------------------------------------
   db.run(`CREATE INDEX IF NOT EXISTS idx_usage_api_key_created ON usage(api_key_id, created_at)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_usage_created_at ON usage(created_at)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_api_keys_user_id ON api_keys(user_id)`);
   db.run(`CREATE INDEX IF NOT EXISTS idx_users_group_id ON users(group_id)`);
-
-  saveDb();
+  // Persistence is handled by the driver after createTables returns (see initDbAsync).
 }
 
-// ---------------------------------------------------------------------------
-// Auto-save to disk
-// ---------------------------------------------------------------------------
-
-let saveTimer: ReturnType<typeof setInterval> | null = null;
-let dirty = false;
-
-function setupAutoSave(db: SqlJsDatabase): void {
-  saveTimer = setInterval(() => {
-    if (dirty) {
-      saveDb();
-      dirty = false;
-    }
-  }, 30_000);
-}
-
-export function saveDb(): void {
-  if (!db || !dbPath) return;
-  try {
-    // sql.js export() returns Uint8Array; fs.writeFileSync accepts it directly,
-    // avoiding a redundant Buffer.from() copy that doubles peak memory per save.
-    const data = db.export();
-    fs.writeFileSync(dbPath, data);
-  } catch (err) {
-    console.error("[db] Failed to save database:", err);
+/**
+ * Cloud schema setup (PostgreSQL/MySQL). Runs migrations tracked in the
+ * `schema_migrations` table. SQLite uses createTables() on the raw handle
+ * (legacy settings-based migrations remain in createTables for zero regression).
+ *
+ * Currently applies migration 001_base_schema (full PG DDL + indexes + seed).
+ * Future migrations append below and are gated by their ids.
+ */
+async function runMigrations(d: DbDriver): Promise<void> {
+  await d.exec(
+    "CREATE TABLE IF NOT EXISTS schema_migrations (id TEXT PRIMARY KEY, applied_at TEXT NOT NULL)"
+  );
+  const applied = await d.query<{ id: string }>("SELECT id FROM schema_migrations");
+  if (applied.rows.some((r) => r.id === "001_base_schema")) return;
+  console.log("[db] Running cloud migration 001_base_schema");
+  if (d.dialect === "postgres") {
+    await d.exec(PG_DDL);
+    await d.exec(PG_INDEXES);
+    await d.exec(PG_SEED_DEFAULT_GROUP);
+  } else {
+    await d.exec(MYSQL_DDL);
+    await d.exec(MYSQL_INDEXES);
+    await d.exec(MYSQL_SEED_DEFAULT_GROUP);
   }
+  await d.run("INSERT INTO schema_migrations (id, applied_at) VALUES (?, ?)", [
+    "001_base_schema",
+    new Date().toISOString(),
+  ]);
+  console.log("[db] Cloud migration 001_base_schema complete");
 }
 
-export function closeDb(): void {
-  // Flush pending usage writes
-  flushUsageQueue();
-  if (saveTimer) {
-    clearInterval(saveTimer);
-    saveTimer = null;
+// ---------------------------------------------------------------------------
+// Persistence & shutdown
+// ---------------------------------------------------------------------------
+
+/**
+ * Force-flush pending writes to disk (SQLite). On cloud drivers this is a
+ * no-op (statements commit immediately). Kept for callers that historically
+ * invoked saveDb() directly after critical writes.
+ */
+export async function saveDb(): Promise<void> {
+  if (!driver) return;
+  await driver.sync();
+}
+
+export async function closeDb(): Promise<void> {
+  // Flush pending usage writes before tearing down.
+  if (driver) {
+    try {
+      await flushUsageQueue();
+    } catch (err) {
+      console.error("[db] flushUsageQueue during closeDb failed:", err);
+    }
   }
   if (usageFlushTimer) {
     clearInterval(usageFlushTimer);
     usageFlushTimer = null;
   }
-  if (db) {
-    saveDb();
-    db.close();
-    db = null;
+  if (driver) {
+    await driver.close();
   }
+  driver = null;
+  db = null;
+  dbPath = "";
+  // Drop in-memory caches so a fresh init starts clean.
+  providerCache = new Map<string, CachedProvider>();
+  allProvidersCache = null;
+  apiKeyCache.clear();
+  effectiveLimitsCache.clear();
 }
 
 // ---------------------------------------------------------------------------
-// Helper: run query and return results as array of objects
+// Helper: async query/run wrappers over the driver
 // ---------------------------------------------------------------------------
 
-function queryAll(sql: string, params: SqlValue[] = []): Record<string, SqlValue>[] {
-  const d = getDb();
-  const stmt = d.prepare(sql);
-  stmt.bind(params);
-
-  const results: Record<string, SqlValue>[] = [];
-  while (stmt.step()) {
-    results.push(stmt.getAsObject());
-  }
-  stmt.free();
-  return results;
+async function queryAll(sql: string, params: SqlValue[] = []): Promise<Record<string, SqlValue>[]> {
+  const result = await drv().query<Record<string, SqlValue>>(sql, params as SqlParam[]);
+  return result.rows;
 }
 
-function queryOne(sql: string, params: SqlValue[] = []): Record<string, SqlValue> | undefined {
-  const results = queryAll(sql, params);
-  return results[0];
+async function queryOne(sql: string, params: SqlValue[] = []): Promise<Record<string, SqlValue> | undefined> {
+  const rows = await queryAll(sql, params);
+  return rows[0];
 }
 
 /**
- * Run a write SQL statement.
- * Marks DB as dirty for the next auto-save cycle — does NOT call saveDb() immediately.
+ * Run a write SQL statement. The driver marks the DB dirty; durability is
+ * handled by auto-save (SQLite) or immediate commit (cloud).
  */
-function runSql(sql: string, params: SqlValue[] = []): void {
-  const d = getDb();
+async function runSql(sql: string, params: SqlValue[] = []): Promise<void> {
   try {
-    d.run(sql, params);
-    dirty = true;
+    await drv().run(sql, params as SqlParam[]);
   } catch (err) {
     console.error("[db] SQL error:", sql, params, err);
     throw err;
@@ -468,14 +503,13 @@ function runSql(sql: string, params: SqlValue[] = []): void {
 }
 
 /**
- * Run a write SQL statement AND immediately save to disk.
- * Use only for critical writes (e.g. key generation).
+ * Run a write SQL statement AND immediately persist (critical writes only).
  */
-function runSqlAndSave(sql: string, params: SqlValue[] = []): void {
-  const d = getDb();
+async function runSqlAndSave(sql: string, params: SqlValue[] = []): Promise<void> {
+  const d = drv();
   try {
-    d.run(sql, params);
-    saveDb();
+    await d.run(sql, params as SqlParam[]);
+    await d.sync();
   } catch (err) {
     console.error("[db] SQL error:", sql, params, err);
     throw err;
@@ -506,16 +540,16 @@ let providerCache = new Map<string, CachedProvider>();
 let allProvidersCache: Provider[] | null = null;
 
 /**
- * Rebuild the model->provider routing cache from DB.
- * Called on init and after any provider add/update/delete.
+ * Rebuild the model→provider routing cache from DB.
+ * Called on init and after any provider add/update/delete. Async because it
+ * scans providers + model mappings + model_prices.
  */
-export function rebuildProviderCache(): void {
-  if (!db) return; // Guard: skip if DB not initialized (e.g. during test teardown)
+export async function rebuildProviderCache(): Promise<void> {
+  if (!driver) return; // Guard: skip if DB not initialized (e.g. during test teardown)
   const newCache = new Map<string, CachedProvider>();
-  const providers = queryAll("SELECT * FROM providers WHERE enabled = 1 ORDER BY id");
+  const providers = await queryAll("SELECT * FROM providers WHERE enabled = 1 ORDER BY id");
 
-  // Load all model mappings into a lookup map: "pid:originalModel" -> displayName
-  const mappingRows = queryAll("SELECT provider_id, original_model, display_name FROM model_mappings");
+  const mappingRows = await queryAll("SELECT provider_id, original_model, display_name FROM model_mappings");
   const mappingMap = new Map<string, string>();
   for (const m of mappingRows) {
     mappingMap.set(`${Number(m.provider_id)}:${String(m.original_model)}`, String(m.display_name));
@@ -529,15 +563,13 @@ export function rebuildProviderCache(): void {
       .filter(Boolean);
 
     for (const modelName of models) {
-      // Try model-specific pricing first
-      const mp = queryOne(
+      const mp = await queryOne(
         "SELECT input_price, output_price FROM model_prices WHERE provider_id = ? AND model = ?",
         [pid, modelName]
       );
       const inputPrice = mp ? (mp.input_price as number | null) : (p.input_price as number | null);
       const outputPrice = mp ? (mp.output_price as number | null) : (p.output_price as number | null);
 
-      // Use display name as cache key if a mapping exists, otherwise use original name
       const displayName = mappingMap.get(`${pid}:${modelName}`) ?? modelName;
 
       newCache.set(displayName, {
@@ -562,7 +594,7 @@ export function rebuildProviderCache(): void {
 }
 
 /**
- * Fast model lookup for API routing — uses in-memory cache, zero DB queries.
+ * Fast model lookup for API routing — reads in-memory cache, zero DB queries.
  */
 export function lookupModelCached(modelName: string): CachedProvider | undefined {
   return providerCache.get(modelName);
@@ -587,14 +619,15 @@ export interface ModelMapping {
 }
 
 /** Get all model mappings joined with provider names. */
-export function getModelMappings(): ModelMapping[] {
-  if (!db) return [];
-  return queryAll(
+export async function getModelMappings(): Promise<ModelMapping[]> {
+  if (!driver) return [];
+  const rows = await queryAll(
     `SELECT mm.provider_id, p.name as provider_name, mm.original_model, mm.display_name
      FROM model_mappings mm
      JOIN providers p ON mm.provider_id = p.id
      ORDER BY p.name, mm.original_model`
-  ).map((r) => ({
+  );
+  return rows.map((r) => ({
     provider_id: Number(r.provider_id),
     provider_name: String(r.provider_name),
     original_model: String(r.original_model),
@@ -603,67 +636,74 @@ export function getModelMappings(): ModelMapping[] {
 }
 
 /** Insert or update a model mapping. */
-export function upsertModelMapping(providerId: number, originalModel: string, displayName: string): void {
-  if (!db) return;
-  if (!getProviderById(providerId)) {
+export async function upsertModelMapping(providerId: number, originalModel: string, displayName: string): Promise<void> {
+  if (!driver) return;
+  if (!(await getProviderById(providerId))) {
     throw new Error("Provider not found");
   }
-  db.run(
-    `INSERT INTO model_mappings (provider_id, original_model, display_name)
-     VALUES (?, ?, ?)
-     ON CONFLICT(provider_id, original_model)
-     DO UPDATE SET display_name = excluded.display_name`,
+  const d = drv();
+  await d.run(
+    buildUpsertSql(drv().dialect, "model_mappings", ["provider_id", "original_model", "display_name"], ["provider_id", "original_model"], ["display_name"], false),
     [providerId, originalModel, displayName]
   );
-  saveDb();
+  await d.sync();
   invalidateProviderCache();
 }
 
 /** Delete a model mapping. */
-export function deleteModelMapping(providerId: number, originalModel: string): void {
-  if (!db) return;
-  db.run(
+export async function deleteModelMapping(providerId: number, originalModel: string): Promise<void> {
+  if (!driver) return;
+  const d = drv();
+  await d.run(
     "DELETE FROM model_mappings WHERE provider_id = ? AND original_model = ?",
     [providerId, originalModel]
   );
-  saveDb();
+  await d.sync();
   invalidateProviderCache();
 }
 
 /** Replace all model mappings (batch operation). */
-export function replaceModelMappings(mappings: Array<{ provider_id: number; original_model: string; display_name: string }>): void {
-  if (!db) return;
-  const providerIds = new Set(getProviders(false).map((p) => p.id));
+export async function replaceModelMappings(mappings: Array<{ provider_id: number; original_model: string; display_name: string }>): Promise<void> {
+  if (!driver) return;
+  const providers = await getProviders(false);
+  const providerIds = new Set(providers.map((p) => p.id));
   const invalid = mappings.find((m) => !providerIds.has(m.provider_id));
   if (invalid) {
     throw new Error(`Provider not found for model mapping: ${invalid.provider_id}`);
   }
-  db.run("DELETE FROM model_mappings");
-  for (const m of mappings) {
-    db.run(
-      "INSERT INTO model_mappings (provider_id, original_model, display_name) VALUES (?, ?, ?)",
-      [m.provider_id, m.original_model, m.display_name]
-    );
-  }
-  saveDb();
+  const d = drv();
+  await d.transaction(async () => {
+    await d.run("DELETE FROM model_mappings");
+    for (const m of mappings) {
+      await d.run(
+        "INSERT INTO model_mappings (provider_id, original_model, display_name) VALUES (?, ?, ?)",
+        [m.provider_id, m.original_model, m.display_name]
+      );
+    }
+  });
+  await d.sync();
   invalidateProviderCache();
 }
 
+let rebuildCachePending = false;
+
 /**
  * Invalidate provider caches — call after any provider/model/price mutation.
+ * Synchronous: clears the cache immediately and schedules a fire-and-forget
+ * rebuild on next tick (batched across multiple mutations).
  */
 function invalidateProviderCache(): void {
   allProvidersCache = null;
-  // Defer full rebuild to next tick to batch multiple mutations
   if (!rebuildCachePending) {
     rebuildCachePending = true;
     process.nextTick(() => {
-      rebuildProviderCache();
-      rebuildCachePending = false;
+      // Fire-and-forget; errors are logged but never crash the caller.
+      void rebuildProviderCache()
+        .catch((err) => console.error("[cache] rebuildProviderCache failed:", err))
+        .finally(() => { rebuildCachePending = false; });
     });
   }
 }
-let rebuildCachePending = false;
 
 /** Register a callback to be called whenever provider cache is rebuilt.
  *  Returns an unsubscribe function to remove the listener (prevents leak). */
@@ -701,10 +741,11 @@ const apiKeyCache = new Map<string, CachedApiKey>();
 
 /**
  * Lookup API key with LRU cache.
+ * Cache hit returns synchronously-wrapped value; cache miss falls back to
+ * async DB queries for the api_key and user rows.
  * Returns null if key not found or inactive.
  */
-export function lookupApiKeyCached(key: string): CachedApiKey | null {
-  // Check cache first
+export async function lookupApiKeyCached(key: string): Promise<CachedApiKey | null> {
   const cached = apiKeyCache.get(key);
   if (cached) {
     // Move to end (LRU)
@@ -715,10 +756,10 @@ export function lookupApiKeyCached(key: string): CachedApiKey | null {
   }
 
   // Cache miss — query DB
-  const apiKeyRow = queryOne("SELECT * FROM api_keys WHERE key = ?", [key]);
+  const apiKeyRow = await queryOne(`SELECT * FROM api_keys WHERE ${quoteIdent("key", drv().dialect)} = ?`, [key]);
   if (!apiKeyRow || Number(apiKeyRow.is_active) !== 1) return null;
 
-  const user = queryOne("SELECT * FROM users WHERE id = ?", [apiKeyRow.user_id]);
+  const user = await queryOne("SELECT * FROM users WHERE id = ?", [apiKeyRow.user_id]);
   if (!user || Number(user.is_active) !== 1) return null;
 
   const entry: CachedApiKey = {
@@ -769,59 +810,50 @@ interface PendingUsage {
 
 const usageQueue: PendingUsage[] = [];
 let usageFlushTimer: ReturnType<typeof setInterval> | null = null;
-const USAGE_FLUSH_INTERVAL_MS = 5_000; // flush every 5 seconds
-const USAGE_MAX_QUEUE_SIZE = 100; // force flush if queue gets too large
+const USAGE_FLUSH_INTERVAL_MS = 5_000;
+const USAGE_MAX_QUEUE_SIZE = 100;
 
 function startUsageFlushTimer(): void {
   usageFlushTimer = setInterval(() => {
-    flushUsageQueue();
+    void flushUsageQueue().catch((err) => console.error("[usage-queue] timer flush failed:", err));
   }, USAGE_FLUSH_INTERVAL_MS);
 }
 
 /**
- * Flush all pending usage records to DB in a single batch.
+ * Flush all pending usage records to DB atomically.
  */
-export function flushUsageQueue(): void {
+export async function flushUsageQueue(): Promise<void> {
   if (usageQueue.length === 0) return;
 
-  // Drain the queue
   const batch = usageQueue.splice(0, usageQueue.length);
   if (batch.length === 0) return;
 
-  const d = getDb();
+  const d = drv();
   try {
-    // Use a single transaction for the entire batch
-    d.run("BEGIN TRANSACTION");
-    const stmt = d.prepare(
-      `INSERT INTO usage (api_key_id, provider_id, input_tokens, output_tokens, input_cost, output_cost, model)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`
-    );
-    for (const u of batch) {
-      stmt.bind([u.api_key_id, u.provider_id, u.input_tokens, u.output_tokens, u.input_cost, u.output_cost, u.model]);
-      stmt.step();
-      stmt.reset();
-    }
-    stmt.free();
-    d.run("COMMIT");
-    dirty = true;
+    await d.transaction(async () => {
+      for (const u of batch) {
+        await d.run(
+          `INSERT INTO usage (api_key_id, provider_id, input_tokens, output_tokens, input_cost, output_cost, model, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ${nowExpr()})`,
+          [u.api_key_id, u.provider_id, u.input_tokens, u.output_tokens, u.input_cost, u.output_cost, u.model]
+        );
+      }
+    });
     console.log(`[usage-queue] Flushed ${batch.length} records to DB`);
   } catch (err) {
     console.error("[usage-queue] Batch insert failed:", err);
-    try { d.run("ROLLBACK"); } catch { /* ignore */ }
-    // Put records back at the front of the queue
+    // Put records back at the front of the queue for retry on next flush.
     usageQueue.unshift(...batch);
   }
 }
 
 /**
- * Queue a usage record for batched writing.
- * Returns immediately — no DB I/O.
+ * Queue a usage record for batched writing. Non-blocking; flushes immediately
+ * once the queue reaches USAGE_MAX_QUEUE_SIZE (fire-and-forget).
  */
 export function enqueueUsage(record: PendingUsage): void {
   usageQueue.push(record);
-  // Force flush if queue is too large
   if (usageQueue.length >= USAGE_MAX_QUEUE_SIZE) {
-    flushUsageQueue();
+    void flushUsageQueue().catch((err) => console.error("[usage-queue] overflow flush failed:", err));
   }
 }
 
@@ -845,13 +877,12 @@ export interface Provider {
   updated_at: string;
 }
 
-export function addProvider(
+export async function addProvider(
   provider: Omit<Provider, "id" | "enabled" | "created_at" | "updated_at" | "key_strategy" | "user_agent"> & { key_strategy?: string; user_agent?: string }
-): void {
+): Promise<void> {
   console.log(`[db] addProvider: name=${provider.name}, type=${provider.api_type}, models=${provider.models}`);
-  runSql(
-    `INSERT INTO providers (name, api_type, base_url, api_key, user_agent, key_strategy, models, input_price, output_price)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  await runSql(
+    `INSERT INTO providers (name, api_type, base_url, api_key, user_agent, key_strategy, models, input_price, output_price, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ${nowExpr()}, ${nowExpr()})`,
     [
       provider.name,
       provider.api_type,
@@ -867,26 +898,24 @@ export function addProvider(
   invalidateProviderCache();
 }
 
-export function getProviders(enabledOnly = false): Provider[] {
-  // Try cache for enabled-only queries
+export async function getProviders(enabledOnly = false): Promise<Provider[]> {
   if (enabledOnly) {
     if (!allProvidersCache) {
-      allProvidersCache = queryAll("SELECT * FROM providers WHERE enabled = 1 ORDER BY id") as unknown as Provider[];
+      allProvidersCache = (await queryAll("SELECT * FROM providers WHERE enabled = 1 ORDER BY id")) as unknown as Provider[];
     }
     return allProvidersCache;
   }
-  const sql = "SELECT * FROM providers ORDER BY id";
-  return queryAll(sql) as unknown as Provider[];
+  return (await queryAll("SELECT * FROM providers ORDER BY id")) as unknown as Provider[];
 }
 
-export function getProviderById(id: number): Provider | undefined {
-  return queryOne("SELECT * FROM providers WHERE id = ?", [id]) as unknown as Provider | undefined;
+export async function getProviderById(id: number): Promise<Provider | undefined> {
+  return (await queryOne("SELECT * FROM providers WHERE id = ?", [id])) as unknown as Provider | undefined;
 }
 
-export function updateProvider(
+export async function updateProvider(
   id: number,
   data: Partial<Omit<Provider, "id" | "created_at">>
-): void {
+): Promise<void> {
   const fields: string[] = [];
   const values: SqlValue[] = [];
 
@@ -899,21 +928,20 @@ export function updateProvider(
     throw new Error("No fields to update");
   }
 
-  fields.push("updated_at = datetime('now')");
+  fields.push(`updated_at = ${nowExpr()}`);
   values.push(id);
 
-  runSql(`UPDATE providers SET ${fields.join(", ")} WHERE id = ?`, values);
+  await runSql(`UPDATE providers SET ${fields.join(", ")} WHERE id = ?`, values);
   invalidateProviderCache();
 }
 
-export function deleteProvider(ids: number[]): void {
+export async function deleteProvider(ids: number[]): Promise<void> {
   if (ids.length === 0) return;
 
   const placeholders = ids.map(() => "?").join(",");
-  runSql(`DELETE FROM model_mappings WHERE provider_id IN (${placeholders})`, ids);
-  runSql(`DELETE FROM model_prices WHERE provider_id IN (${placeholders})`, ids);
-  runSql(`DELETE FROM providers WHERE id IN (${placeholders})`, ids);
-  // Clean up in-memory keySelector state for deleted providers (prevents memory leak)
+  await runSql(`DELETE FROM model_mappings WHERE provider_id IN (${placeholders})`, ids);
+  await runSql(`DELETE FROM model_prices WHERE provider_id IN (${placeholders})`, ids);
+  await runSql(`DELETE FROM providers WHERE id IN (${placeholders})`, ids);
   for (const id of ids) clearProviderKeyState(id);
   invalidateProviderCache();
 }
@@ -930,40 +958,40 @@ export interface User {
   created_at: string;
 }
 
-export function addUser(tgUserId: number, username: string | null = null): void {
-  runSql(
-    "INSERT INTO users (tg_user_id, username) VALUES (?, ?)",
+export async function addUser(tgUserId: number, username: string | null = null): Promise<void> {
+  await runSql(
+    `INSERT INTO users (tg_user_id, username, created_at) VALUES (?, ?, ${nowExpr()})`,
     [tgUserId, username]
   );
 }
 
-export function getUsers(excludeAdminId?: number): User[] {
+export async function getUsers(excludeAdminId?: number): Promise<User[]> {
   if (excludeAdminId !== undefined) {
-    return queryAll("SELECT * FROM users WHERE tg_user_id != ? ORDER BY id", [excludeAdminId]) as unknown as User[];
+    return (await queryAll("SELECT * FROM users WHERE tg_user_id != ? ORDER BY id", [excludeAdminId])) as unknown as User[];
   }
-  return queryAll("SELECT * FROM users ORDER BY id") as unknown as User[];
+  return (await queryAll("SELECT * FROM users ORDER BY id")) as unknown as User[];
 }
 
-export function getUserByTgId(tgUserId: number): User | undefined {
-  return queryOne("SELECT * FROM users WHERE tg_user_id = ?", [tgUserId]) as unknown as User | undefined;
+export async function getUserByTgId(tgUserId: number): Promise<User | undefined> {
+  return (await queryOne("SELECT * FROM users WHERE tg_user_id = ?", [tgUserId])) as unknown as User | undefined;
 }
 
-export function getUserById(id: number): User | undefined {
-  return queryOne("SELECT * FROM users WHERE id = ?", [id]) as unknown as User | undefined;
+export async function getUserById(id: number): Promise<User | undefined> {
+  return (await queryOne("SELECT * FROM users WHERE id = ?", [id])) as unknown as User | undefined;
 }
 
-export function updateUserStatus(id: number, isActive: number): void {
-  runSql("UPDATE users SET is_active = ? WHERE id = ?", [isActive, id]);
-  invalidateUserApiKeyCache(0); // clear all key caches on user status change
+export async function updateUserStatus(id: number, isActive: number): Promise<void> {
+  await runSql("UPDATE users SET is_active = ? WHERE id = ?", [isActive, id]);
+  invalidateUserApiKeyCache(0);
 }
 
-export function deleteUser(id: number): void {
-  runSql("DELETE FROM users WHERE id = ?", [id]);
+export async function deleteUser(id: number): Promise<void> {
+  await runSql("DELETE FROM users WHERE id = ?", [id]);
   apiKeyCache.clear();
 }
 
-export function updateUserTgId(oldTgUserId: number, newTgUserId: number): void {
-  runSql("UPDATE users SET tg_user_id = ? WHERE tg_user_id = ?", [newTgUserId, oldTgUserId]);
+export async function updateUserTgId(oldTgUserId: number, newTgUserId: number): Promise<void> {
+  await runSql("UPDATE users SET tg_user_id = ? WHERE tg_user_id = ?", [newTgUserId, oldTgUserId]);
 }
 
 // ========================
@@ -978,43 +1006,43 @@ export interface ApiKey {
   created_at: string;
 }
 
-export function addApiKey(tgUserId: number): { key: string } {
-  const user = getUserByTgId(tgUserId);
+export async function addApiKey(tgUserId: number): Promise<{ key: string }> {
+  const user = await getUserByTgId(tgUserId);
   if (!user) {
     throw new Error(`User with tg_user_id ${tgUserId} not found`);
   }
 
   const key = `sk-s12ryt-${uuidv7()}`;
-  runSqlAndSave("INSERT INTO api_keys (user_id, key) VALUES (?, ?)", [user.id, key]);
+  await runSqlAndSave(`INSERT INTO api_keys (user_id, ${quoteIdent("key", drv().dialect)}, created_at) VALUES (?, ?, ${nowExpr()})`, [user.id, key]);
   return { key };
 }
 
-export function getKeysByUser(tgUserId: number): ApiKey[] {
-  return queryAll(
+export async function getKeysByUser(tgUserId: number): Promise<ApiKey[]> {
+  return (await queryAll(
     `SELECT ak.* FROM api_keys ak
      JOIN users u ON ak.user_id = u.id
      WHERE u.tg_user_id = ?
      ORDER BY ak.id`,
     [tgUserId]
-  ) as unknown as ApiKey[];
+  )) as unknown as ApiKey[];
 }
 
-export function getKeyByValue(key: string): ApiKey | undefined {
-  return queryOne("SELECT * FROM api_keys WHERE key = ?", [key]) as unknown as ApiKey | undefined;
+export async function getKeyByValue(key: string): Promise<ApiKey | undefined> {
+  return (await queryOne(`SELECT * FROM api_keys WHERE ${quoteIdent("key", drv().dialect)} = ?`, [key])) as unknown as ApiKey | undefined;
 }
 
-export function deleteApiKey(id: number): void {
-  runSqlAndSave("DELETE FROM api_keys WHERE id = ?", [id]);
+export async function deleteApiKey(id: number): Promise<void> {
+  await runSqlAndSave("DELETE FROM api_keys WHERE id = ?", [id]);
   apiKeyCache.clear();
 }
 
-export function getAllKeys(): (ApiKey & { tg_user_id: number; username: string | null })[] {
-  return queryAll(
+export async function getAllKeys(): Promise<(ApiKey & { tg_user_id: number; username: string | null })[]> {
+  return (await queryAll(
     `SELECT ak.*, u.tg_user_id, u.username
      FROM api_keys ak
      JOIN users u ON ak.user_id = u.id
      ORDER BY ak.id`
-  ) as unknown as (ApiKey & { tg_user_id: number; username: string | null })[];
+  )) as unknown as (ApiKey & { tg_user_id: number; username: string | null })[];
 }
 
 // ========================
@@ -1040,7 +1068,7 @@ export interface UsageWithDetails extends UsageRecord {
 
 /**
  * Record usage — enqueues for batched writing.
- * This is non-blocking and returns immediately.
+ * Non-blocking: returns immediately, no DB I/O on the hot path.
  */
 export function recordUsage(
   apiKeyId: number,
@@ -1062,9 +1090,9 @@ export function recordUsage(
   });
 }
 
-export function getUsageByUser(tgUserId: number): UsageWithDetails[] {
-  return queryAll(
-    `SELECT u.*, p.name as provider_name, ak.key as api_key
+export async function getUsageByUser(tgUserId: number): Promise<UsageWithDetails[]> {
+  return (await queryAll(
+    `SELECT u.*, p.name as provider_name, ak.${quoteIdent("key", drv().dialect)} as api_key
      FROM usage u
      JOIN api_keys ak ON u.api_key_id = ak.id
      JOIN users us ON ak.user_id = us.id
@@ -1072,19 +1100,19 @@ export function getUsageByUser(tgUserId: number): UsageWithDetails[] {
      WHERE us.tg_user_id = ?
      ORDER BY u.created_at DESC`,
     [tgUserId]
-  ) as unknown as UsageWithDetails[];
+  )) as unknown as UsageWithDetails[];
 }
 
-export function getUsageByProvider(providerId: number): UsageWithDetails[] {
-  return queryAll(
-    `SELECT u.*, p.name as provider_name, ak.key as api_key
+export async function getUsageByProvider(providerId: number): Promise<UsageWithDetails[]> {
+  return (await queryAll(
+    `SELECT u.*, p.name as provider_name, ak.${quoteIdent("key", drv().dialect)} as api_key
      FROM usage u
      JOIN api_keys ak ON u.api_key_id = ak.id
      JOIN providers p ON u.provider_id = p.id
      WHERE u.provider_id = ?
      ORDER BY u.created_at DESC`,
     [providerId]
-  ) as unknown as UsageWithDetails[];
+  )) as unknown as UsageWithDetails[];
 }
 
 export interface UsageBreakdown {
@@ -1106,8 +1134,8 @@ export interface TotalUsage {
   by_user: Record<string, UsageBreakdown>;
 }
 
-export function getTotalUsage(): TotalUsage {
-  const row = queryOne(
+export async function getTotalUsage(): Promise<TotalUsage> {
+  const row = await queryOne(
     `SELECT
        COALESCE(SUM(input_tokens), 0) as total_input_tokens,
        COALESCE(SUM(output_tokens), 0) as total_output_tokens,
@@ -1121,8 +1149,7 @@ export function getTotalUsage(): TotalUsage {
   const totalInputCost = row ? Number(row.total_input_cost) : 0;
   const totalOutputCost = row ? Number(row.total_output_cost) : 0;
 
-  // Aggregate by provider
-  const providerRows = queryAll(
+  const providerRows = await queryAll(
     `SELECT
        COALESCE(p.name, 'Unknown') as name,
        COUNT(*) as requests,
@@ -1132,7 +1159,7 @@ export function getTotalUsage(): TotalUsage {
        COALESCE(SUM(u.output_cost), 0) as output_cost
      FROM usage u
      LEFT JOIN providers p ON u.provider_id = p.id
-     GROUP BY u.provider_id
+     GROUP BY u.provider_id, p.name
      ORDER BY input_cost + output_cost DESC`
   );
 
@@ -1148,10 +1175,9 @@ export function getTotalUsage(): TotalUsage {
     };
   }
 
-  // Aggregate by user
-  const userRows = queryAll(
+  const userRows = await queryAll(
     `SELECT
-       COALESCE(us.username, CAST(us.tg_user_id AS TEXT), 'Unknown') as name,
+       COALESCE(us.username, ${castAsText("us.tg_user_id", drv().dialect)}, 'Unknown') as name,
        COUNT(*) as requests,
        COALESCE(SUM(u.input_tokens), 0) as input_tokens,
        COALESCE(SUM(u.output_tokens), 0) as output_tokens,
@@ -1160,7 +1186,7 @@ export function getTotalUsage(): TotalUsage {
      FROM usage u
      JOIN api_keys ak ON u.api_key_id = ak.id
      LEFT JOIN users us ON ak.user_id = us.id
-     GROUP BY ak.user_id
+     GROUP BY ak.user_id, us.username, us.tg_user_id
      ORDER BY input_cost + output_cost DESC`
   );
 
@@ -1193,15 +1219,15 @@ export function getTotalUsage(): TotalUsage {
 // Settings CRUD
 // ========================
 
-export function getSetting(key: string): string | null {
-  const row = queryOne("SELECT value FROM settings WHERE key = ?", [key]);
+export async function getSetting(key: string): Promise<string | null> {
+  const row = await queryOne(`SELECT value FROM settings WHERE ${quoteIdent("key", drv().dialect)} = ?`, [key]);
   return (row?.value as string) ?? null;
 }
 
-export function setSetting(key: string, value: string): void {
-  runSql(
-    "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = ?",
-    [key, value, value]
+export async function setSetting(key: string, value: string): Promise<void> {
+  await runSql(
+    buildUpsertSql(drv().dialect, "settings", ["key", "value"], ["key"], ["value"], false),
+    [key, value]
   );
 }
 
@@ -1223,40 +1249,35 @@ export interface ModelPrice {
  * Get price for a specific model under a provider.
  * Returns undefined if no record exists.
  */
-export function getModelPrice(providerId: number, modelName: string): ModelPrice | undefined {
-  return queryOne(
+export async function getModelPrice(providerId: number, modelName: string): Promise<ModelPrice | undefined> {
+  return (await queryOne(
     "SELECT * FROM model_prices WHERE provider_id = ? AND model = ?",
     [providerId, modelName]
-  ) as unknown as ModelPrice | undefined;
+  )) as unknown as ModelPrice | undefined;
 }
 
 /**
  * Get all model prices for a provider.
  */
-export function getModelPricesByProvider(providerId: number): ModelPrice[] {
-  return queryAll(
+export async function getModelPricesByProvider(providerId: number): Promise<ModelPrice[]> {
+  return (await queryAll(
     "SELECT * FROM model_prices WHERE provider_id = ? ORDER BY model",
     [providerId]
-  ) as unknown as ModelPrice[];
+  )) as unknown as ModelPrice[];
 }
 
 /**
  * Upsert a model price record. If a record for (provider_id, model) exists, update it.
  * Prices are in USD per 1M tokens.
  */
-export function upsertModelPrice(
+export async function upsertModelPrice(
   providerId: number,
   modelName: string,
   inputPrice: number | null,
   outputPrice: number | null
-): void {
-  runSql(
-    `INSERT INTO model_prices (provider_id, model, input_price, output_price)
-     VALUES (?, ?, ?, ?)
-     ON CONFLICT(provider_id, model) DO UPDATE SET
-       input_price = excluded.input_price,
-       output_price = excluded.output_price,
-       updated_at = datetime('now')`,
+): Promise<void> {
+  await runSql(
+    buildUpsertSql(drv().dialect, "model_prices", ["provider_id", "model", "input_price", "output_price"], ["provider_id", "model"], ["input_price", "output_price"], true),
     [providerId, modelName, inputPrice, outputPrice]
   );
   invalidateProviderCache();
@@ -1264,52 +1285,40 @@ export function upsertModelPrice(
 
 /**
  * Batch upsert model prices using a single transaction.
- * Each entry: { model, input_price, output_price }
- * Prices are in USD per 1M tokens.
  */
-export function batchUpsertModelPrices(
+export async function batchUpsertModelPrices(
   providerId: number,
   entries: Array<{ model: string; input_price: number | null; output_price: number | null }>
-): void {
+): Promise<void> {
   if (entries.length === 0) return;
 
-  const d = getDb();
+  const d = drv();
   try {
-    d.run("BEGIN TRANSACTION");
-    const stmt = d.prepare(
-      `INSERT INTO model_prices (provider_id, model, input_price, output_price)
-       VALUES (?, ?, ?, ?)
-       ON CONFLICT(provider_id, model) DO UPDATE SET
-         input_price = excluded.input_price,
-         output_price = excluded.output_price,
-         updated_at = datetime('now')`
-    );
-    for (const entry of entries) {
-      stmt.bind([providerId, entry.model, entry.input_price ?? null, entry.output_price ?? null]);
-      stmt.step();
-      stmt.reset();
-    }
-    stmt.free();
-    d.run("COMMIT");
-    dirty = true;
+    await d.transaction(async () => {
+      for (const entry of entries) {
+        await d.run(
+          buildUpsertSql(drv().dialect, "model_prices", ["provider_id", "model", "input_price", "output_price"], ["provider_id", "model"], ["input_price", "output_price"], true),
+          [providerId, entry.model, entry.input_price ?? null, entry.output_price ?? null]
+        );
+      }
+    });
   } catch (err) {
     console.error("[db] batchUpsertModelPrices error:", err);
-    try { d.run("ROLLBACK"); } catch { /* ignore */ }
     throw err;
   }
   invalidateProviderCache();
 }
 
 /**
- * Delete model prices for models that are no longer in the provider's model list.
+ * Delete model prices for models no longer in the provider's model list.
  */
-export function cleanupModelPrices(providerId: number, currentModels: string[]): void {
+export async function cleanupModelPrices(providerId: number, currentModels: string[]): Promise<void> {
   if (currentModels.length === 0) {
-    runSql("DELETE FROM model_prices WHERE provider_id = ?", [providerId]);
+    await runSql("DELETE FROM model_prices WHERE provider_id = ?", [providerId]);
     return;
   }
   const placeholders = currentModels.map(() => "?").join(",");
-  runSql(
+  await runSql(
     `DELETE FROM model_prices WHERE provider_id = ? AND model NOT IN (${placeholders})`,
     [providerId, ...currentModels]
   );
@@ -1319,8 +1328,8 @@ export function cleanupModelPrices(providerId: number, currentModels: string[]):
 /**
  * Delete all model prices for a provider.
  */
-export function deleteModelPricesByProvider(providerId: number): void {
-  runSql("DELETE FROM model_prices WHERE provider_id = ?", [providerId]);
+export async function deleteModelPricesByProvider(providerId: number): Promise<void> {
+  await runSql("DELETE FROM model_prices WHERE provider_id = ?", [providerId]);
   invalidateProviderCache();
 }
 
@@ -1343,12 +1352,7 @@ export interface CodingConfig {
   session_model_counts: string;
 }
 
-/**
- * Get coding config for a user by internal user_id.
- */
-export function getCodingConfig(userId: number): CodingConfig | null {
-  const row = queryOne("SELECT * FROM coding_configs WHERE user_id = ?", [userId]) as Record<string, unknown> | undefined;
-  if (!row) return null;
+function rowToCodingConfig(row: Record<string, unknown>): CodingConfig {
   const config = row as Record<string, SqlValue>;
   return {
     id: config.id as number,
@@ -1367,10 +1371,19 @@ export function getCodingConfig(userId: number): CodingConfig | null {
 }
 
 /**
+ * Get coding config for a user by internal user_id.
+ */
+export async function getCodingConfig(userId: number): Promise<CodingConfig | null> {
+  const row = await queryOne("SELECT * FROM coding_configs WHERE user_id = ?", [userId]);
+  if (!row) return null;
+  return rowToCodingConfig(row);
+}
+
+/**
  * Get coding config by Telegram user ID.
  */
-export function getCodingConfigByTgId(tgUserId: number): CodingConfig | null {
-  const user = getUserByTgId(tgUserId);
+export async function getCodingConfigByTgId(tgUserId: number): Promise<CodingConfig | null> {
+  const user = await getUserByTgId(tgUserId);
   if (!user) return null;
   return getCodingConfig(user.id);
 }
@@ -1378,11 +1391,12 @@ export function getCodingConfigByTgId(tgUserId: number): CodingConfig | null {
 /**
  * Set (upsert) coding config for a user.
  */
-export function setCodingConfig(
+export async function setCodingConfig(
   userId: number,
   opts: { isActive?: number; fallbackModels?: string; maxRetries?: number }
-): CodingConfig | null {
-  const existing = queryOne("SELECT id FROM coding_configs WHERE user_id = ?", [userId]);
+): Promise<CodingConfig | null> {
+  const existing = await queryOne("SELECT id FROM coding_configs WHERE user_id = ?", [userId]);
+  const now = nowExpr();
 
   if (existing) {
     const sets: string[] = [];
@@ -1391,19 +1405,13 @@ export function setCodingConfig(
     if (opts.fallbackModels !== undefined) { sets.push("fallback_models = ?"); params.push(opts.fallbackModels); }
     if (opts.maxRetries !== undefined) { sets.push("max_retries = ?"); params.push(opts.maxRetries); }
     if (sets.length > 0) {
-      sets.push("updated_at = datetime('now')");
+      sets.push(`updated_at = ${now}`);
       params.push(userId);
-      runSql(`UPDATE coding_configs SET ${sets.join(", ")} WHERE user_id = ?`, params);
+      await runSql(`UPDATE coding_configs SET ${sets.join(", ")} WHERE user_id = ?`, params);
     }
   } else {
-    runSql(
-      `INSERT INTO coding_configs (user_id, is_active, fallback_models, max_retries)
-       VALUES (?, ?, ?, ?)
-       ON CONFLICT(user_id) DO UPDATE SET
-         is_active = excluded.is_active,
-         fallback_models = excluded.fallback_models,
-         max_retries = excluded.max_retries,
-         updated_at = datetime('now')`,
+    await runSql(
+      buildUpsertSql(drv().dialect, "coding_configs", ["user_id", "is_active", "fallback_models", "max_retries"], ["user_id"], ["is_active", "fallback_models", "max_retries"], true),
       [
         userId,
         opts.isActive ?? 0,
@@ -1420,51 +1428,37 @@ export function setCodingConfig(
  * Given an api_key_id, return the user's active coding config (if any).
  * Used by the API server to check fallback logic.
  */
-export function getActiveCodingForApiKey(apiKeyId: number): CodingConfig | null {
-  const row = queryOne(
+export async function getActiveCodingForApiKey(apiKeyId: number): Promise<CodingConfig | null> {
+  const row = await queryOne(
     `SELECT cc.* FROM coding_configs cc
      JOIN api_keys ak ON ak.user_id = cc.user_id
      WHERE ak.id = ? AND cc.is_active = 1`,
     [apiKeyId]
-  ) as Record<string, unknown> | undefined;
+  );
   if (!row) return null;
-  const config = row as Record<string, SqlValue>;
-  return {
-    id: config.id as number,
-    user_id: config.user_id as number,
-    is_active: config.is_active as number,
-    fallback_models: (config.fallback_models as string) || "",
-    max_retries: (config.max_retries as number) || 3,
-    fallback_list: ((config.fallback_models as string) || "").split(",").map((m: string) => m.trim()).filter(Boolean),
-    session_input_tokens: (config.session_input_tokens as number) || 0,
-    session_output_tokens: (config.session_output_tokens as number) || 0,
-    session_input_cost: (config.session_input_cost as number) || 0,
-    session_output_cost: (config.session_output_cost as number) || 0,
-    session_requests: (config.session_requests as number) || 0,
-    session_model_counts: (config.session_model_counts as string) || "{}",
-  };
+  return rowToCodingConfig(row);
 }
 
 /**
  * Increment coding mode session stats after a successful coding-mode request.
  */
-export function incrementCodingSessionStats(
+export async function incrementCodingSessionStats(
   userId: number,
   inputTokens: number,
   outputTokens: number,
   inputCost: number,
   outputCost: number,
   actualModel: string,
-): void {
-  // Read current model counts, update, write back
-  const row = queryOne(`SELECT session_model_counts FROM coding_configs WHERE user_id = ?`, [userId]);
+): Promise<void> {
+  const row = await queryOne(`SELECT session_model_counts FROM coding_configs WHERE user_id = ?`, [userId]);
   let counts: Record<string, number> = {};
   try {
     counts = row?.session_model_counts ? JSON.parse(row.session_model_counts as string) : {};
   } catch { counts = {}; }
   counts[actualModel] = (counts[actualModel] || 0) + 1;
 
-  runSql(
+  const now = nowExpr();
+  await runSql(
     `UPDATE coding_configs SET
        session_input_tokens = session_input_tokens + ?,
        session_output_tokens = session_output_tokens + ?,
@@ -1472,7 +1466,7 @@ export function incrementCodingSessionStats(
        session_output_cost = session_output_cost + ?,
        session_requests = session_requests + 1,
        session_model_counts = ?,
-       updated_at = datetime('now')
+       updated_at = ${now}
      WHERE user_id = ?`,
     [inputTokens, outputTokens, inputCost, outputCost, JSON.stringify(counts), userId]
   );
@@ -1481,8 +1475,9 @@ export function incrementCodingSessionStats(
 /**
  * Reset coding mode session stats to zero (called when coding mode is activated).
  */
-export function resetCodingSessionStats(userId: number): void {
-  runSql(
+export async function resetCodingSessionStats(userId: number): Promise<void> {
+  const now = nowExpr();
+  await runSql(
     `UPDATE coding_configs SET
        session_input_tokens = 0,
        session_output_tokens = 0,
@@ -1490,7 +1485,7 @@ export function resetCodingSessionStats(userId: number): void {
        session_output_cost = 0.0,
        session_requests = 0,
        session_model_counts = '{}',
-       updated_at = datetime('now')
+       updated_at = ${now}
      WHERE user_id = ?`,
     [userId]
   );
@@ -1505,7 +1500,7 @@ export interface ModelRestriction {
   user_id: number;
   api_key_id: number | null;
   mode: "whitelist" | "blacklist";
-  models: string;       // comma-separated
+  models: string;
   created_at: string;
   updated_at: string;
 }
@@ -1514,59 +1509,60 @@ export interface ModelRestriction {
  * Get model restriction for a specific user or API key.
  * api_key_id = null → user-level; api_key_id = number → key-level.
  */
-export function getModelRestriction(
+export async function getModelRestriction(
   userId: number,
   apiKeyId: number | null,
-): ModelRestriction | null {
+): Promise<ModelRestriction | null> {
   if (apiKeyId !== null) {
-    return queryOne(
+    return (await queryOne(
       "SELECT * FROM model_restrictions WHERE user_id = ? AND api_key_id = ?",
       [userId, apiKeyId],
-    ) as unknown as ModelRestriction | null;
+    )) as unknown as ModelRestriction | null;
   }
-  return queryOne(
+  return (await queryOne(
     "SELECT * FROM model_restrictions WHERE user_id = ? AND api_key_id IS NULL",
     [userId],
-  ) as unknown as ModelRestriction | null;
+  )) as unknown as ModelRestriction | null;
 }
 
 /**
  * Get ALL restrictions for a user (both user-level and key-level).
  */
-export function getModelRestrictionsForUser(
+export async function getModelRestrictionsForUser(
   userId: number,
-): ModelRestriction[] {
-  return queryAll(
+): Promise<ModelRestriction[]> {
+  return (await queryAll(
     "SELECT * FROM model_restrictions WHERE user_id = ? ORDER BY api_key_id IS NULL DESC, api_key_id ASC",
     [userId],
-  ) as unknown as ModelRestriction[];
+  )) as unknown as ModelRestriction[];
 }
 
 /**
  * Set (upsert) model restriction.
  * mode: 'whitelist' = only these models allowed; 'blacklist' = these models blocked.
  */
-export function setModelRestriction(
+export async function setModelRestriction(
   userId: number,
   apiKeyId: number | null,
   mode: "whitelist" | "blacklist",
   models: string,
-): void {
+): Promise<void> {
   const modelsStr = models
     .split(",")
     .map((m) => m.trim())
     .filter(Boolean)
     .join(",");
 
-  const existing = getModelRestriction(userId, apiKeyId);
+  const existing = await getModelRestriction(userId, apiKeyId);
+  const now = nowExpr();
   if (existing) {
-    runSql(
-      `UPDATE model_restrictions SET mode = ?, models = ?, updated_at = datetime('now') WHERE id = ?`,
+    await runSql(
+      `UPDATE model_restrictions SET mode = ?, models = ?, updated_at = ${now} WHERE id = ?`,
       [mode, modelsStr, existing.id],
     );
   } else {
-    runSql(
-      `INSERT INTO model_restrictions (user_id, api_key_id, mode, models) VALUES (?, ?, ?, ?)`,
+    await runSql(
+      `INSERT INTO model_restrictions (user_id, api_key_id, mode, models, created_at, updated_at) VALUES (?, ?, ?, ?, ${nowExpr()}, ${nowExpr()})`,
       [userId, apiKeyId, mode, modelsStr],
     );
   }
@@ -1575,19 +1571,18 @@ export function setModelRestriction(
 /**
  * Delete a model restriction.
  */
-export function deleteModelRestriction(
+export async function deleteModelRestriction(
   userId: number,
   apiKeyId: number | null,
-): boolean {
-  const existing = getModelRestriction(userId, apiKeyId);
+): Promise<boolean> {
+  const existing = await getModelRestriction(userId, apiKeyId);
   if (!existing) return false;
-  runSql("DELETE FROM model_restrictions WHERE id = ?", [existing.id]);
+  await runSql("DELETE FROM model_restrictions WHERE id = ?", [existing.id]);
   return true;
 }
 
 /**
  * Check if a specific model is allowed for the given user/apiKey.
- * Returns true if allowed, false if denied.
  *
  * Priority:
  * 1. Key-level restriction (model_restrictions with specific apiKeyId)
@@ -1599,15 +1594,15 @@ export function deleteModelRestriction(
  *    → If non-empty, acts as whitelist for that model.
  * 5. If no restriction at all → default allow (return true).
  */
-export function checkModelAllowed(
+export async function checkModelAllowed(
   userId: number,
   apiKeyId: number | null,
   modelName: string,
   isAdmin: boolean,
-): boolean {
+): Promise<boolean> {
   // 1. Try key-level restriction (always applies, even for admin)
   if (apiKeyId !== null) {
-    const keyRestriction = getModelRestriction(userId, apiKeyId);
+    const keyRestriction = await getModelRestriction(userId, apiKeyId);
     if (keyRestriction) {
       return applyRestriction(keyRestriction, modelName);
     }
@@ -1617,13 +1612,13 @@ export function checkModelAllowed(
   if (isAdmin) return true;
 
   // 3. Check user-level restriction
-  const userRestriction = getModelRestriction(userId, null);
+  const userRestriction = await getModelRestriction(userId, null);
   if (userRestriction) {
     return applyRestriction(userRestriction, modelName);
   }
 
   // 4. Check group-level allowed_models (whitelist from user group)
-  const limits = getCachedEffectiveLimits(userId, apiKeyId);
+  const limits = await getCachedEffectiveLimits(userId, apiKeyId);
   if (limits.allowedModels.length > 0) {
     return limits.allowedModels.includes(modelName);
   }
@@ -1651,15 +1646,15 @@ function applyRestriction(
  * Get the list of allowed models for a user/apiKey from the full model list.
  * Used by /v1/models endpoint.
  */
-export function getAllowedModels(
+export async function getAllowedModels(
   userId: number,
   apiKeyId: number | null,
   allModels: string[],
   isAdmin: boolean,
-): string[] {
+): Promise<string[]> {
   // 1. Try key-level restriction
   if (apiKeyId !== null) {
-    const keyRestriction = getModelRestriction(userId, apiKeyId);
+    const keyRestriction = await getModelRestriction(userId, apiKeyId);
     if (keyRestriction) {
       return filterModelsByRestriction(keyRestriction, allModels);
     }
@@ -1669,13 +1664,13 @@ export function getAllowedModels(
   if (isAdmin) return allModels;
 
   // 3. User-level restriction
-  const userRestriction = getModelRestriction(userId, null);
+  const userRestriction = await getModelRestriction(userId, null);
   if (userRestriction) {
     return filterModelsByRestriction(userRestriction, allModels);
   }
 
   // 4. Check group-level allowed_models (whitelist from user group)
-  const limits = getCachedEffectiveLimits(userId, apiKeyId);
+  const limits = await getCachedEffectiveLimits(userId, apiKeyId);
   if (limits.allowedModels.length > 0) {
     return allModels.filter((m) => limits.allowedModels.includes(m));
   }
@@ -1762,20 +1757,20 @@ export interface EffectiveLimits {
 
 // --- User Groups CRUD ---
 
-export function getUserGroups(): UserGroup[] {
-  return queryAll("SELECT * FROM user_groups ORDER BY is_default DESC, name ASC") as unknown as UserGroup[];
+export async function getUserGroups(): Promise<UserGroup[]> {
+  return (await queryAll("SELECT * FROM user_groups ORDER BY is_default DESC, name ASC")) as unknown as UserGroup[];
 }
 
-export function getUserGroupById(id: number): UserGroup | undefined {
-  return queryOne("SELECT * FROM user_groups WHERE id = ?", [id]) as unknown as UserGroup | undefined;
+export async function getUserGroupById(id: number): Promise<UserGroup | undefined> {
+  return (await queryOne("SELECT * FROM user_groups WHERE id = ?", [id])) as unknown as UserGroup | undefined;
 }
 
-export function getUserGroupByName(name: string): UserGroup | undefined {
-  return queryOne("SELECT * FROM user_groups WHERE name = ?", [name]) as unknown as UserGroup | undefined;
+export async function getUserGroupByName(name: string): Promise<UserGroup | undefined> {
+  return (await queryOne("SELECT * FROM user_groups WHERE name = ?", [name])) as unknown as UserGroup | undefined;
 }
 
-export function getDefaultUserGroup(): UserGroup | undefined {
-  return queryOne("SELECT * FROM user_groups WHERE is_default = 1") as unknown as UserGroup | undefined;
+export async function getDefaultUserGroup(): Promise<UserGroup | undefined> {
+  return (await queryOne("SELECT * FROM user_groups WHERE is_default = 1")) as unknown as UserGroup | undefined;
 }
 
 export interface UserGroupInput {
@@ -1791,8 +1786,8 @@ export interface UserGroupInput {
   allowed_models?: string;
 }
 
-export function addUserGroup(data: UserGroupInput): void {
-  runSql(
+export async function addUserGroup(data: UserGroupInput): Promise<void> {
+  await runSql(
     `INSERT INTO user_groups (name, display_name, rpm_limit, tpm_limit, concurrency_limit,
       daily_token_limit, monthly_token_limit, daily_cost_limit, monthly_cost_limit, allowed_models)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -1812,7 +1807,7 @@ export function addUserGroup(data: UserGroupInput): void {
   invalidateEffectiveLimitsCache();
 }
 
-export function updateUserGroup(id: number, data: Partial<UserGroupInput>): void {
+export async function updateUserGroup(id: number, data: Partial<UserGroupInput>): Promise<void> {
   const fields: string[] = [];
   const values: SqlValue[] = [];
 
@@ -1831,47 +1826,45 @@ export function updateUserGroup(id: number, data: Partial<UserGroupInput>): void
 
   if (fields.length === 0) return;
 
-  fields.push("updated_at = datetime('now')");
+  fields.push(`updated_at = ${nowExpr()}`);
   values.push(id);
 
-  runSql(`UPDATE user_groups SET ${fields.join(", ")} WHERE id = ?`, values);
+  await runSql(`UPDATE user_groups SET ${fields.join(", ")} WHERE id = ?`, values);
   invalidateEffectiveLimitsCache();
 }
 
-export function deleteUserGroup(id: number): void {
-  // Prevent deleting the default group
-  const group = getUserGroupById(id);
+export async function deleteUserGroup(id: number): Promise<void> {
+  const group = await getUserGroupById(id);
   if (group && group.is_default === 1) {
     throw new Error("Cannot delete the default user group");
   }
-  // Reset all users in this group to the default group
-  const defaultGroup = getDefaultUserGroup();
+  const defaultGroup = await getDefaultUserGroup();
   if (defaultGroup && defaultGroup.id !== id) {
-    runSql("UPDATE users SET group_id = ? WHERE group_id = ?", [defaultGroup.id, id]);
+    await runSql("UPDATE users SET group_id = ? WHERE group_id = ?", [defaultGroup.id, id]);
   }
-  runSql("DELETE FROM user_groups WHERE id = ?", [id]);
+  await runSql("DELETE FROM user_groups WHERE id = ?", [id]);
   invalidateEffectiveLimitsCache();
 }
 
-export function setDefaultUserGroup(id: number): void {
-  const group = getUserGroupById(id);
+export async function setDefaultUserGroup(id: number): Promise<void> {
+  const group = await getUserGroupById(id);
   if (!group) throw new Error("User group not found");
-  runSql("UPDATE user_groups SET is_default = 0");
-  runSql("UPDATE user_groups SET is_default = 1 WHERE id = ?", [id]);
+  await runSql("UPDATE user_groups SET is_default = 0");
+  await runSql("UPDATE user_groups SET is_default = 1 WHERE id = ?", [id]);
   invalidateEffectiveLimitsCache();
 }
 
 // --- User limits management ---
 
-export function getUserWithLimits(id: number): UserWithLimits | undefined {
-  return queryOne("SELECT * FROM users WHERE id = ?", [id]) as unknown as UserWithLimits | undefined;
+export async function getUserWithLimits(id: number): Promise<UserWithLimits | undefined> {
+  return (await queryOne("SELECT * FROM users WHERE id = ?", [id])) as unknown as UserWithLimits | undefined;
 }
 
-export function setUserGroup(userId: number, groupId: number): void {
-  if (!getUserGroupById(groupId)) {
+export async function setUserGroup(userId: number, groupId: number): Promise<void> {
+  if (!(await getUserGroupById(groupId))) {
     throw new Error("User group not found");
   }
-  runSql("UPDATE users SET group_id = ? WHERE id = ?", [groupId, userId]);
+  await runSql("UPDATE users SET group_id = ? WHERE id = ?", [groupId, userId]);
   invalidateEffectiveLimitsCache(userId);
 }
 
@@ -1886,7 +1879,7 @@ export interface UserOverridesInput {
   monthly_cost_override?: number | null;
 }
 
-export function setUserOverrides(userId: number, overrides: UserOverridesInput): void {
+export async function setUserOverrides(userId: number, overrides: UserOverridesInput): Promise<void> {
   const fields: string[] = [];
   const values: SqlValue[] = [];
 
@@ -1905,14 +1898,14 @@ export function setUserOverrides(userId: number, overrides: UserOverridesInput):
   if (fields.length === 0) return;
   values.push(userId);
 
-  runSql(`UPDATE users SET ${fields.join(", ")} WHERE id = ?`, values);
+  await runSql(`UPDATE users SET ${fields.join(", ")} WHERE id = ?`, values);
   invalidateEffectiveLimitsCache(userId);
 }
 
 // --- API Key limits management ---
 
-export function getApiKeyWithLimits(id: number): ApiKeyWithLimits | undefined {
-  return queryOne("SELECT * FROM api_keys WHERE id = ?", [id]) as unknown as ApiKeyWithLimits | undefined;
+export async function getApiKeyWithLimits(id: number): Promise<ApiKeyWithLimits | undefined> {
+  return (await queryOne("SELECT * FROM api_keys WHERE id = ?", [id])) as unknown as ApiKeyWithLimits | undefined;
 }
 
 export interface ApiKeyOverridesInput {
@@ -1926,7 +1919,7 @@ export interface ApiKeyOverridesInput {
   monthly_cost_override?: number | null;
 }
 
-export function setApiKeyOverrides(apiKeyId: number, overrides: ApiKeyOverridesInput): void {
+export async function setApiKeyOverrides(apiKeyId: number, overrides: ApiKeyOverridesInput): Promise<void> {
   const fields: string[] = [];
   const values: SqlValue[] = [];
 
@@ -1945,7 +1938,7 @@ export function setApiKeyOverrides(apiKeyId: number, overrides: ApiKeyOverridesI
   if (fields.length === 0) return;
   values.push(apiKeyId);
 
-  runSql(`UPDATE api_keys SET ${fields.join(", ")} WHERE id = ?`, values);
+  await runSql(`UPDATE api_keys SET ${fields.join(", ")} WHERE id = ?`, values);
   // API key overrides affect any user that holds this key — clear entire cache
   invalidateEffectiveLimitsCache();
 }
@@ -1973,8 +1966,8 @@ function pickLimit(
  *
  * Uses a single JOIN query instead of 3 separate SELECTs.
  */
-export function getEffectiveLimits(userId: number, apiKeyId: number | null): EffectiveLimits {
-  const row = queryOne(
+export async function getEffectiveLimits(userId: number, apiKeyId: number | null): Promise<EffectiveLimits> {
+  const row = await queryOne(
     `SELECT
        u.rpm_override AS u_rpm, u.tpm_override AS u_tpm,
        u.concurrency_override AS u_conc, u.daily_token_override AS u_dt,
@@ -2026,10 +2019,9 @@ export function getEffectiveLimits(userId: number, apiKeyId: number | null): Eff
 }
 
 // --- Effective limits TTL cache (60s) ---
-// Avoids repeated DB queries for the same user+key within the TTL window.
 
-const EFFECTIVE_LIMITS_TTL = 60_000; // 60 seconds
-const EFFECTIVE_LIMITS_CACHE_MAX = 512; // prevent unbounded memory growth
+const EFFECTIVE_LIMITS_TTL = 60_000;
+const EFFECTIVE_LIMITS_CACHE_MAX = 512;
 const effectiveLimitsCache = new Map<string, { limits: EffectiveLimits; expiresAt: number }>();
 
 function effectiveLimitsCacheKey(userId: number, apiKeyId: number | null): string {
@@ -2038,10 +2030,10 @@ function effectiveLimitsCacheKey(userId: number, apiKeyId: number | null): strin
 
 /**
  * Cached version of getEffectiveLimits.
- * Checks in-memory cache first, falls back to DB query on miss.
- * Uses simple LRU eviction when cache exceeds EFFECTIVE_LIMITS_CACHE_MAX entries.
+ * Cache hit returns synchronously-wrapped value; cache miss falls back to
+ * async DB query. LRU eviction when over capacity.
  */
-export function getCachedEffectiveLimits(userId: number, apiKeyId: number | null): EffectiveLimits {
+export async function getCachedEffectiveLimits(userId: number, apiKeyId: number | null): Promise<EffectiveLimits> {
   const key = effectiveLimitsCacheKey(userId, apiKeyId);
   const cached = effectiveLimitsCache.get(key);
   const now = Date.now();
@@ -2051,9 +2043,8 @@ export function getCachedEffectiveLimits(userId: number, apiKeyId: number | null
     effectiveLimitsCache.set(key, cached);
     return cached.limits;
   }
-  const limits = getEffectiveLimits(userId, apiKeyId);
+  const limits = await getEffectiveLimits(userId, apiKeyId);
   effectiveLimitsCache.set(key, { limits, expiresAt: now + EFFECTIVE_LIMITS_TTL });
-  // Evict oldest entry if over capacity
   if (effectiveLimitsCache.size > EFFECTIVE_LIMITS_CACHE_MAX) {
     const oldestKey = effectiveLimitsCache.keys().next().value;
     if (oldestKey !== undefined) effectiveLimitsCache.delete(oldestKey);
@@ -2090,36 +2081,40 @@ export interface UsageQuota {
 /**
  * Get today's token usage and cost for a user or specific API key.
  */
-export function getDailyUsage(userId: number, apiKeyId: number | null = null): UsageQuota {
+export async function getDailyUsage(userId: number, apiKeyId: number | null = null): Promise<UsageQuota> {
   return getPeriodUsage("day", userId, apiKeyId);
 }
 
 /**
  * Get this month's token usage and cost for a user or specific API key.
  */
-export function getMonthlyUsage(userId: number, apiKeyId: number | null = null): UsageQuota {
+export async function getMonthlyUsage(userId: number, apiKeyId: number | null = null): Promise<UsageQuota> {
   return getPeriodUsage("month", userId, apiKeyId);
 }
 
-function getPeriodUsage(period: "day" | "month", userId: number, apiKeyId: number | null): UsageQuota {
-  const dateCondition = period === "day"
-    ? "date(u.created_at) = date('now')"
-    : "strftime('%Y-%m', u.created_at) = strftime('%Y-%m', 'now')";
+/**
+ * Period-based usage aggregate.
+ *
+ * The date comparison is dialect-aware (see `periodCondition` in dialect.ts):
+ * SQLite uses date()/strftime(), Postgres uses ::date casts, MySQL uses
+ * DATE()/DATE_FORMAT().
+ */
+async function getPeriodUsage(period: "day" | "month", userId: number, apiKeyId: number | null): Promise<UsageQuota> {
+  const col = apiKeyId !== null ? "created_at" : "u.created_at";
+  const dateCondition = periodCondition(period, drv().dialect, col);
 
   let sql: string;
   let params: SqlValue[];
 
   if (apiKeyId !== null) {
-    // Query by specific API key
     sql = `SELECT
              COALESCE(SUM(input_tokens), 0) AS total_input_tokens,
              COALESCE(SUM(output_tokens), 0) AS total_output_tokens,
              COALESCE(SUM(input_cost + output_cost), 0) AS total_cost
            FROM usage
-           WHERE api_key_id = ? AND ${dateCondition.replace("u.", "")}`;
+           WHERE api_key_id = ? AND ${dateCondition}`;
     params = [apiKeyId];
   } else {
-    // Query by user (all their API keys)
     sql = `SELECT
              COALESCE(SUM(u.input_tokens), 0) AS total_input_tokens,
              COALESCE(SUM(u.output_tokens), 0) AS total_output_tokens,
@@ -2130,7 +2125,7 @@ function getPeriodUsage(period: "day" | "month", userId: number, apiKeyId: numbe
     params = [userId];
   }
 
-  const row = queryOne(sql, params);
+  const row = await queryOne(sql, params);
   return {
     total_input_tokens: Number(row?.total_input_tokens ?? 0),
     total_output_tokens: Number(row?.total_output_tokens ?? 0),
@@ -2149,26 +2144,10 @@ export function isExpired(expiresAt: string | null): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// Backup / Restore
+// Backup / Restore (SQLite-only in stage 2; cloud flow arrives in stage 3/4)
 // ---------------------------------------------------------------------------
 
-/**
- * Whitelist of tables included in backup/restore.
- * Order = insertion order (parents before children).
- * Table names are compile-time constants — never derived from user input.
- */
-const BACKUP_TABLES = [
-  "providers",
-  "users",
-  "api_keys",
-  "usage",
-  "settings",
-  "model_prices",
-  "coding_configs",
-  "model_restrictions",
-  "user_groups",
-  "model_mappings",
-] as const;
+/* BACKUP_TABLES is imported from schema/tables.js (shared across dialects). */
 
 export interface BackupData {
   version: 1;
@@ -2211,11 +2190,11 @@ function toSqlValue(val: unknown): SqlValue {
  * Export all backup tables as a JSON-serializable object.
  * Flushes pending usage writes first to ensure completeness.
  */
-export function exportDatabase(): BackupData {
-  flushUsageQueue();
+export async function exportDatabase(): Promise<BackupData> {
+  await flushUsageQueue();
   const tables: Record<string, Record<string, unknown>[]> = {};
   for (const table of BACKUP_TABLES) {
-    const rows = queryAll(`SELECT * FROM ${table}`);
+    const rows = await queryAll(`SELECT * FROM ${table}`);
     tables[table] = rows.map((row) => {
       const out: Record<string, unknown> = {};
       for (const [k, v] of Object.entries(row)) {
@@ -2247,14 +2226,13 @@ export function getBackupSummary(data: BackupData): BackupSummary {
 }
 
 /**
- * Get column names for a table via PRAGMA table_info.
- * Used to validate imported row keys against the actual schema.
+ * Get column names for a table.
+ * Uses a compile-time constant map (TABLE_COLUMNS) instead of PRAGMA so this
+ * works identically across SQLite/PG/MySQL without dialect-specific introspection.
  */
 function getTableColumns(tableName: string): string[] {
-  const d = getDb();
-  const result = d.exec(`PRAGMA table_info(${tableName})`);
-  if (!result.length) return [];
-  return result[0].values.map((r) => String(r[1]));
+  const cols = TABLE_COLUMNS[tableName];
+  return cols ? [...cols] : [];
 }
 
 function assertNoForeignKeyViolations(d: SqlJsDatabase): void {
@@ -2338,22 +2316,10 @@ function validateBackupAgainstSchema(data: BackupData): void {
 }
 
 /**
- * Import (restore) a backup, overwriting all existing data.
- *
- * Uses a single transaction with foreign_keys disabled during bulk insert,
- * validates referential integrity before commit, and rolls back on error.
- * After success: rebuilds provider cache, clears circuit-breaker state, saves to disk.
- *
- * @throws Error if the backup format is invalid or the restore fails.
+ * SQLite restore path: shadow-DB preflight + raw sql.js handle bulk insert.
+ * Preserves the original behaviour (zero regression for existing SQLite users).
  */
-export function importDatabase(data: BackupData): void {
-  if (!data || typeof data !== "object" || typeof data.tables !== "object" || data.tables === null) {
-    throw new Error("Invalid backup format: missing or invalid 'tables' object");
-  }
-
-  // Flush pending writes before overwriting
-  flushUsageQueue();
-
+async function importDatabaseSqlite(data: BackupData): Promise<void> {
   // Preflight: validate backup on a shadow DB before touching the live database.
   validateBackupAgainstSchema(data);
 
@@ -2366,7 +2332,6 @@ export function importDatabase(data: BackupData): void {
     // Wipe all backup tables and reset AUTOINCREMENT sequences
     for (const table of BACKUP_TABLES) {
       d.exec(`DELETE FROM ${table}`);
-      // sqlite_sequence may not contain every table; ignoring unknown rows is safe
       try {
         d.exec(`DELETE FROM sqlite_sequence WHERE name = '${table}'`);
       } catch {
@@ -2414,9 +2379,84 @@ export function importDatabase(data: BackupData): void {
       // Ignore
     }
   }
+}
 
+/**
+ * Cloud (Postgres/MySQL) restore path.
+ *
+ * Uses a driver transaction: TRUNCATE all backup tables (RESTART IDENTITY to
+ * reset sequences, CASCADE to honour FK), bulk INSERT rows preserving original
+ * ids, then reset sequences past max(id) so subsequent inserts don't collide.
+ * Foreign-key integrity is enforced by the DB at COMMIT.
+ *
+ * MySQL-specific syntax (no RESTART IDENTITY, AUTO_INCREMENT reset) will be
+ * wired up in stage 4.
+ */
+async function importDatabaseCloud(data: BackupData): Promise<void> {
+  await drv().transaction(async () => {
+    for (const table of BACKUP_TABLES) {
+      const truncateSql = drv().dialect === "postgres"
+          ? `TRUNCATE TABLE ${table} RESTART IDENTITY CASCADE`
+          : `DELETE FROM ${table}`;
+        await runSql(truncateSql);
+    }
+    for (const table of BACKUP_TABLES) {
+      const rows = (data.tables as Record<string, unknown>)[table];
+      if (!Array.isArray(rows) || rows.length === 0) continue;
+      const columns = getTableColumns(table);
+      if (columns.length === 0) continue;
+      for (const row of rows) {
+        if (typeof row !== "object" || row === null) continue;
+        const rowRecord = row as Record<string, unknown>;
+        const presentCols = columns.filter((c) => c in rowRecord);
+        if (presentCols.length === 0) continue;
+        const colList = presentCols.map((c) => `"${c}"`).join(", ");
+        const placeholders = presentCols.map(() => "?").join(", ");
+        const sql = `INSERT INTO ${table} (${colList}) VALUES (${placeholders})`;
+        const values: SqlValue[] = presentCols.map((c) => toSqlValue(rowRecord[c]));
+        await runSql(sql, values);
+      }
+    }
+    // Reset sequences past max(id) so new inserts don't collide.
+    if (drv().dialect === "postgres") {
+      for (const table of BACKUP_TABLES) {
+        if (!TABLE_COLUMNS[table]?.includes("id")) continue;
+        await runSql(
+          `SELECT setval(pg_get_serial_sequence('${table}', 'id'), COALESCE((SELECT MAX(id) FROM ${table}), 0) + 1, false)`,
+        );
+      }
+    }
+  });
+}
+/**
+ * Import (restore) a backup, overwriting all existing data.
+ *
+ * Uses a single transaction with foreign_keys disabled during bulk insert,
+ * validates referential integrity before commit, and rolls back on error.
+ * After success: rebuilds provider cache, clears circuit-breaker state, saves to disk.
+ *
+ * SQLite-only in stage 2 (operates on the raw sql.js handle). Cloud drivers
+ * will use a transaction-based equivalent in stage 3/4.
+ *
+ * @throws Error if the backup format is invalid or the restore fails.
+ */
+export async function importDatabase(data: BackupData): Promise<void> {
+  if (!data || typeof data !== "object" || typeof data.tables !== "object" || data.tables === null) {
+    throw new Error("Invalid backup format: missing or invalid 'tables' object");
+  }
+
+  // Flush pending writes before overwriting
+  await flushUsageQueue();
+
+  // Preflight + restore: SQLite uses a shadow-DB preflight + raw sql.js handle;
+  // cloud drivers use a transaction-based equivalent.
+  if (drv().dialect !== "sqlite") {
+    await importDatabaseCloud(data);
+  } else {
+    await importDatabaseSqlite(data);
+  }
   // Post-restore: rebuild caches and persist
-  rebuildProviderCache();
+  await rebuildProviderCache();
   // Clear circuit-breaker state for all restored providers (fresh start)
   const restoredProviders = data.tables["providers"];
   if (Array.isArray(restoredProviders)) {
@@ -2426,5 +2466,5 @@ export function importDatabase(data: BackupData): void {
       }
     }
   }
-  saveDb();
+  await driver!.sync();
 }

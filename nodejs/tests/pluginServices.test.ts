@@ -96,16 +96,16 @@ describe("Plugin services", () => {
     expect(() => services.storage.set("circular", circular)).toThrow();
   });
 
-  it("exposes auth helpers without requiring grammY context objects", () => {
+  it("exposes auth helpers without requiring grammY context objects", async () => {
     const services = createPluginServices("alpha", createLogger());
-    addUser(900001, "trusted");
+    await addUser(900001, "trusted");
 
     expect(services.auth.isAdminTelegramUser(config.ADMIN_ID)).toBe(true);
     expect(services.auth.isAdminTelegramUser(900001)).toBe(false);
-    expect(services.auth.isTrustedTelegramUser(config.ADMIN_ID)).toBe(true);
-    expect(services.auth.isTrustedTelegramUser(900001)).toBe(true);
-    expect(services.auth.isTrustedTelegramUser(900002)).toBe(false);
-    expect(() => services.auth.requireTrustedTelegramUser(900002)).toThrow(/Trusted/);
+    expect(await services.auth.isTrustedTelegramUser(config.ADMIN_ID)).toBe(true);
+    expect(await services.auth.isTrustedTelegramUser(900001)).toBe(true);
+    expect(await services.auth.isTrustedTelegramUser(900002)).toBe(false);
+    await expect(services.auth.requireTrustedTelegramUser(900002)).rejects.toThrow(/Trusted/);
 
     const req = { auth: { userId: "1", apiKeyId: "2", tgUserId: 900001 } } as Request;
     expect(services.auth.getRequestAuth(req)).toEqual({ userId: "1", apiKeyId: "2", tgUserId: 900001 });
@@ -161,7 +161,7 @@ describe("Plugin services", () => {
     expect(() => services.scheduler.setTimeout(() => {}, 999)).toThrow(/at least/);
   });
 
-  it("returns sanitized provider data without secrets or base URLs", () => {
+  it("returns sanitized provider data without secrets or base URLs", async () => {
     const services = createPluginServices("alpha", createLogger());
     addProvider({
       name: "Sensitive Provider",
@@ -174,9 +174,9 @@ describe("Plugin services", () => {
       input_price: 1.25,
       output_price: 2.5,
     });
-    rebuildProviderCache();
+    await rebuildProviderCache();
 
-    const provider = services.providers.list()[0];
+    const provider = (await services.providers.list())[0];
     const lookup = services.providers.lookupModel("gpt-test");
 
     expect(provider).toMatchObject({
@@ -201,18 +201,18 @@ describe("Plugin services", () => {
     expect(JSON.stringify(lookup)).not.toContain("secret-provider.example");
   });
 
-  it("returns read-only DB facade data with masked API key previews", () => {
+  it("returns read-only DB facade data with masked API key previews", async () => {
     const services = createPluginServices("alpha", createLogger());
-    addUser(900010, "api-user");
-    const createdKey = addApiKey(900010).key;
+    await addUser(900010, "api-user");
+    const createdKey = (await addApiKey(900010)).key;
 
-    const user = services.db.getUserByTelegramId(900010);
-    const previews = services.db.listApiKeyPreviewsByTelegramId(900010);
+    const user = await services.db.getUserByTelegramId(900010);
+    const previews = await services.db.listApiKeyPreviewsByTelegramId(900010);
 
     expect(user).toMatchObject({ tgUserId: 900010, username: "api-user", isActive: true });
     expect(previews).toHaveLength(1);
     expect(previews[0]?.preview).toBe(`...${createdKey.slice(-12)}`);
     expect(JSON.stringify(previews)).not.toContain(createdKey);
-    expect(services.db.getUserById(user!.id)).toEqual(user);
+    expect(await services.db.getUserById(user!.id)).toEqual(user);
   });
 });

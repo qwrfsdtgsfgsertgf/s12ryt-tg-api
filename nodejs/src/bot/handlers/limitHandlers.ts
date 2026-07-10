@@ -66,7 +66,7 @@ function parseOverride(input: string): number | null {
 }
 
 /** 顯示有效限制的文字 */
-function effectiveLimitsText(limits: ReturnType<typeof getEffectiveLimits>): string {
+function effectiveLimitsText(limits: Awaited<ReturnType<typeof getEffectiveLimits>>): string {
   const lines: string[] = [];
   lines.push(`📊 **有效限制**`);
   lines.push(`  RPM: ${formatLimit(limits.rpm)}`);
@@ -282,9 +282,10 @@ async function deleteGroupFlow(
   conversation: MyConversation,
   ctx: MyContext
 ): Promise<void> {
-  const groups = await conversation.external(() =>
-    getUserGroups().filter((g) => !g.is_default)
-  );
+  const groups = await conversation.external(async () => {
+    const gs = await getUserGroups();
+    return gs.filter((g) => !g.is_default);
+  });
 
   if (groups.length === 0) {
     await ctx.reply("沒有可刪除的分組（預設分組不可刪除）。");
@@ -643,7 +644,7 @@ async function limitsConversation(
   ctx: MyContext
 ): Promise<void> {
   await ctx.reply(LIMITS_MENU_TEXT, {
-    reply_markup: webButton(ctx.from!.id, "groups"),
+    reply_markup: await webButton(ctx.from!.id, "groups"),
   });
 
   const r = await conversation.wait();
@@ -677,28 +678,28 @@ async function handleMyLimits(ctx: MyContext): Promise<void> {
   const tgId = ctx.from?.id;
   if (!tgId) return;
 
-  const user = getUserByTgId(tgId);
+  const user = await getUserByTgId(tgId);
   if (!user) {
     await ctx.reply("❌ 找不到你的用戶資料");
     return;
   }
 
   const userId = Number(user.id);
-  const userLimits = getEffectiveLimits(userId, null);
-  const dailyUsage = getDailyUsage(userId);
-  const monthlyUsage = getMonthlyUsage(userId);
+  const userLimits = await getEffectiveLimits(userId, null);
+  const dailyUsage = await getDailyUsage(userId);
+  const monthlyUsage = await getMonthlyUsage(userId);
 
   let text = `📊 **我的限制**\n\n`;
   text += effectiveLimitsText(userLimits);
   text += `\n\n📈 **今日用量**: ${dailyUsage.total_input_tokens + dailyUsage.total_output_tokens} tokens, ${formatCost(dailyUsage.total_cost)}`;
   text += `\n📈 **本月用量**: ${monthlyUsage.total_input_tokens + monthlyUsage.total_output_tokens} tokens, ${formatCost(monthlyUsage.total_cost)}`;
 
-  const keys = getKeysByUser(userId);
+  const keys = await getKeysByUser(userId);
   if (keys.length > 0) {
     text += "\n\n🔑 **API Keys：**\n";
     for (const k of keys) {
-      const keyLimits = getEffectiveLimits(userId, k.id);
-      const keyDaily = getDailyUsage(userId, k.id);
+      const keyLimits = await getEffectiveLimits(userId, k.id);
+      const keyDaily = await getDailyUsage(userId, k.id);
       text += `\nKey #${k.id} (${k.key.substring(0, 15)}...):\n`;
       text += `  RPM: ${formatLimit(keyLimits.rpm)}, 並發: ${formatLimit(keyLimits.concurrency)}\n`;
       text += `  過期: ${formatExpiry(keyLimits.expiresAt)}\n`;
@@ -706,7 +707,7 @@ async function handleMyLimits(ctx: MyContext): Promise<void> {
     }
   }
 
-  await ctx.reply(text, { reply_markup: webButton(tgId, "limits") });
+  await ctx.reply(text, { reply_markup: await webButton(tgId, "limits") });
 }
 
 // ========================
@@ -725,7 +726,7 @@ export function registerLimitHandlers(bot: Bot<MyContext>): void {
 
   // /my_limits — any trusted user
   bot.command("my_limits", async (ctx) => {
-    if (!isTrustedUser(ctx)) return;
+    if (!(await isTrustedUser(ctx))) return;
     await handleMyLimits(ctx);
   });
 }

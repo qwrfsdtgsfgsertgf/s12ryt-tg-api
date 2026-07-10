@@ -283,7 +283,7 @@ async function dispatchWithFallback(
       throw new Error("coding-mode requires an API key");
     }
 
-    const codingConfig = getActiveCodingForApiKey(apiKeyId);
+    const codingConfig = await getActiveCodingForApiKey(apiKeyId);
     if (!codingConfig || codingConfig.fallback_list.length === 0) {
       throw new Error(
         "coding-mode 未設定：請先使用 /set_coding 設定 Fallback 模型鏈"
@@ -297,7 +297,7 @@ async function dispatchWithFallback(
       const { model: fbModel, thinkingLevel: fbThinkingLevel } = parseModelThinkingSuffix(fbModelRaw);
 
       // BUG-1 fix: enforce model access restrictions (whitelist/blacklist) for fallback models
-      if (auth && !isModelAllowedForRequest(auth, fbModel)) {
+      if (auth && !(await isModelAllowedForRequest(auth, fbModel))) {
         continue;
       }
 
@@ -432,10 +432,10 @@ onProviderCacheRebuild(() => { cachedModelList = null; });
  * Returns true if allowed (or no auth), false if denied.
  * For coding-mode, always allow (the fallback chain handles individual model checks).
  */
-function isModelAllowedForRequest(
+async function isModelAllowedForRequest(
   auth: { userId: string; apiKeyId: string; tgUserId: number } | undefined,
   modelName: string,
-): boolean {
+): Promise<boolean> {
   if (!auth) return true; // no auth → public paths only (middleware handles this)
   if (modelName === "coding-mode") return true; // coding-mode handled by fallback
 
@@ -443,7 +443,7 @@ function isModelAllowedForRequest(
   const apiKeyId = parseInt(auth.apiKeyId, 10);
   const isAdmin = auth.tgUserId === config.ADMIN_ID;
 
-  return checkModelAllowed(userId, apiKeyId, modelName, isAdmin);
+  return await checkModelAllowed(userId, apiKeyId, modelName, isAdmin);
 }
 
 // ---------------------------------------------------------------------------
@@ -874,7 +874,7 @@ app.get("/health", (_req: Request, res: Response) => {
   res.json({ status: "ok" });
 });
 
-app.get("/v1/models", (req: Request, res: Response) => {
+app.get("/v1/models", async (req: Request, res: Response) => {
   const allModels = getAllModelsFromDb();
 
   // Filter models based on auth + model restrictions
@@ -885,7 +885,7 @@ app.get("/v1/models", (req: Request, res: Response) => {
     const isAdmin = auth.tgUserId === config.ADMIN_ID;
 
     const allModelNames = allModels.map((m) => m.id);
-    const allowedNames = new Set(getAllowedModels(userId, apiKeyId, allModelNames, isAdmin));
+    const allowedNames = new Set(await getAllowedModels(userId, apiKeyId, allModelNames, isAdmin));
 
     // Always include coding-mode virtual model if user has any models allowed
     if (allowedNames.size > 0 || isAdmin) {
@@ -928,7 +928,7 @@ app.post(
       }
 
       // Check model restriction
-      if (!isModelAllowedForRequest(req.auth, modelName)) {
+      if (!(await isModelAllowedForRequest(req.auth, modelName))) {
         res.status(403).json({
           error: { message: `Model '${modelName}' is not allowed for this API key`, type: "permission_error" },
         });
@@ -1086,7 +1086,7 @@ app.post(
       }
 
       // Check model restriction
-      if (!isModelAllowedForRequest(req.auth, modelName)) {
+      if (!(await isModelAllowedForRequest(req.auth, modelName))) {
         res.status(403).json({
           error: { message: `Model '${modelName}' is not allowed for this API key`, type: "permission_error" },
         });
@@ -1413,7 +1413,7 @@ app.post(
       }
 
       // Check model restriction
-      if (!isModelAllowedForRequest(req.auth, modelName)) {
+      if (!(await isModelAllowedForRequest(req.auth, modelName))) {
         res.status(403).json({
           type: "error",
           error: { type: "permission_error", message: `Model '${modelName}' is not allowed for this API key` },

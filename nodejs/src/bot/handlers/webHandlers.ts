@@ -27,8 +27,8 @@ type MyBot = Bot<MyContext>;
  * 邏輯與 /url 指令一致：優先使用 DB 中的 api_url setting，
  * 回退到 config.DEFAULT_API_URL，然後附加 /web 路徑。
  */
-function getWebBaseUrl(): string {
-  const base = (getSetting("api_url") ?? config.DEFAULT_API_URL).replace(/\/+$/, "");
+async function getWebBaseUrl(): Promise<string> {
+  const base = ((await getSetting("api_url")) ?? config.DEFAULT_API_URL).replace(/\/+$/, "");
   return `${base}/web`;
 }
 
@@ -58,9 +58,9 @@ export function isTelegramValidUrl(url: string): boolean {
  *
  * 匯出供其他 handler（如 /start）重用，避免重複邏輯。
  */
-export function buildWebLoginUrl(tgUserId: number): string {
+export async function buildWebLoginUrl(tgUserId: number): Promise<string> {
   const token = generateLoginToken(tgUserId);
-  return `${getWebBaseUrl()}?token=${token}`;
+  return `${await getWebBaseUrl()}?token=${token}`;
 }
 
 /**
@@ -72,8 +72,8 @@ export function buildWebLoginUrl(tgUserId: number): string {
  * @param page     hash 頁面名稱（對應前端路由，如 "keys", "coding", "usage" 等）
  * @returns 完整 URL，格式：{baseUrl}?token={token}#{page}
  */
-export function buildWebPageUrl(tgUserId: number, page?: string): string {
-  const base = buildWebLoginUrl(tgUserId);
+export async function buildWebPageUrl(tgUserId: number, page?: string): Promise<string> {
+  const base = await buildWebLoginUrl(tgUserId);
   return page ? `${base}#${page}` : base;
 }
 
@@ -85,8 +85,8 @@ export function buildWebPageUrl(tgUserId: number, page?: string): string {
  * @param label    按鈕文字，預設「🌐 Web 操作」
  * @returns InlineKeyboard 實例
  */
-export function webButton(tgUserId: number, page?: string, label = "🌐 Web 操作"): InlineKeyboard | undefined {
-  const url = buildWebPageUrl(tgUserId, page);
+export async function webButton(tgUserId: number, page?: string, label = "🌐 Web 操作"): Promise<InlineKeyboard | undefined> {
+  const url = await buildWebPageUrl(tgUserId, page);
   if (!isTelegramValidUrl(url)) return undefined;
   return new InlineKeyboard().url(label, url);
 }
@@ -101,7 +101,7 @@ async function webCommand(ctx: MyContext): Promise<void> {
   if (!tgUserId) return;
 
   try {
-    const loginUrl = buildWebLoginUrl(tgUserId);
+    const loginUrl = await buildWebLoginUrl(tgUserId);
     const canUseButton = isTelegramValidUrl(loginUrl);
     const isAdminUser = tgUserId === config.ADMIN_ID;
 
@@ -149,7 +149,7 @@ async function webCommand(ctx: MyContext): Promise<void> {
 export function registerWebHandlers(bot: MyBot): void {
   // /web — 任何信任用戶都可使用
   bot.command("web", async (ctx) => {
-    if (!isTrustedUser(ctx)) return;
+    if (!(await isTrustedUser(ctx))) return;
     await webCommand(ctx);
   });
 }

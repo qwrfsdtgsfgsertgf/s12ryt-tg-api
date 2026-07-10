@@ -73,3 +73,115 @@
 - **`完整請求.md`（194KB）是本地測試資產**：含 110 個 tools 的真實請求，被 `.gitignore` 忽略不進 git/CI。`full_request_integration.test.ts` 用 `describe.skipIf(!existsSync(...))` 在沒有此檔的環境自動 skip。本地全跑 401 測試（394 base + 7 integration），CI 只跑 394（integration 整檔 skip）。
 - **測試檔路徑解析**：`join(__dirname, "../../完整請求.md")` — 從 `nodejs/tests/` 往上兩層到專案根。在 vitest（tsx/esbuild 轉譯）下 `__dirname` 正確解析為測試檔所在目錄，Windows/Linux 皆然。
 - 本 session 共 8 個 commit（`1c7cc83`、`34919b3`、`976e7ff`、`6f66e5d`、`57056de`、`20f9af7`、`c30bebe`、`5901f24`），全在 `main` 分支，全已 push。`c30bebe`（整合測試）觸發 CI 失敗，`5901f24` 修復。
+
+## 2026-07-06（續）- Prebuilt bundle 更新路徑（commit `9de2212`）
+
+- 使用者場景是 **Pterodactyl 面板容器**：原始碼部署 + `start.js` 啟動器（優先 `dist/index.js`，必要時 `tsx` fallback），**不是** `node dist/`。容器內跑 `npm install` + `tsc build` 又慢又不穩（3-10 分鐘），所以做了 CI 預編譯 bundle。
+- **CI 預編譯機制**：`.github/workflows/release.yml` 的 `latest-release` 與 `tagged-release` 兩 job 都新增打包步驟 — `npm ci` + `npm run build` + `npm prune --omit=dev`（去掉 dev deps 減小體積）→ tar 成固定檔名 `s12ryt-tg-api-dist.tar.gz` → 上傳為 Release asset。解壓後根目錄平坦（`dist/`、`node_modules/`、`web/`、`scripts/`、`start.js`、`package.json` 等）。
+- **updater.ts 三層抽象**：
+  - `findPrebuiltAsset(assets)`：精確檔名 `s12ryt-tg-api-dist.tar.gz` 優先，pattern（`/-dist\.tar\.gz$/`）fallback；無 asset 回 null。
+  - `downloadPrebuiltAndExtract(url, dest)`：下載 + 解壓，用 `SWAP_ITEMS` 過濾。**關鍵差異**：與 Blue-Green 的 `shouldStageItem` 不同，prebuilt 路徑**保留 `node_modules`**（因為 CI 已經 prune 過 + 打包好了，容器端零 install）。
+  - `performPrebuiltUpdate()`：download → extract → validate（檢查 `dist/index.js` 存在）→ atomic swap。**零 npm install、零 tsc build**，10-30 秒完成。
+- **`SWAP_ITEMS`**：升級為 `["src", "dist", "web", "scripts", "start.js", "package.json", "package-lock.json", "tsconfig.json", "VERSION"]` — prebuilt 雖不含 `src`/`tsconfig.json`，但 Blue-Green 路徑仍需要，所以清單是兩條路徑的聯集。
+- **`performUpdate` 自動偵測**：有 prebuilt asset → prebuilt 路徑；無 asset（舊版 release）→ fallback Blue-Green。`UpdateResult.method` 新增 `'prebuilt'`。
+- **向後相容性鏈**：舊版 release 無 asset → `findPrebuiltAsset` 回 null → Blue-Green。舊版 v1.8.6 前端（不傳 `method`）→ 路由白名單歸類 `auto` → `performUpdate` 預設 `auto` → 自動偵測。舊版 v1.8.6 updater 程式碼**沒有 prebuilt 邏輯**，所以從 v1.8.6 第一次更新仍走 Blue-Green（舊碼認不得 asset），更新到新版後才會用 prebuilt。
+- **測試**：新增 8 個 — `findPrebuiltAsset` 6 情境（精確名/pattern/無 asset/多 asset/大小寫/URL 含 dist）+ `getLatestRelease` assets 解析 2 情境。總計 409 passed。
+- **未驗證的假設**：release asset 檔名**固定**為 `s12ryt-tg-api-dist.tar.gz`（release.yml 寫死），`findPrebuiltAsset` 精確比對這個名稱。若未來改檔名需同步更新比對邏輯。pattern fallback 是保險網但實務上精確比對就會命中。
+
+## 2026-07-06（續）- Web UI 更新方法選擇按鈕（commit `6251963`）
+
+- 使用者要求 Web Console 系統管理頁的「檢查更新」從單一按鈕改成一排可選方法按鈕，**用 SVG 圖示不用 emoji**（專案 `nodejs/web/app.js` 有 `ic.xxx` 圖示系統，如 `ic.download`、`ic.refresh`、`ic.check`、`ic.alert`、`ic.sparkles`）。
+- **`UpdateMethod` type** 新增：`"auto" | "prebuilt" | "blue-green"`。讓前端能明確指定方法，而非只能靠後端自動偵測。`auto` 保留原有自動偵測行為以維持完全向後相容。
+- **`performUpdate(onProgress?, method = "auto")` 三分支**：`blue-green` 強制走 tarball Blue-Green（忽略 prebuilt asset）、`prebuilt` 強制走 prebuilt（無 asset 回報錯誤讓前端知道）、`auto` 維持自動偵測。
+- **routes.ts `POST /api/admin/update`**：讀 `body.method`，白名單 `prebuilt`/`blue-green` 通過，其餘（含 undefined/空字串/亂填）一律歸 `auto`。白名單設計避免前端傳錯值導致 updater 行為異常。
+- **app.js pageSystem 改造**：單一按鈕 → 一排 SVG 按鈕。從 `release.assets` 偵測 `hasPrebuilt`（有 asset 才顯示 prebuilt 按鈕，舊版 release 不會有）。prebuilt 按鈕 `ic.download`、Blue-Green 按鈕 `ic.refresh`。`runUpdate(method)` POST 帶 `{method, restart:true}`。被點擊按鈕顯示「更新中...」並停用全部 `btn-update-*` 防重複點擊。
+- **順帶修的 method 顯示 bug**：原本更新結果顯示的 `methodLabel` 只有 `blue-green`/`tarball`/git pull 三分支，**缺少 `prebuilt` case**，導致 prebuilt 更新成功時錯誤 fallback 到 git pull 顯示。新增 `methodLabel()` 函式涵蓋全部 4 種 method，純文字無 emoji（符合專案風格）。
+- **驗證**：`tsc --noEmit` 零錯誤；`vitest run` 409 passed（18 檔案，含 updater 36 測試），無回歸。CI 預期全綠。
+- **`agent/` 目錄已被 `.gitignore` 忽略**，但 `agent/deep_todos.md`、`agent/memory.md` 是早期誤 tracked 進 git 的（在 .gitignore 規則加入前已 commit），git 仍會追蹤其改動。依工作規則**不主动 commit agent/ 變更**，這次只本地更新不留 git 痕跡。
+
+## 2026-07-06（續）- 閱讀 agent 資料夾並正式接手項目
+
+- 已使用 glob 工具列出 `agent/` 目錄，並以 batch_read 完整閱讀 `deep_todos.md`、`項目表.md`、`memory.md` 三個核心檔案。
+- 確認 deep_todos.md 所有任務（包含 Prebuilt bundle 更新路徑、Web UI 更新方法選擇按鈕、串流 token usage 注入修復、插件系統優雅化重構、全專案盤點等）均標記完成並通過驗證。
+- `項目表.md` 提供最新專案結構、更新機制（Prebuilt + Blue-Green + auto）、插件系統 10 個模組現況、測試覆蓋與部署重點。
+- `memory.md` 詳細記載所有歷史決策、bug 根因分析、驗證步驟、語言慣例（英文契約 vs 繁體中文管理員訊息）、測試斷言不可改動、agent 目錄不 commit 等重要注意事項。
+- **正式接手**：自即日起以此三個 agent 檔案作為單一真相來源，後續所有需求理解、實作、挖蟲、驗證與紀錄均以此為基礎，並在每次工作結束後更新這三個檔案以保持連續性。
+- 目前專案主線為 Node.js 版本（1.8.5+），Python 已停止維護，更新機制已大幅優化為秒級 Prebuilt 部署，適合 Pterodactyl 等容器環境。
+
+## 2026-07-07 - 插件大小上限 1MB → 10MB
+
+- 使用者要求「把插件大小限制到 10mb」。已完成 4 個檔案 9 處改動，所有「1MB」字串與 `1024 * 1024`（1 MiB）常數同步改為「10MB」與 `10 * 1024 * 1024`（10 MiB）。
+- **修改清單**：
+  1. `nodejs/src/plugins/pluginNaming.ts` L12 `MAX_PLUGIN_BYTES`、L49 `assertPluginSize` 錯誤訊息
+  2. `nodejs/src/web/routes.ts` L133 `MAX_PLUGIN_SOURCE_BYTES`（GitHub source 下載預檢）、L195/L199 `fetchTextWithLimit` content-length + Buffer.byteLength 雙重預檢錯誤訊息
+  3. `nodejs/web/app.js` L2752 UI form-hint 文字、L2795 前端 `file.size` 預檢 + toast
+  4. `plugin-example/README.md` L144、`agent/項目表.md` L77 文件同步
+- **不動的相關常數**（語義不同，避免越權）：`updater.ts` `MIN_UPDATE_FREE_BYTES = 768 * 1024 * 1024`（768MB 磁碟預留）、`backupHandlers.ts` `MAX_FILE_SIZE = 20 * 1024 * 1024`（20MB Telegram getFile 上限）、`server.ts` L54 `express.json({ limit: "10mb" })`（Express body parser，給 chat completions 大請求用，decimal MB）。
+- **已確認事項**：
+  - `nodejs/tests/` 沒有對插件大小做斷言（grep `assertPluginSize|MAX_PLUGIN_BYTES|插件檔案|超過` 在 tests/ 無 match），修改不會破壞測試。
+  - Express body parser `limit: "10mb"` 是 decimal MB（10,000,000 bytes），插件上限是 10 MiB（10,485,760 bytes），兩者單位略不同但 Express body parser 在我改動前已是 10mb（給 chat completions 用），本次不動。10 MiB JS 檔 JSON-escape 後 body 可能略超 10mb，極端邊界值上傳可能被 Express 擋下；實務上 8-9 MiB 的混淆插件能正常上傳，已符合「10mb」需求。
+  - 邊界判斷維持 `>`（size 等於上限時允許），與原本邏輯一致。
+- **驗證**：`lsp_diagnostics`（pluginNaming.ts、routes.ts）0 error；`npm test -- --run` 18 檔 409 tests 全通過，與改動前一致。
+- **技術債觀察**（未動，列建議）：插件大小上限散在 4 處檔案 9 個位置（`MAX_PLUGIN_BYTES`、`MAX_PLUGIN_SOURCE_BYTES`、前端 hardcode、文件），未集中為單一常數；未來若要再調整或 env 化，建議抽到 `pluginNaming.ts` 匯出，前端透過 API 取得。
+
+## 2026-07-09 - 雲端資料庫遷移工程（進行中：階段 0/1 完成）
+
+### 決策（已定案）
+- **動機**：保留 SQLite 又可上雲 → 策略 B（可選後端，DATABASE_URL 分流）
+- **DB 選型**：PostgreSQL + MySQL 8.0+ 都要
+- **技術路線**：路線 A（抽象 DbDriver 介面 + 保留現有 raw SQL），非 Drizzle 重寫
+- **型別策略**：統一用 TEXT（雲端 DB 時間/JSON 與 SQLite 一致，犧牲雲端型別能力換三方言查詢邏輯一致）
+- **MySQL 基線**：8.0+（CHECK 約束預設強制）
+
+### 設計與接手文件
+- `agent/db-cloud-migration-design.md`：完整 12 章技術設計（路線對比、方言對照、5 機制改造、6 階段計畫、7 風險）
+- `agent/stage2-async-migration.md`：⭐階段 2 執行手冊（改造規則、關鍵決策、進度追蹤）。**接手階段 2 必讀**。
+
+### 已完成（零回歸，tsc 零錯，439 tests 全綠）
+- `nodejs/src/db/driver/types.ts`：DbDriver 介面（query/run/insert/exec/batch/transaction/sync/close），SqlParam/DbRow/InsertResult 型別
+- `nodejs/src/db/driver/sqliteDriver.ts`：SqliteDriver（包裝 sql.js 為 async，30s auto-save，dirty flag）+ `getRawDatabase()`（供 backup shadow DB 用）
+- `nodejs/src/db/driver/factory.ts`：createDriver（DATABASE_URL scheme 偵測；PG/MySQL throw 佔位待階段 3/4；dynamic import 計畫）
+- `nodejs/src/db/dialect.ts`：NOW 常數（sqlite=`datetime('now')`, postgres/mysql=`NOW()`）+ dialectNow helper
+- `nodejs/tests/sqliteDriver.test.ts`（23 tests）+ `nodejs/tests/driverFactory.test.ts`（7 tests）
+
+### 階段 2 為何未在本 session 完成（重要接手背景）
+- database.ts（2430 行、~75 函數）全部 async 化是「全有或全無」大爆炸改動：一旦 database.ts 變 async，14 個呼叫檔 + database.test.ts（1459 行）必須同步改完才能編譯。
+- database.ts 全文已完整讀取並提煉成改造規則（見兩個壓縮對話塊 + stage2 手冊）。**原文未動**（git 確認 diff 空白）。
+- 本 session 因 README 注入 + 大量原文讀取消耗上下文，經與使用者確認改在新 session 執行以確保完整收尾。
+- **接手者直接讀 `agent/stage2-async-migration.md` 即可無縫執行**。database.ts 原檔乾淨（git checkout 可還原）。
+
+### 階段 2 核心改造規則（摘錄，詳見手冊）
+- queryAll/queryOne/runSql/runSqlAndSave → async + driver（drv() helper 取 driver）
+- 所有 export function → async（除純邏輯：isExpired/getBackupSummary/applyRestriction/filterModelsByRestriction/pickLimit/cache invalidate 純 Map 操作）
+- datetime('now') → NOW[driver.dialect]（~15 處）
+- cache hot path（lookupModelCached/getAllCachedModelNames/getCachedEffectiveLimits）保持同步讀 cache；rebuildProviderCache 變 async；invalidate 保持同步 + fire-and-forget 重建
+- lookupApiKeyCached 建議變 async（cache miss 查 DB），auth middleware 配合
+- flushUsageQueue → async（driver.batch/transaction）；enqueueUsage/recordUsage 同步，滿 100 void flushUsageQueue().catch()
+- createTables 保持同步操作 raw SqlJsDatabase（SQLite 專屬）；init 時從 SqliteDriver.getRawDatabase() 取得
+- closeDb → async（await flushUsageQueue + await driver.close）
+- backup/restore 階段 2 SQLite-only（shadow DB + PRAGMA 保留）；雲端版階段 3/4 用 transaction rollback
+
+### 待執行階段
+- 階段 2：✅ **已完成（2026-07-10）**。database.ts async 化 + 16 呼叫檔 + 6 測試檔，tsc 零錯，vitest 439 全綠。詳見 `agent/stage2-async-migration.md` 進度追蹤段。後續待辦：① plugin-example 適配 PluginDbService 介面 Promise 化（breaking change）；② pluginServices.test teardown ENOENT 雜音（非功能 bug）。
+- 階段 3：✅ **已完成（2026-07-10）**。PostgreSQL 後端全鏈路通車。新增 PostgresDriver（pg.Pool + $1 placeholder + RETURNING id + transaction txClient）+ schema 拆分（tables.ts/postgres.ts）+ schema_migrations + dialect periodCondition + importDatabase 分方言（SQLite shadow 零回歸 / PG TRUNCATE+setval）。tsc 零錯，SQLite 439 全綠。PG driver 測試 19 個靠 CI `pg-test` job（postgres:16 service container）自動跑。PG 連線驗證待 push 後 CI 結果確認。
+- 階段 4：✅ **已完成（2026-07-10）**。MySQL 後端全鏈路通車。新增 MysqlDriver（mysql2 Pool + `?` 原生 placeholder + OkPacket.insertId + transaction txConn + exec split `;`）+ schema/mysql.ts（INTEGER AUTO_INCREMENT + VARCHAR(255) for UNIQUE/PK + TEXT 無 DEFAULT + ENGINE=InnoDB + backtick `key`）+ importDatabaseCloud TRUNCATE 方言化。tsc 零錯，SQLite 439 全綠。MySQL driver 測試 19 個靠 CI `mysql-test` job（mysql:8 service container）自動跑。
+- 階段 5：✅ **已完成（2026-07-10）**。環境變數文檔（README DATABASE_URL 行 + .env.example mysql 範例）+ docker-compose.yml（DATABASE_URL 傳遞 + PG/MySQL profile 註解範例）+ SQLite→雲端遷移工具（src/scripts/migrate-db.ts → build 到 dist/scripts/）+ agent 文件收尾。tsc 零錯、build 通過、vitest 439 全綠。**整個雲端 DB 遷移計劃（階段 0-5）圓滿完成**，PG/MySQL 連線整合測試待 GitHub Actions CI 驗證。
+
+### 階段 3 完成摘要（2026-07-10）
+- **新增檔案**：`src/db/driver/postgresDriver.ts`、`src/db/schema/tables.ts`（BACKUP_TABLES+TABLE_COLUMNS）、`src/db/schema/postgres.ts`（PG_DDL+PG_INDEXES+PG_SEED_DEFAULT_GROUP）、`tests/postgresDriver.test.ts`（19 tests，讀 TEST_DATABASE_URL 否則 skip）
+- **修改檔案**：`src/db/driver/factory.ts`（PG 分支 dynamic import）、`src/db/dialect.ts`（NOW.postgres→to_char、新增 periodCondition）、`src/db/database.ts`（runMigrations+initDbAsync 放開 PG+getTableColumns 常數+getPeriodUsage 方言化+importDatabase 分 sqlite/cloud）、`package.json`（pg optionalDep + @types/pg devDep）、`.env.example`（DATABASE_URL 說明）、`.github/workflows/nodejs-ci.yml`（pg-test job）
+- **關鍵設計**：D1 SQLite 路徑零回歸（createTables/importDatabaseSqlite 走舊邏輯）；D2 PG 全新 DB 走 schema_migrations（001_base_schema）；D3 importDatabaseCloud 用 transaction+TRUNCATE RESTART IDENTITY CASCADE+INSERT 保留原始 id+setval 重置序列；D4 PG FK 驗證靠 COMMIT rollback 取代 PRAGMA foreign_key_check；D5 TABLE_COLUMNS 常數化取代 PRAGMA table_info；D6 PG 用 INTEGER 存布林（三方一致）；D7 tg_user_id BIGINT（Telegram ID 可超 int4）
+- **待驗證**：PG driver 連線測試靠 CI `pg-test` job（push 後觸發）。若 CI 紅需修 PG driver 細節
+
+### 階段 4 完成摘要（2026-07-10）
+- **新增檔案**：`src/db/driver/mysqlDriver.ts`（MysqlDriver: mysql2/promise Pool + `?` 原生 placeholder + isOkPacket 區分 SELECT vs OkPacket + insert 用 OkPacket.insertId + transaction txConn + exec split `;`）、`src/db/schema/mysql.ts`（MYSQL_DDL + MYSQL_INDEXES + MYSQL_SEED_DEFAULT_GROUP）、`tests/mysqlDriver.test.ts`（19 tests，讀 TEST_MYSQL_URL 否則 skip）
+- **修改檔案**：`src/db/driver/factory.ts`（MySQL 分支 dynamic import）、`src/db/database.ts`（runMigrations dialect dispatch 加 MySQL / importDatabaseCloud TRUNCATE 方言化：PG `RESTART IDENTITY CASCADE` vs MySQL 無後綴）、`package.json`（mysql2 optionalDep，自帶 TS 型別免 @types）、`.github/workflows/nodejs-ci.yml`（mysql-test job: mysql:8 service container + TEST_MYSQL_URL）、`tests/driverFactory.test.ts`（MySQL factory 從 not-implemented 改真實測試）
+- **MySQL vs PG 關鍵差異**：placeholder `?` 原生不轉換（PG `?`→`$N`）；insert 取 id 用 OkPacket.insertId（PG append RETURNING id）；TEXT in UNIQUE/PK 需 VARCHAR(255)（PG TEXT 可）；TEXT 無 DEFAULT（PG 可 DEFAULT ''）；timestamp 無 DEFAULT app 帶 NOW()（PG DDL DEFAULT to_char(NOW())）；TRUNCATE 無後綴自動重置 AUTO_INCREMENT（PG 需 RESTART IDENTITY + setval）；ENGINE=InnoDB + backtick `key`
+- **待驗證**：MySQL driver 連線測試靠 CI `mysql-test` job（push 後觸發）。若 CI 紅需修 MySQL driver 細節（caching_sha2_password 認證等）
+
+### 工作紀律提醒（本次延續）
+- driver 層檔案（types/sqliteDriver/factory/dialect）是 untracked 新檔。
+- 階段 2 已改動：database.ts（async 重寫）+ database.test.ts + 14 呼叫檔 + 6 測試檔。agent/ 不主動 commit，git 確認改動範圍正確即可。
+- pg/mysql2 計畫為 optionalDependencies + dynamic import（SQLite-only 部署不需裝）。
+- 錯誤訊息慣例：英文=開發者契約（driver/types 已遵循）；繁中=管理員 UI。
+- 本環境 read/edit 工具每次注入完整 README（~330 行），大檔逐段操作時嚴重消耗上下文；改用 bash PowerShell `[IO.File]::ReadAllText/WriteAllText` + `.Replace` / `[regex]::Replace` 字面替換（不注入），或寫腳本到 `C:\Users\yoyo2\AppData\Local\Temp\opencode\` 執行。

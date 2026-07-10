@@ -75,7 +75,7 @@ export function generateLoginToken(tgUserId: number): string {
  *
  * @returns Session info 或 null（OTP 無效/過期/用戶已停用）
  */
-export function exchangeToken(otpToken: string): { sessionToken: string; tgUserId: number; isAdmin: boolean } | null {
+export async function exchangeToken(otpToken: string): Promise<{ sessionToken: string; tgUserId: number; isAdmin: boolean } | null> {
   const entry = otpStore.get(otpToken);
   if (!entry) return null;
 
@@ -92,7 +92,7 @@ export function exchangeToken(otpToken: string): { sessionToken: string; tgUserI
 
   // 非管理員需確認用戶仍有效
   if (!isAdmin) {
-    const user = getUserByTgId(entry.tgUserId);
+    const user = await getUserByTgId(entry.tgUserId);
     if (!user || Number(user.is_active) !== 1) {
       return null;
     }
@@ -157,7 +157,8 @@ declare global {
  * 從 Authorization: Bearer {token} 提取 session token 並驗證。
  * 成功時注入 req.webAuth = { tgUserId, isAdmin }，失敗返回 401。
  */
-export function webAuthMiddleware(req: Request, res: Response, next: NextFunction): void {
+export async function webAuthMiddleware(req: Request, res: Response, next: NextFunction): Promise<void> {
+  try {
   const auth = req.headers.authorization;
   if (!auth || !auth.startsWith("Bearer ")) {
     res.status(401).json({ error: "未提供認證 token" });
@@ -176,7 +177,7 @@ export function webAuthMiddleware(req: Request, res: Response, next: NextFunctio
   const isAdmin = info.tgUserId === config.ADMIN_ID;
 
   if (!isAdmin) {
-    const user = getUserByTgId(info.tgUserId);
+    const user = await getUserByTgId(info.tgUserId);
     if (!user || Number(user.is_active) !== 1) {
       destroySession(token);
       res.status(401).json({ error: "帳號已停用，請重新登入" });
@@ -186,6 +187,9 @@ export function webAuthMiddleware(req: Request, res: Response, next: NextFunctio
 
   req.webAuth = { tgUserId: info.tgUserId, isAdmin };
   next();
+  } catch (err) {
+    next(err);
+  }
 }
 
 /**

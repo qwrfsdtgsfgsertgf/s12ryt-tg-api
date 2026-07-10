@@ -109,7 +109,7 @@ cleanupTimer.unref?.();
 // Express middleware
 // ---------------------------------------------------------------------------
 
-export function rateLimitMiddleware(req: Request, res: Response, next: NextFunction): void {
+export async function rateLimitMiddleware(req: Request, res: Response, next: NextFunction): Promise<void> {
   const auth = req.auth;
   // No auth info means authMiddleware hasn't run yet — skip
   if (!auth) {
@@ -125,7 +125,7 @@ export function rateLimitMiddleware(req: Request, res: Response, next: NextFunct
 
   let limits: EffectiveLimits;
   try {
-    limits = getCachedEffectiveLimits(Number(auth.userId), Number(auth.apiKeyId));
+    limits = await getCachedEffectiveLimits(Number(auth.userId), Number(auth.apiKeyId));
   } catch (err) {
     // If we can't read limits, allow the request (fail-open)
     console.error("[rateLimiter] Failed to get effective limits:", err);

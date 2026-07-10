@@ -107,7 +107,7 @@ export function registerBackupHandlers(bot: Bot<MyContext>): void {
     await ctx.reply("📤 正在匯出資料庫...");
 
     try {
-      const data = exportDatabase();
+      const data = await exportDatabase();
       const jsonStr = JSON.stringify(data, null, 2);
       const filename = getBackupFilename();
       const input = new InputFile(Buffer.from(jsonStr, "utf-8"), filename);

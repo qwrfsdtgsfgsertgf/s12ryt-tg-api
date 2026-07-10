@@ -111,9 +111,9 @@ export type PublicModelMapping = {
 
 export type PluginAuthService = {
   isAdminTelegramUser(tgUserId: number | null | undefined): boolean;
-  isTrustedTelegramUser(tgUserId: number | null | undefined): boolean;
+  isTrustedTelegramUser(tgUserId: number | null | undefined): Promise<boolean>;
   requireAdminTelegramUser(tgUserId: number | null | undefined): void;
-  requireTrustedTelegramUser(tgUserId: number | null | undefined): void;
+  requireTrustedTelegramUser(tgUserId: number | null | undefined): Promise<void>;
   getRequestAuth(req: Request): AuthInfo | null;
   requireRequestAuth(req: Request): AuthInfo;
 };
@@ -142,23 +142,23 @@ export type PluginSchedulerService = {
 };
 
 export type PluginProvidersService = {
-  list(options?: { enabledOnly?: boolean }): PublicProvider[];
-  getById(id: number): PublicProvider | null;
+  list(options?: { enabledOnly?: boolean }): Promise<PublicProvider[]>;
+  getById(id: number): Promise<PublicProvider | null>;
   listModels(): string[];
   lookupModel(modelName: string): PublicProviderLookup | null;
-  getModelPrices(providerId: number): PublicModelPrice[];
-  getModelMappings(): PublicModelMapping[];
+  getModelPrices(providerId: number): Promise<PublicModelPrice[]>;
+  getModelMappings(): Promise<PublicModelMapping[]>;
 };
 
 export type PluginDbService = {
-  getUserByTelegramId(tgUserId: number): PublicUser | null;
-  getUserById(id: number): PublicUser | null;
-  listApiKeyPreviewsByTelegramId(tgUserId: number): PublicApiKeyPreview[];
+  getUserByTelegramId(tgUserId: number): Promise<PublicUser | null>;
+  getUserById(id: number): Promise<PublicUser | null>;
+  listApiKeyPreviewsByTelegramId(tgUserId: number): Promise<PublicApiKeyPreview[]>;
   getEffectiveLimits(userId: number | string, apiKeyId: number | string): ReturnType<typeof getEffectiveLimits>;
   getDailyUsage(userId: number | string, apiKeyId?: number | string | null): ReturnType<typeof getDailyUsage>;
   getMonthlyUsage(userId: number | string, apiKeyId?: number | string | null): ReturnType<typeof getMonthlyUsage>;
-  checkModelAllowed(userId: number | string, apiKeyId: number | string, modelName: string, isAdmin?: boolean): boolean;
-  getAllowedModels(userId: number | string, apiKeyId: number | string, allModels: string[], isAdmin?: boolean): string[];
+  checkModelAllowed(userId: number | string, apiKeyId: number | string, modelName: string, isAdmin?: boolean): Promise<boolean>;
+  getAllowedModels(userId: number | string, apiKeyId: number | string, allModels: string[], isAdmin?: boolean): Promise<string[]>;
 };
 
 export type PluginServices = Readonly<{
@@ -278,10 +278,10 @@ function toPublicModelMapping(mapping: ModelMapping): PublicModelMapping {
 }
 
 function createAuthService(): PluginAuthService {
-  const isTrustedTelegramUser = (tgUserId: number | null | undefined): boolean => {
+  const isTrustedTelegramUser = async (tgUserId: number | null | undefined): Promise<boolean> => {
     if (tgUserId === undefined || tgUserId === null) return false;
     if (tgUserId === config.ADMIN_ID) return true;
-    const user = getUserByTgId(tgUserId);
+    const user = await getUserByTgId(tgUserId);
     return user?.is_active === 1;
   };
 
@@ -293,8 +293,8 @@ function createAuthService(): PluginAuthService {
     requireAdminTelegramUser(tgUserId) {
       if (tgUserId !== config.ADMIN_ID) throw new Error("Admin Telegram user required");
     },
-    requireTrustedTelegramUser(tgUserId) {
-      if (!isTrustedTelegramUser(tgUserId)) throw new Error("Trusted Telegram user required");
+    async requireTrustedTelegramUser(tgUserId) {
+      if (!(await isTrustedTelegramUser(tgUserId))) throw new Error("Trusted Telegram user required");
     },
     getRequestAuth(req) {
       return req.auth ?? null;
@@ -337,14 +337,14 @@ function createStorageService(pluginId: string): PluginStorageService {
          ON CONFLICT(plugin_id, key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')`,
         [pluginId, key, serialized],
       );
-      saveDb();
+      void saveDb();
     },
     delete(key: string): boolean {
       validateName("storage key", key);
       ensureStorageTable();
       const existed = hasStorageKey(key);
       getDb().run("DELETE FROM plugin_storage WHERE plugin_id = ? AND key = ?", [pluginId, key]);
-      if (existed) saveDb();
+      if (existed) void saveDb();
       return existed;
     },
     has(key: string): boolean {
@@ -359,7 +359,7 @@ function createStorageService(pluginId: string): PluginStorageService {
     clear(): void {
       ensureStorageTable();
       getDb().run("DELETE FROM plugin_storage WHERE plugin_id = ?", [pluginId]);
-      saveDb();
+      void saveDb();
     },
   });
 }
@@ -408,11 +408,11 @@ function createSchedulerService(pluginId: string, logger: PluginLogger): PluginS
 
 function createProvidersService(): PluginProvidersService {
   return freezePublic({
-    list(options = {}) {
-      return getProviders(Boolean(options.enabledOnly)).map((provider) => toPublicProvider(provider)).filter((provider): provider is PublicProvider => provider !== null);
+    async list(options = {}) {
+      return (await getProviders(Boolean(options.enabledOnly))).map((provider) => toPublicProvider(provider)).filter((provider): provider is PublicProvider => provider !== null);
     },
-    getById(id) {
-      return toPublicProvider(getProviderById(id));
+    async getById(id) {
+      return toPublicProvider(await getProviderById(id));
     },
     listModels() {
       return freezePublic([...getAllCachedModelNames()]) as string[];
@@ -431,39 +431,39 @@ function createProvidersService(): PluginProvidersService {
         outputPrice: provider.outputPrice,
       });
     },
-    getModelPrices(providerId) {
-      return getModelPricesByProvider(providerId).map(toPublicModelPrice);
+    async getModelPrices(providerId) {
+      return (await getModelPricesByProvider(providerId)).map(toPublicModelPrice);
     },
-    getModelMappings() {
-      return getModelMappings().map(toPublicModelMapping);
+    async getModelMappings() {
+      return (await getModelMappings()).map(toPublicModelMapping);
     },
   });
 }
 
 function createDbService(): PluginDbService {
   return freezePublic({
-    getUserByTelegramId(tgUserId) {
-      return toPublicUser(getUserByTgId(tgUserId));
+    async getUserByTelegramId(tgUserId) {
+      return toPublicUser(await getUserByTgId(tgUserId));
     },
-    getUserById(id) {
-      return toPublicUser(getUserById(id));
+    async getUserById(id) {
+      return toPublicUser(await getUserById(id));
     },
-    listApiKeyPreviewsByTelegramId(tgUserId) {
-      return getKeysByUser(tgUserId).map(toPublicApiKeyPreview);
+    async listApiKeyPreviewsByTelegramId(tgUserId) {
+      return (await getKeysByUser(tgUserId)).map(toPublicApiKeyPreview);
     },
-    getEffectiveLimits(userId, apiKeyId) {
+    async getEffectiveLimits(userId, apiKeyId) {
       return getEffectiveLimits(normalizeDbId(userId, "userId"), normalizeDbId(apiKeyId, "apiKeyId"));
     },
-    getDailyUsage(userId, apiKeyId = null) {
+    async getDailyUsage(userId, apiKeyId = null) {
       return getDailyUsage(normalizeDbId(userId, "userId"), normalizeOptionalDbId(apiKeyId, "apiKeyId"));
     },
-    getMonthlyUsage(userId, apiKeyId = null) {
+    async getMonthlyUsage(userId, apiKeyId = null) {
       return getMonthlyUsage(normalizeDbId(userId, "userId"), normalizeOptionalDbId(apiKeyId, "apiKeyId"));
     },
-    checkModelAllowed(userId, apiKeyId, modelName, isAdmin = false) {
+    async checkModelAllowed(userId, apiKeyId, modelName, isAdmin = false) {
       return checkModelAllowed(normalizeDbId(userId, "userId"), normalizeDbId(apiKeyId, "apiKeyId"), modelName, isAdmin);
     },
-    getAllowedModels(userId, apiKeyId, allModels, isAdmin = false) {
+    async getAllowedModels(userId, apiKeyId, allModels, isAdmin = false) {
       return getAllowedModels(normalizeDbId(userId, "userId"), normalizeDbId(apiKeyId, "apiKeyId"), allModels, isAdmin);
     },
   });

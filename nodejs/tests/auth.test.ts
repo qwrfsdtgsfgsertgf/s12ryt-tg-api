@@ -80,16 +80,16 @@ function createTestApp(): express.Application {
 // generateLoginToken
 // ===========================================================================
 
-describe("generateLoginToken", () => {
+describe("generateLoginToken", async () => {
   beforeEach(() => clearAllAuth());
 
-  it("returns a non-empty string token", () => {
+  it("returns a non-empty string token", async () => {
     const token = generateLoginToken(999);
     expect(typeof token).toBe("string");
     expect(token.length).toBeGreaterThan(0);
   });
 
-  it("generates unique tokens on each call", () => {
+  it("generates unique tokens on each call", async () => {
     const t1 = generateLoginToken(999);
     const t2 = generateLoginToken(999);
     expect(t1).not.toBe(t2);
@@ -100,86 +100,86 @@ describe("generateLoginToken", () => {
 // exchangeToken
 // ===========================================================================
 
-describe("exchangeToken", () => {
+describe("exchangeToken", async () => {
   beforeEach(() => {
     clearAllAuth();
     mockGetUserByTgId.mockReset();
   });
 
-  it("exchanges valid OTP for session (admin bypass)", () => {
+  it("exchanges valid OTP for session (admin bypass)", async () => {
     const otp = generateLoginToken(MOCK_ADMIN_ID);
-    const result = exchangeToken(otp);
+    const result = await exchangeToken(otp);
     expect(result).not.toBeNull();
     expect(result!.tgUserId).toBe(MOCK_ADMIN_ID);
     expect(result!.isAdmin).toBe(true);
     expect(typeof result!.sessionToken).toBe("string");
   });
 
-  it("admin does not require DB record", () => {
-    mockGetUserByTgId.mockReturnValue(undefined);
+  it("admin does not require DB record", async () => {
+    mockGetUserByTgId.mockResolvedValue(undefined);
     const otp = generateLoginToken(MOCK_ADMIN_ID);
-    const result = exchangeToken(otp);
+    const result = await exchangeToken(otp);
     expect(result).not.toBeNull();
     expect(result!.isAdmin).toBe(true);
     // DB should NOT be queried for admin
     expect(mockGetUserByTgId).not.toHaveBeenCalled();
   });
 
-  it("non-admin with active user succeeds", () => {
-    mockGetUserByTgId.mockReturnValue({
+  it("non-admin with active user succeeds", async () => {
+    mockGetUserByTgId.mockResolvedValue({
       id: 1,
       tg_user_id: 88888,
       is_active: 1,
     });
     const otp = generateLoginToken(88888);
-    const result = exchangeToken(otp);
+    const result = await exchangeToken(otp);
     expect(result).not.toBeNull();
     expect(result!.tgUserId).toBe(88888);
     expect(result!.isAdmin).toBe(false);
   });
 
-  it("non-admin with inactive user returns null", () => {
-    mockGetUserByTgId.mockReturnValue({
+  it("non-admin with inactive user returns null", async () => {
+    mockGetUserByTgId.mockResolvedValue({
       id: 2,
       tg_user_id: 77777,
       is_active: 0,
     });
     const otp = generateLoginToken(77777);
-    const result = exchangeToken(otp);
+    const result = await exchangeToken(otp);
     expect(result).toBeNull();
   });
 
-  it("non-admin with no DB record returns null", () => {
-    mockGetUserByTgId.mockReturnValue(undefined);
+  it("non-admin with no DB record returns null", async () => {
+    mockGetUserByTgId.mockResolvedValue(undefined);
     const otp = generateLoginToken(66666);
-    const result = exchangeToken(otp);
+    const result = await exchangeToken(otp);
     expect(result).toBeNull();
   });
 
-  it("OTP is one-time use (second call returns null)", () => {
+  it("OTP is one-time use (second call returns null)", async () => {
     const otp = generateLoginToken(MOCK_ADMIN_ID);
-    const first = exchangeToken(otp);
-    const second = exchangeToken(otp);
+    const first = await exchangeToken(otp);
+    const second = await exchangeToken(otp);
     expect(first).not.toBeNull();
     expect(second).toBeNull();
   });
 
-  it("invalid OTP token returns null", () => {
-    const result = exchangeToken("totally-invalid-uuid");
+  it("invalid OTP token returns null", async () => {
+    const result = await exchangeToken("totally-invalid-uuid");
     expect(result).toBeNull();
   });
 
-  it("empty string OTP returns null", () => {
-    const result = exchangeToken("");
+  it("empty string OTP returns null", async () => {
+    const result = await exchangeToken("");
     expect(result).toBeNull();
   });
 
-  it("expired OTP returns null", () => {
+  it("expired OTP returns null", async () => {
     const otp = generateLoginToken(MOCK_ADMIN_ID);
     // Manually expire by manipulating time
     vi.useFakeTimers();
     vi.advanceTimersByTime(6 * 60 * 1000); // 6 minutes (> 5 min TTL)
-    const result = exchangeToken(otp);
+    const result = await exchangeToken(otp);
     expect(result).toBeNull();
     vi.useRealTimers();
   });
@@ -189,26 +189,26 @@ describe("exchangeToken", () => {
 // getSessionInfo
 // ===========================================================================
 
-describe("getSessionInfo", () => {
+describe("getSessionInfo", async () => {
   beforeEach(() => {
     clearAllAuth();
     mockGetUserByTgId.mockReset();
   });
 
-  it("returns session info for valid token", () => {
+  it("returns session info for valid token", async () => {
     const otp = generateLoginToken(MOCK_ADMIN_ID);
-    const { sessionToken } = exchangeToken(otp)!;
+    const { sessionToken } = (await exchangeToken(otp))!;
     const info = getSessionInfo(sessionToken);
     expect(info).not.toBeNull();
     expect(info!.tgUserId).toBe(MOCK_ADMIN_ID);
     expect(info!.isAdmin).toBe(true);
   });
 
-  it("returns null for invalid token", () => {
+  it("returns null for invalid token", async () => {
     expect(getSessionInfo("invalid")).toBeNull();
   });
 
-  it("returns null for empty token", () => {
+  it("returns null for empty token", async () => {
     expect(getSessionInfo("")).toBeNull();
   });
 });
@@ -217,21 +217,21 @@ describe("getSessionInfo", () => {
 // destroySession
 // ===========================================================================
 
-describe("destroySession", () => {
+describe("destroySession", async () => {
   beforeEach(() => {
     clearAllAuth();
   });
 
-  it("removes session so getSessionInfo returns null", () => {
+  it("removes session so getSessionInfo returns null", async () => {
     const otp = generateLoginToken(MOCK_ADMIN_ID);
-    const { sessionToken } = exchangeToken(otp)!;
+    const { sessionToken } = (await exchangeToken(otp))!;
     expect(getSessionInfo(sessionToken)).not.toBeNull();
 
     destroySession(sessionToken);
     expect(getSessionInfo(sessionToken)).toBeNull();
   });
 
-  it("does not throw for non-existent session", () => {
+  it("does not throw for non-existent session", async () => {
     expect(() => destroySession("nonexistent")).not.toThrow();
   });
 });
@@ -240,7 +240,7 @@ describe("destroySession", () => {
 // webAuthMiddleware
 // ===========================================================================
 
-describe("webAuthMiddleware", () => {
+describe("webAuthMiddleware", async () => {
   let app: express.Application;
 
   beforeEach(() => {
@@ -270,7 +270,7 @@ describe("webAuthMiddleware", () => {
 
   it("injects req.webAuth on valid session", async () => {
     const otp = generateLoginToken(MOCK_ADMIN_ID);
-    const { sessionToken } = exchangeToken(otp)!;
+    const { sessionToken } = (await exchangeToken(otp))!;
     const res = await request(app)
       .get("/test")
       .set("Authorization", `Bearer ${sessionToken}`);
@@ -280,11 +280,11 @@ describe("webAuthMiddleware", () => {
   });
 
   it("invalidates non-admin session when user becomes inactive", async () => {
-    mockGetUserByTgId.mockReturnValue({ id: 1, tg_user_id: 88888, is_active: 1 });
+    mockGetUserByTgId.mockResolvedValue({ id: 1, tg_user_id: 88888, is_active: 1 });
     const otp = generateLoginToken(88888);
-    const { sessionToken } = exchangeToken(otp)!;
+    const { sessionToken } = (await exchangeToken(otp))!;
 
-    mockGetUserByTgId.mockReturnValue({ id: 1, tg_user_id: 88888, is_active: 0 });
+    mockGetUserByTgId.mockResolvedValue({ id: 1, tg_user_id: 88888, is_active: 0 });
     const res = await request(app)
       .get("/test")
       .set("Authorization", `Bearer ${sessionToken}`);
@@ -295,9 +295,9 @@ describe("webAuthMiddleware", () => {
   });
 
   it("allows admin session without user database record", async () => {
-    mockGetUserByTgId.mockReturnValue(undefined);
+    mockGetUserByTgId.mockResolvedValue(undefined);
     const otp = generateLoginToken(MOCK_ADMIN_ID);
-    const { sessionToken } = exchangeToken(otp)!;
+    const { sessionToken } = (await exchangeToken(otp))!;
 
     const res = await request(app)
       .get("/test")
@@ -313,7 +313,7 @@ describe("webAuthMiddleware", () => {
 // requireAdmin
 // ===========================================================================
 
-describe("requireAdmin", () => {
+describe("requireAdmin", async () => {
   let app: express.Application;
 
   beforeEach(() => {
@@ -324,7 +324,7 @@ describe("requireAdmin", () => {
 
   it("allows admin to access", async () => {
     const otp = generateLoginToken(MOCK_ADMIN_ID);
-    const { sessionToken } = exchangeToken(otp)!;
+    const { sessionToken } = (await exchangeToken(otp))!;
     const res = await request(app)
       .get("/admin-only")
       .set("Authorization", `Bearer ${sessionToken}`);
@@ -333,9 +333,9 @@ describe("requireAdmin", () => {
   });
 
   it("returns 403 for non-admin", async () => {
-    mockGetUserByTgId.mockReturnValue({ id: 1, tg_user_id: 88888, is_active: 1 });
+    mockGetUserByTgId.mockResolvedValue({ id: 1, tg_user_id: 88888, is_active: 1 });
     const otp = generateLoginToken(88888);
-    const { sessionToken } = exchangeToken(otp)!;
+    const { sessionToken } = (await exchangeToken(otp))!;
     const res = await request(app)
       .get("/admin-only")
       .set("Authorization", `Bearer ${sessionToken}`);
@@ -348,10 +348,10 @@ describe("requireAdmin", () => {
 // clearAllAuth
 // ===========================================================================
 
-describe("clearAllAuth", () => {
-  it("clears all active sessions", () => {
+describe("clearAllAuth", async () => {
+  it("clears all active sessions", async () => {
     const otp = generateLoginToken(MOCK_ADMIN_ID);
-    const { sessionToken } = exchangeToken(otp)!;
+    const { sessionToken } = (await exchangeToken(otp))!;
     expect(getSessionInfo(sessionToken)).not.toBeNull();
 
     clearAllAuth();

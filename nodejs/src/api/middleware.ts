@@ -72,7 +72,7 @@ function extractApiToken(req: Request): { token?: string; error?: string } {
 // Middleware
 // ---------------------------------------------------------------------------
 
-export function authMiddleware(req: Request, res: Response, next: NextFunction): void {
+export async function authMiddleware(req: Request, res: Response, next: NextFunction): Promise<void> {
   if (PUBLIC_PATHS.has(req.path) || req.method === "OPTIONS") {
     next();
     return;
@@ -100,7 +100,7 @@ export function authMiddleware(req: Request, res: Response, next: NextFunction):
   }
 
   try {
-    const keyInfo = lookupApiKeyCached(token);
+    const keyInfo = await lookupApiKeyCached(token);
     if (!keyInfo) {
       res.status(401).json({
         error: { message: "Invalid or inactive API key", type: "auth_error" },

@@ -36,9 +36,9 @@ let mockDailyUsage = { total_input_tokens: 0, total_output_tokens: 0, total_cost
 let mockMonthlyUsage = { total_input_tokens: 0, total_output_tokens: 0, total_cost: 0 };
 
 vi.mock("../src/db/database.js", () => ({
-  getCachedEffectiveLimits: vi.fn(() => ({ ...mockLimits })),
-  getDailyUsage: vi.fn(() => ({ ...mockDailyUsage })),
-  getMonthlyUsage: vi.fn(() => ({ ...mockMonthlyUsage })),
+  getCachedEffectiveLimits: vi.fn(async () => ({ ...mockLimits })),
+  getDailyUsage: vi.fn(async () => ({ ...mockDailyUsage })),
+  getMonthlyUsage: vi.fn(async () => ({ ...mockMonthlyUsage })),
 }));
 
 // Import after mocks are set
@@ -100,7 +100,7 @@ const ADMIN_AUTH: MockAuth = { userId: "0", apiKeyId: "0", tgUserId: 123456 };
 // Tests
 // ---------------------------------------------------------------------------
 
-describe("quotaCheckMiddleware", () => {
+describe("quotaCheckMiddleware", async () => {
   beforeEach(() => {
     mockLimits = {
       rpm: 0,
@@ -121,39 +121,39 @@ describe("quotaCheckMiddleware", () => {
     vi.restoreAllMocks();
   });
 
-  it("should call next() when no auth is present", () => {
+  it("should call next() when no auth is present", async () => {
     const req = makeReq(null);
     const res = makeRes();
     const next = makeNext();
 
-    quotaCheckMiddleware(req as Request, res, next);
+    await quotaCheckMiddleware(req as Request, res, next);
 
     expect(next.called).toBe(true);
     expect(res._ended).toBe(false);
   });
 
-  it("should bypass for admin users", () => {
+  it("should bypass for admin users", async () => {
     const req = makeReq(ADMIN_AUTH);
     const res = makeRes();
     const next = makeNext();
 
-    quotaCheckMiddleware(req as Request, res, next);
+    await quotaCheckMiddleware(req as Request, res, next);
 
     expect(next.called).toBe(true);
   });
 
-  it("should allow request when all quotas are 0 (unlimited)", () => {
+  it("should allow request when all quotas are 0 (unlimited)", async () => {
     const req = makeReq(TEST_AUTH);
     const res = makeRes();
     const next = makeNext();
 
-    quotaCheckMiddleware(req as Request, res, next);
+    await quotaCheckMiddleware(req as Request, res, next);
 
     expect(next.called).toBe(true);
     expect(res._ended).toBe(false);
   });
 
-  it("should return 429 when daily token quota is exceeded", () => {
+  it("should return 429 when daily token quota is exceeded", async () => {
     mockLimits.dailyTokenLimit = 1000;
     mockDailyUsage.total_input_tokens = 1500;
 
@@ -161,7 +161,7 @@ describe("quotaCheckMiddleware", () => {
     const res = makeRes();
     const next = makeNext();
 
-    quotaCheckMiddleware(req as Request, res, next);
+    await quotaCheckMiddleware(req as Request, res, next);
 
     expect(res._statusCode).toBe(429);
     expect(next.called).toBe(false);
@@ -171,7 +171,7 @@ describe("quotaCheckMiddleware", () => {
     expect(body.error.limit).toBe(1000);
   });
 
-  it("should allow request when daily token usage is within quota", () => {
+  it("should allow request when daily token usage is within quota", async () => {
     mockLimits.dailyTokenLimit = 1000;
     mockDailyUsage.total_input_tokens = 500;
 
@@ -179,12 +179,12 @@ describe("quotaCheckMiddleware", () => {
     const res = makeRes();
     const next = makeNext();
 
-    quotaCheckMiddleware(req as Request, res, next);
+    await quotaCheckMiddleware(req as Request, res, next);
 
     expect(next.called).toBe(true);
   });
 
-  it("should return 429 when monthly token quota is exceeded", () => {
+  it("should return 429 when monthly token quota is exceeded", async () => {
     mockLimits.monthlyTokenLimit = 10000;
     mockMonthlyUsage.total_input_tokens = 12000;
 
@@ -192,7 +192,7 @@ describe("quotaCheckMiddleware", () => {
     const res = makeRes();
     const next = makeNext();
 
-    quotaCheckMiddleware(req as Request, res, next);
+    await quotaCheckMiddleware(req as Request, res, next);
 
     expect(res._statusCode).toBe(429);
     const body = res._jsonBody as { error: { code: string; used: number; limit: number } };
@@ -201,7 +201,7 @@ describe("quotaCheckMiddleware", () => {
     expect(body.error.limit).toBe(10000);
   });
 
-  it("should return 429 when daily cost quota is exceeded", () => {
+  it("should return 429 when daily cost quota is exceeded", async () => {
     mockLimits.dailyCostLimit = 1.0;
     mockDailyUsage.total_cost = 1.5;
 
@@ -209,14 +209,14 @@ describe("quotaCheckMiddleware", () => {
     const res = makeRes();
     const next = makeNext();
 
-    quotaCheckMiddleware(req as Request, res, next);
+    await quotaCheckMiddleware(req as Request, res, next);
 
     expect(res._statusCode).toBe(429);
     const body = res._jsonBody as { error: { code: string } };
     expect(body.error.code).toBe("daily_cost_exceeded");
   });
 
-  it("should return 429 when monthly cost quota is exceeded", () => {
+  it("should return 429 when monthly cost quota is exceeded", async () => {
     mockLimits.monthlyCostLimit = 10.0;
     mockMonthlyUsage.total_cost = 15.0;
 
@@ -224,14 +224,14 @@ describe("quotaCheckMiddleware", () => {
     const res = makeRes();
     const next = makeNext();
 
-    quotaCheckMiddleware(req as Request, res, next);
+    await quotaCheckMiddleware(req as Request, res, next);
 
     expect(res._statusCode).toBe(429);
     const body = res._jsonBody as { error: { code: string } };
     expect(body.error.code).toBe("monthly_cost_exceeded");
   });
 
-  it("should check daily token before other quotas", () => {
+  it("should check daily token before other quotas", async () => {
     mockLimits.dailyTokenLimit = 100;
     mockLimits.monthlyTokenLimit = 1000;
     mockDailyUsage.total_input_tokens = 150;
@@ -241,7 +241,7 @@ describe("quotaCheckMiddleware", () => {
     const res = makeRes();
     const next = makeNext();
 
-    quotaCheckMiddleware(req as Request, res, next);
+    await quotaCheckMiddleware(req as Request, res, next);
 
     // Should fail on daily token first
     expect(res._statusCode).toBe(429);

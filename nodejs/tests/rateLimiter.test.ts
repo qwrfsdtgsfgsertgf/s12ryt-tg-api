@@ -33,7 +33,7 @@ let mockLimits = {
 };
 
 vi.mock("../src/db/database.js", () => ({
-  getCachedEffectiveLimits: vi.fn(() => ({ ...mockLimits })),
+  getCachedEffectiveLimits: vi.fn(async () => ({ ...mockLimits })),
 }));
 
 // Import after mocks are set
@@ -96,7 +96,7 @@ const ADMIN_AUTH: MockAuth = { userId: "0", apiKeyId: "0", tgUserId: 123456 };
 // Tests
 // ---------------------------------------------------------------------------
 
-describe("rateLimitMiddleware", () => {
+describe("rateLimitMiddleware", async () => {
   beforeEach(() => {
     // Reset mock limits to unlimited
     mockLimits = {
@@ -116,46 +116,46 @@ describe("rateLimitMiddleware", () => {
     vi.restoreAllMocks();
   });
 
-  it("should call next() when no auth is present", () => {
+  it("should call next() when no auth is present", async () => {
     const req = makeReq(null);
     const res = makeRes();
     const next = makeNext();
 
-    rateLimitMiddleware(req as Request, res, next);
+    await rateLimitMiddleware(req as Request, res, next);
 
     expect(next.called).toBe(true);
     expect(res._ended).toBe(false);
   });
 
-  it("should bypass for admin users", () => {
+  it("should bypass for admin users", async () => {
     const req = makeReq(ADMIN_AUTH);
     const res = makeRes();
     const next = makeNext();
 
-    rateLimitMiddleware(req as Request, res, next);
+    await rateLimitMiddleware(req as Request, res, next);
 
     expect(next.called).toBe(true);
     expect(res._ended).toBe(false);
   });
 
-  it("should allow request when all limits are 0 (unlimited)", () => {
+  it("should allow request when all limits are 0 (unlimited)", async () => {
     const req = makeReq(TEST_AUTH);
     const res = makeRes();
     const next = makeNext();
 
-    rateLimitMiddleware(req as Request, res, next);
+    await rateLimitMiddleware(req as Request, res, next);
 
     expect(next.called).toBe(true);
     expect(res._ended).toBe(false);
   });
 
-  it("should return 403 when access is expired", () => {
+  it("should return 403 when access is expired", async () => {
     mockLimits.expiresAt = "2000-01-01T00:00:00";
     const req = makeReq(TEST_AUTH);
     const res = makeRes();
     const next = makeNext();
 
-    rateLimitMiddleware(req as Request, res, next);
+    await rateLimitMiddleware(req as Request, res, next);
 
     expect(res._statusCode).toBe(403);
     expect(res._ended).toBe(true);
@@ -164,18 +164,18 @@ describe("rateLimitMiddleware", () => {
     expect(body.error.code).toBe("access_expired");
   });
 
-  it("should allow request when expiry is in the future", () => {
+  it("should allow request when expiry is in the future", async () => {
     mockLimits.expiresAt = "2099-12-31T23:59:59";
     const req = makeReq(TEST_AUTH);
     const res = makeRes();
     const next = makeNext();
 
-    rateLimitMiddleware(req as Request, res, next);
+    await rateLimitMiddleware(req as Request, res, next);
 
     expect(next.called).toBe(true);
   });
 
-  it("should return 429 when RPM limit is exceeded", () => {
+  it("should return 429 when RPM limit is exceeded", async () => {
     mockLimits.rpm = 2;
     const req = makeReq(TEST_AUTH);
     const res = makeRes();
@@ -186,7 +186,7 @@ describe("rateLimitMiddleware", () => {
     // Second request passes
     rateLimitMiddleware(req as Request, makeRes(), makeNext());
     // Third request should be blocked
-    rateLimitMiddleware(req as Request, res, next);
+    await rateLimitMiddleware(req as Request, res, next);
 
     expect(res._statusCode).toBe(429);
     expect(next.called).toBe(false);
@@ -195,7 +195,7 @@ describe("rateLimitMiddleware", () => {
     expect(body.error.retry_after).toBeGreaterThan(0);
   });
 
-  it("should allow requests within RPM limit", () => {
+  it("should allow requests within RPM limit", async () => {
     mockLimits.rpm = 10;
     const req = makeReq(TEST_AUTH);
 
@@ -203,13 +203,13 @@ describe("rateLimitMiddleware", () => {
     for (let i = 0; i < 5; i++) {
       const res = makeRes();
       const next = makeNext();
-      rateLimitMiddleware(req as Request, res, next);
+      await rateLimitMiddleware(req as Request, res, next);
       expect(next.called).toBe(true);
       expect(res._ended).toBe(false);
     }
   });
 
-  it("should return 429 when TPM limit is exceeded", () => {
+  it("should return 429 when TPM limit is exceeded", async () => {
     mockLimits.tpm = 100;
     const req = makeReq(TEST_AUTH);
 
@@ -218,25 +218,25 @@ describe("rateLimitMiddleware", () => {
 
     const res = makeRes();
     const next = makeNext();
-    rateLimitMiddleware(req as Request, res, next);
+    await rateLimitMiddleware(req as Request, res, next);
 
     expect(res._statusCode).toBe(429);
     const body = res._jsonBody as { error: { code: string } };
     expect(body.error.code).toBe("tpm_exceeded");
   });
 
-  it("should return 429 when concurrency limit is exceeded", () => {
+  it("should return 429 when concurrency limit is exceeded", async () => {
     mockLimits.concurrency = 1;
     const req = makeReq(TEST_AUTH);
 
     // First request occupies the concurrency slot (but res.on('close') won't fire in mock)
     const res1 = makeRes();
-    rateLimitMiddleware(req as Request, res1, makeNext());
+    await rateLimitMiddleware(req as Request, res1, makeNext());
 
     // Second request should be blocked (concurrency slot still occupied)
     const res2 = makeRes();
     const next2 = makeNext();
-    rateLimitMiddleware(req as Request, res2, next2);
+    await rateLimitMiddleware(req as Request, res2, next2);
 
     expect(res2._statusCode).toBe(429);
     const body = res2._jsonBody as { error: { code: string } };

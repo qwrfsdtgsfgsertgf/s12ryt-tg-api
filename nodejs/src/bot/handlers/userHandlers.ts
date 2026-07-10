@@ -61,8 +61,8 @@ async function handleStart(ctx: MyContext): Promise<void> {
   }
 
   try {
-    const loginUrl = buildWebLoginUrl(tgUserId);
-    const wb = webButton(tgUserId, undefined, "🌐 開啟 Web 控制台");
+    const loginUrl = await buildWebLoginUrl(tgUserId);
+    const wb = await webButton(tgUserId, undefined, "🌐 開啟 Web 控制台");
 
     const intro =
       "你好！我是你的 AI API 管理助手。\n\n" +
@@ -92,7 +92,7 @@ async function handleStart(ctx: MyContext): Promise<void> {
 // ========================
 
 async function handleUrl(ctx: MyContext): Promise<void> {
-  const url = getSetting("api_url") ?? config.DEFAULT_API_URL;
+  const url = (await getSetting("api_url")) ?? config.DEFAULT_API_URL;
   await ctx.reply(`API URL: ${url}`);
 }
 
@@ -105,10 +105,10 @@ async function keyConversation(
   ctx: MyContext
 ): Promise<void> {
   const tgId = ctx.from!.id;
-  await conversation.external(() => { ensureUserExists(tgId, ctx.from!.username); });
+  await conversation.external(() => ensureUserExists(tgId, ctx.from!.username));
 
   while (true) {
-    await ctx.reply(KEY_MENU_TEXT, { reply_markup: webButton(tgId, "keys") });
+    await ctx.reply(KEY_MENU_TEXT, { reply_markup: await webButton(tgId, "keys") });
     ctx = await conversation.wait();
     const choice = ctx.msg?.text?.trim() ?? "";
 
@@ -116,7 +116,7 @@ async function keyConversation(
 
     if (choice === "1") {
       // ── 查看 Key ──
-      const keys = getKeysByUser(tgId);
+      const keys = await getKeysByUser(tgId);
       const activeKeys = keys.filter((k) => Number(k.is_active) === 1);
 
       if (activeKeys.length === 0) {
@@ -149,7 +149,7 @@ async function keyConversation(
 
     if (choice === "3") {
       // ── 刪除 Key ──
-      const activeKeys = getKeysByUser(tgId).filter(
+      const activeKeys = (await getKeysByUser(tgId)).filter(
         (k) => Number(k.is_active) === 1
       );
 
@@ -189,7 +189,7 @@ async function keyConversation(
       let deleted = 0;
       for (const idx of uniqueIndices) {
         const key = activeKeys[Number(idx) - 1];
-        await conversation.external(() => { deleteApiKey(key.id); });
+        await conversation.external(() => deleteApiKey(key.id));
         deleted++;
       }
 
@@ -210,10 +210,10 @@ async function keyConversation(
 
 async function handleUsage(ctx: MyContext): Promise<void> {
   const tgId = ctx.from!.id;
-  const usageRecords = getUsageByUser(tgId);
+  const usageRecords = await getUsageByUser(tgId);
 
   if (usageRecords.length === 0) {
-    await ctx.reply("目前沒有使用紀錄。", { reply_markup: webButton(tgId, "usage") });
+    await ctx.reply("目前沒有使用紀錄。", { reply_markup: await webButton(tgId, "usage") });
     return;
   }
 
@@ -259,7 +259,7 @@ async function handleUsage(ctx: MyContext): Promise<void> {
   }
 
   await ctx.reply(lines.join("\n\n"), {
-    reply_markup: webButton(tgId, "usage"),
+    reply_markup: await webButton(tgId, "usage"),
   });
 }
 
@@ -272,14 +272,14 @@ async function codingConversation(
   ctx: MyContext
 ): Promise<void> {
   const tgId = ctx.from!.id;
-  const user = getUserByTgId(tgId);
+  const user = await getUserByTgId(tgId);
   if (!user) {
     await ctx.reply("❌ 您尚未註冊，請先使用 /key 創建 API key。");
     return;
   }
 
   while (true) {
-    await ctx.reply(CODING_MENU_TEXT, { reply_markup: webButton(tgId, "coding") });
+    await ctx.reply(CODING_MENU_TEXT, { reply_markup: await webButton(tgId, "coding") });
     ctx = await conversation.wait();
     const choice = ctx.msg?.text?.trim() ?? "";
 
@@ -287,7 +287,7 @@ async function codingConversation(
 
     if (choice === "1") {
       // ── 開關 Coding 模式 ──
-      const codingConfig = getCodingConfigByTgId(tgId);
+      const codingConfig = await getCodingConfigByTgId(tgId);
 
       if (codingConfig && codingConfig.is_active === 1) {
         // 關閉 + 顯示 session 統計
@@ -297,7 +297,7 @@ async function codingConversation(
         const sOutCost = codingConfig.session_output_cost || 0;
         const sReqs = codingConfig.session_requests || 0;
 
-        await conversation.external(() => { setCodingConfig(user.id, { isActive: 0 }); });
+        await conversation.external(() => setCodingConfig(user.id, { isActive: 0 }));
 
         if (sReqs > 0) {
           const totalCost = sInCost + sOutCost;
@@ -332,10 +332,7 @@ async function codingConversation(
       } else {
         // 開啟
         if (codingConfig && codingConfig.fallback_models) {
-          await conversation.external(() => {
-            setCodingConfig(user.id, { isActive: 1 });
-            resetCodingSessionStats(user.id);
-          });
+          await conversation.external(async () => { await setCodingConfig(user.id, { isActive: 1 }); await resetCodingSessionStats(user.id); });
           const list = codingConfig.fallback_list
             .map((m: string, i: number) => `   ${i + 1}. ${m}`)
             .join("\n");
@@ -343,7 +340,7 @@ async function codingConversation(
             `🟢 Coding 模式已開啟！\n\n📋 當前 Fallback 模型鏈：\n${list}\n\n最大重試次數：${codingConfig.max_retries}`
           );
         } else {
-          await conversation.external(() => { setCodingConfig(user.id, { isActive: 1 }); });
+          await conversation.external(() => setCodingConfig(user.id, { isActive: 1 }));
           await ctx.reply(
             "🟢 Coding 模式已開啟，但尚未設定 Fallback 模型。\n請選擇 2 設定 Fallback 模型鏈。"
           );
@@ -354,7 +351,7 @@ async function codingConversation(
 
     if (choice === "2") {
       // ── 設定 Coding 模式 ──
-      const codingConfig = getCodingConfigByTgId(tgId);
+      const codingConfig = await getCodingConfigByTgId(tgId);
       const availableModels = getAllCachedModelNames();
 
       // 顯示當前設定或可用模型
@@ -432,17 +429,11 @@ async function codingConversation(
       }
 
       // 取得當前設定以保留 fallback_models（如果 skip）
-      const currentConfig = getCodingConfigByTgId(tgId);
+      const currentConfig = await getCodingConfigByTgId(tgId);
       const finalFallback =
         fallbackModels ?? (currentConfig?.fallback_models ?? "");
 
-      await conversation.external(() => {
-        setCodingConfig(user.id, {
-          isActive: 1,
-          fallbackModels: finalFallback,
-          maxRetries,
-        });
-      });
+      await conversation.external(() => setCodingConfig(user.id, { isActive: 1, fallbackModels: finalFallback, maxRetries }));
 
       const finalList = finalFallback
         .split(",")
@@ -473,10 +464,10 @@ async function codingConversation(
 /**
  * 確保使用者存在於 DB，不存在則自動建立
  */
-function ensureUserExists(tgUserId: number, username?: string): void {
-  const existing = getUserByTgId(tgUserId);
+async function ensureUserExists(tgUserId: number, username?: string): Promise<void> {
+  const existing = await getUserByTgId(tgUserId);
   if (!existing) {
-    addUser(tgUserId, username ?? null);
+    await addUser(tgUserId, username ?? null);
   }
 }
 
@@ -561,37 +552,37 @@ export function registerUserHandlers(bot: Bot<MyContext>): void {
 
   // /start
   bot.command("start", async (ctx) => {
-    if (!isTrustedUser(ctx)) return;
+    if (!(await isTrustedUser(ctx))) return;
     await handleStart(ctx);
   });
 
   // /url
   bot.command("url", async (ctx) => {
-    if (!isTrustedUser(ctx)) return;
+    if (!(await isTrustedUser(ctx))) return;
     await handleUrl(ctx);
   });
 
   // /key — unified key management
   bot.command("key", async (ctx) => {
-    if (!isTrustedUser(ctx)) return;
+    if (!(await isTrustedUser(ctx))) return;
     await ctx.conversation.enter("key");
   });
 
   // /usage
   bot.command("usage", async (ctx) => {
-    if (!isTrustedUser(ctx)) return;
+    if (!(await isTrustedUser(ctx))) return;
     await handleUsage(ctx);
   });
 
   // /coding — unified coding management
   bot.command("coding", async (ctx) => {
-    if (!isTrustedUser(ctx)) return;
+    if (!(await isTrustedUser(ctx))) return;
     await ctx.conversation.enter("coding");
   });
 
   // /model_catch → 進入對話
   bot.command("model_catch", async (ctx) => {
-    if (!isTrustedUser(ctx)) return;
+    if (!(await isTrustedUser(ctx))) return;
     await ctx.conversation.enter("modelCatch");
   });
 }

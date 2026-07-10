@@ -12,12 +12,12 @@ export function isAdmin(ctx: Context): boolean {
 /**
  * 檢查是否為信任使用者（DB 中存在且 is_active，管理員永遠是信任的）
  */
-export function isTrustedUser(ctx: Context): boolean {
+export async function isTrustedUser(ctx: Context): Promise<boolean> {
   if (isAdmin(ctx)) return true;
 
   const tgId = ctx.from?.id;
   if (!tgId) return false;
 
-  const user = getUserByTgId(tgId);
+  const user = await getUserByTgId(tgId);
   return user !== undefined && Number(user.is_active) === 1;
 }
