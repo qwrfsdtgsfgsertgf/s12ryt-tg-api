@@ -2,6 +2,14 @@
 
 所有版本變更記錄。本檔案由 `npm run release` 自動維護。
 
+## [1.9.1] - 2026-07-10
+
+### ✨ Features
+- cloud database keepalive to prevent idle hibernation (090059e)
+
+### 🔧 CI
+- add low-version test matrix (PG 9.5, MySQL 5.7) (3aa70cd)
+
 ## [1.9.0] - 2026-07-10
 
 ### ✨ Features
