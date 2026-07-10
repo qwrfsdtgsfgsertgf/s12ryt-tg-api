@@ -63,9 +63,14 @@ jobs:
       run:
         working-directory: nodejs
 
+    strategy:
+      fail-fast: false
+      matrix:
+        pg-version: ['16', '9.5']
+
     services:
       postgres:
-        image: postgres:16
+        image: postgres:${{ matrix.pg-version }}
         env:
           POSTGRES_USER: test
           POSTGRES_PASSWORD: test
@@ -110,9 +115,14 @@ jobs:
       run:
         working-directory: nodejs
 
+    strategy:
+      fail-fast: false
+      matrix:
+        mysql-version: ['8', '5.7']
+
     services:
       mysql:
-        image: mysql:8
+        image: mysql:${{ matrix.mysql-version }}
         env:
           MYSQL_ROOT_PASSWORD: rootpw
           MYSQL_USER: test
