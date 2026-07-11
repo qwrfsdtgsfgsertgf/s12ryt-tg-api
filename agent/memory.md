@@ -240,3 +240,15 @@
 - **單一真相來源**：後續以 `memory.md` 為最新決策；`deep_todos.md` 追任務勾選；`項目表.md` 追結構/依賴。
 - **目前可開工狀態**：雲端 DB 0-5 完成、Web 雙模式認證完成、plugin-example v2 已推遠端；建議待辦見項目表「目前狀態快照」。
 - agent/ 不主動 commit（`.gitignore` + 早期誤 tracked 也不主動改 git 歷史）。
+
+## 2026-07-11 - Cloudflare Tunnel URL 自動反映到用戶可見 API URL
+
+- **問題背景**：使用者反映 `CLOUDFLARE_TUNNEL=quick` 時，程式應自動把顯示給用戶的 API URL 換成 Cloudflare 臨時 URL，但目前沒做到。調查確認 tunnel.ts 的 `on("url")` callback 只 console.log URL，沒寫回 DB settings 或 config，因此全專案 4 個 API URL 取用點（`/url`、`/sub_url`、Web Console settings、`/web` 登入連結）都仍顯示 `DEFAULT_API_URL`（通常是 localhost）。最嚴重的影響是 `/start` 和 `/web` 命令的 OTP 登入按鈕——localhost URL 無法作為 Telegram 按鈕 URL，quick tunnel 模式下這兩個命令簡報的登入連結完全無法使用。
+- **舊的統一 pattern**：全專案 4 個呼叫點都用 `(await getSetting("api_url")) ?? config.DEFAULT_API_URL`。位於：`userHandlers.ts:95` handleUrl、`adminHandlers.ts:1100` subUrlConversation、`webHandlers.ts:34` getWebBaseUrl（用於 OTP 登入連結）、`web/routes.ts:810` GET /web/api/url + L1456 settings GET。
+- **修復方案 — 新建 `src/apiUrl.ts`**：`getEffectiveApiUrl(): Promise<string>` 封裝優先級鏈 `(await getSetting("api_url")) ?? getTunnelUrl() ?? config.DEFAULT_API_URL`。選擇獨立檔案而非在 database.ts 加 helper：避免 DB 層依賴 tunnel 層（tunnel.ts import cloudflared 套件）。
+- **tunnel.ts 改動**：新增模組級 `let currentTunnelUrl: string | null = null`。`on("url")` callback 中 `currentTunnelUrl = url`；`on("exit")` 和 `stopTunnel()` 中 `currentTunnelUrl = null`。新增 `export function getTunnelUrl(): string | null`。
+- **優先級設計決策**：`api_url`（管理員 `/sub_url` 手動設定）> `tunnel_url`（quick tunnel 自動）> `DEFAULT_API_URL`（env）。管理員明確設定應優先於自動 tunnel URL，避免啟停 tunnel 覆蓋明確設定。這也意味著如果管理員曾用 `/sub_url` 設過值，tunnel URL 不會自動反映——需管理員清除設定（改回 auto）才會生效。這是刻意選擇。
+- **settings GET 語意調整**：`GET /web/api/admin/settings` 的 `api_url` 欄位改回傳 effective URL（`getEffectiveApiUrl()`），與 `/url` 命令顯示一致；另新增獨立 `tunnel_url: getTunnelUrl()` 欄位（null 或 tunnel URL string），讓前端可顯示「目前使用 Cloudflare Tunnel」提示。`PUT settings` 仍寫入 raw `setSetting("api_url", ...)` 不變。
+- **import 清理**：每個改動檔案都檢查 `getSetting`/`config` 是否有其他用途，只移除真正 unused 的：`userHandlers.ts` 移除 `getSetting`+`config`（全檔僅 handleUrl 用）；`adminHandlers.ts` 移除 `getSetting`（保留 `setSetting` + `config.ADMIN_ID` 4 處）；`webHandlers.ts` 移除 `getSetting`（保留 `config.LOGIN_WEB_PATH`）；`routes.ts` 保留 `config`（9 處）+ `getSetting`（3 處）。
+- **驗證**：`tsc --noEmit` 零錯；`vitest run` **444 passed, 38 skipped**（PG/MySQL CI only）, 0 failed。stderr 的 ENOENT 為既有 pluginServices temp-dir cleanup 已知行為，非本次回歸。
+- **未涵蓋**：token 模式（`CLOUDFLARE_TUNNEL=token` + `CLOUDFLARE_TOKEN`）的 tunnel URL 是固定的（由用戶 Cloudflare DNS 設定），不在 `on("url")` 事件中獲取，因此 `getTunnelUrl()` 在 token 模式下仍回 null——用戶需自行用 `/sub_url` 設定固定 URL。此次修復只解決 quick 模式。

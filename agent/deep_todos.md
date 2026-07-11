@@ -156,3 +156,14 @@
 - [x] 閱讀 `agent/` 全部 5 檔：memory / deep_todos / 項目表 / stage2-async-migration / db-cloud-migration-design。
 - [x] 發現 deep_todos 與 項目表 停在 07-09，落後 memory 的 07-10/11 完成狀態；已同步更新。
 - [x] 正式接手，後續以 memory 為最新決策來源，deep_todos 追任務，項目表追結構。
+
+## 2026-07-11 - Cloudflare Tunnel URL 自動反映到用戶可見 API URL
+
+- [x] **問題**：`CLOUDFLARE_TUNNEL=quick` 時 tunnel URL 只 console.log，不寫回 DB/config，導致 `/url`、`/web`（Web 登入連結）、Web Console settings 都仍顯示 `DEFAULT_API_URL`（localhost）；最嚴重是 `/start` 和 `/web` 命令的 OTP 登入按鈕 URL 無法使用（localhost 不能作為 Telegram 按鈕 URL）。
+- [x] **tunnel.ts**：新增模組級 `currentTunnelUrl: string | null`，`on("url")` callback 寫入，`on("exit")`/`stopTunnel()` 清除；新增 `export function getTunnelUrl(): string | null`。
+- [x] **新建 src/apiUrl.ts**：`getEffectiveApiUrl(): Promise<string>`，優先級鏈 `api_url`（DB settings）> `tunnel_url`（quick tunnel 自動）> `DEFAULT_API_URL`（env）。獨立檔案避免 DB 層依賴 tunnel 層（cloudflared）。
+- [x] **替換 4 個呼叫點**：`webHandlers.ts:34` getWebBaseUrl()、`userHandlers.ts:95` handleUrl()、`adminHandlers.ts:1100` subUrlConversation()、`web/routes.ts:810` GET /web/api/url — 全部從 `(await getSetting("api_url")) ?? config.DEFAULT_API_URL` 改為 `await getEffectiveApiUrl()`。
+- [x] **routes.ts settings GET（L1456）**：`api_url` 欄位改回傳 effective URL（與 `/url` 命令一致），另新增獨立 `tunnel_url: getTunnelUrl()` 欄位供前端顯示「目前使用 Cloudflare Tunnel」提示。
+- [x] **import 清理**：`userHandlers.ts` 移除 `getSetting`+`config`（全檔僅此處）；`adminHandlers.ts` 移除 `getSetting`（保留 `setSetting`+`config`）；`webHandlers.ts` 移除 `getSetting`（保留 `config`）；`routes.ts` 保留 `config`+`getSetting`（各有其他用途）。
+- [x] **設計決策**：優先級 `api_url` > `tunnel_url` > `DEFAULT_API_URL` — 管理員 `/sub_url` 手動設定優先於自動 tunnel，避免啟停 tunnel 覆蓋明確設定。
+- [x] 驗證：`tsc --noEmit` 零錯；`vitest run` **444 passed, 38 skipped**（PG/MySQL CI only），0 failed。
