@@ -68,6 +68,8 @@ import {
 import { hashPassword, verifyPassword, validatePasswordStrength, validateUsername } from "./password.js";
 import { getPanelPath, regenerateWebPanelUuid } from "./panelUuid.js";
 import { config } from "../config.js";
+import { getEffectiveApiUrl } from "../apiUrl.js";
+import { getTunnelUrl } from "../tunnel.js";
 import { parseApiKeys } from "../api/keySelector.js";
 import {
   detectApiProtocols,
@@ -807,7 +809,7 @@ router.get("/api/restrictions", async (req: Request, res: Response) => {
 
 /** GET /web/api/url — API 端點 URL */
 router.get("/api/url", async (_req: Request, res: Response) => {
-  const apiUrl = (await getSetting("api_url")) ?? config.DEFAULT_API_URL;
+  const apiUrl = await getEffectiveApiUrl();
   res.json({ url: apiUrl });
 });
 
@@ -1453,12 +1455,13 @@ router.get("/api/admin/usage", async (req: Request, res: Response) => {
 
 /** GET /web/api/admin/settings — 系統設定 */
 router.get("/api/admin/settings", async (_req: Request, res: Response) => {
-  const apiUrl = (await getSetting("api_url")) ?? config.DEFAULT_API_URL;
+  const apiUrl = await getEffectiveApiUrl();
   const kaEnabled = (await getSetting("keepalive_enabled")) === "1";
   const kaInterval = Number(await getSetting("keepalive_interval")) || 5;
   res.json({
     settings: {
       api_url: apiUrl,
+      tunnel_url: getTunnelUrl(),
       provider_default_user_agent: await getProviderDefaultUserAgent(),
       is_cloud_db: isCloudDatabase(),
       keepalive_enabled: kaEnabled,

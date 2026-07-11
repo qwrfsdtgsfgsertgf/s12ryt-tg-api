@@ -14,7 +14,7 @@
 import { Bot, Context, InlineKeyboard } from "grammy";
 import type { ConversationFlavor } from "@grammyjs/conversations";
 import { config } from "../../config.js";
-import { getSetting } from "../../db/database.js";
+import { getEffectiveApiUrl } from "../../apiUrl.js";
 import { generateLoginToken } from "../../web/auth.js";
 import { isTrustedUser } from "../filters.js";
 
@@ -31,7 +31,7 @@ type MyBot = Bot<MyContext>;
  * 否則使用預設的 /web。
  */
 async function getWebBaseUrl(): Promise<string> {
-  const base = ((await getSetting("api_url")) ?? config.DEFAULT_API_URL).replace(/\/+$/, "");
+  const base = (await getEffectiveApiUrl()).replace(/\/+$/, "");
   return config.LOGIN_WEB_PATH ? `${base}${config.LOGIN_WEB_PATH}` : `${base}/web`;
 }
 

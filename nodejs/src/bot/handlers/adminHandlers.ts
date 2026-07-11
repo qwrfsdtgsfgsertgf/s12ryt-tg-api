@@ -1,6 +1,7 @@
 import { Bot, Context } from "grammy";
 import { Conversation, ConversationFlavor, createConversation } from "@grammyjs/conversations";
 import { config } from "../../config.js";
+import { getEffectiveApiUrl } from "../../apiUrl.js";
 import { webButton } from "./webHandlers.js";
 import {
   addProvider,
@@ -16,7 +17,6 @@ import {
   deleteApiKey,
   getUsageByProvider,
   getUsageByUser,
-  getSetting,
   setSetting,
   batchUpsertModelPrices,
   getModelPricesByProvider,
@@ -1097,7 +1097,7 @@ async function subUrlConversation(
   conversation: MyConversation,
   ctx: MyContext
 ): Promise<void> {
-  const currentUrl = (await getSetting("api_url")) ?? config.DEFAULT_API_URL;
+  const currentUrl = await getEffectiveApiUrl();
   await ctx.reply(`目前 API URL：${currentUrl}\n\n請輸入新的 URL：`, {
     reply_markup: await webButton(ctx.from!.id, "settings"),
   });

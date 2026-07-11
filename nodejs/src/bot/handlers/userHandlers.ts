@@ -4,7 +4,7 @@ import {
   type Conversation,
   createConversation,
 } from "@grammyjs/conversations";
-import { config } from "../../config.js";
+import { getEffectiveApiUrl } from "../../apiUrl.js";
 import {
   getUserByTgId,
   addUser,
@@ -12,7 +12,6 @@ import {
   getKeysByUser,
   deleteApiKey,
   getUsageByUser,
-  getSetting,
   getCodingConfigByTgId,
   setCodingConfig,
   resetCodingSessionStats,
@@ -92,7 +91,7 @@ async function handleStart(ctx: MyContext): Promise<void> {
 // ========================
 
 async function handleUrl(ctx: MyContext): Promise<void> {
-  const url = (await getSetting("api_url")) ?? config.DEFAULT_API_URL;
+  const url = await getEffectiveApiUrl();
   await ctx.reply(`API URL: ${url}`);
 }
 
