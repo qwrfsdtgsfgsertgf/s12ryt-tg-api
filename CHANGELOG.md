@@ -2,6 +2,18 @@
 
 所有版本變更記錄。本檔案由 `npm run release` 自動維護。
 
+## [1.10.1] - 2026-07-12
+
+### ✨ Features
+- expose cloudflare tunnel url for user-visible api url (b4c8c01)
+
+### ♻️ Refactor
+- route api url display through getEffectiveApiUrl (faa0d45)
+
+### 📝 Documentation
+- record cloudflare tunnel url integration session (93c77cb)
+- fix env var table formatting and tab character in README (8efa7d6)
+
 ## [1.10.0] - 2026-07-11
 
 ### ✨ Features
