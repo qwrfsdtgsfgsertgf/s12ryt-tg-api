@@ -10,6 +10,7 @@
 
 import { existsSync } from "fs";
 import { Tunnel, bin, install } from "cloudflared";
+import { config } from "./config.js";
 
 let tunnelInstance: Tunnel | null = null;
 let currentTunnelUrl: string | null = null;
@@ -19,7 +20,7 @@ let currentTunnelUrl: string | null = null;
  * No-op if CLOUDFLARE_TUNNEL is not set.
  */
 export async function startTunnel(port: number): Promise<void> {
-  const mode = process.env.CLOUDFLARE_TUNNEL;
+  const mode = config.CLOUDFLARE_TUNNEL;
   if (!mode) return; // Tunnel not enabled
 
   // Ensure the cloudflared binary is available
@@ -31,7 +32,7 @@ export async function startTunnel(port: number): Promise<void> {
   if (mode === "quick") {
     tunnelInstance = Tunnel.quick(`http://localhost:${port}`);
   } else if (mode === "token") {
-    const token = process.env.CLOUDFLARE_TOKEN;
+    const token = config.CLOUDFLARE_TOKEN;
     if (!token) {
       console.error("[tunnel] CLOUDFLARE_TUNNEL=token but CLOUDFLARE_TOKEN is not set — skipping tunnel");
       return;

@@ -62,10 +62,16 @@ function parseLoginWebPath(): string {
 
 export const config: Config = {
   BOT_TOKEN: process.env.BOT_TOKEN ?? "",
-  ADMIN_ID: process.env.ADMIN_ID
-    ? parseInt(process.env.ADMIN_ID, 10)
-    : null,
-  API_PORT: parseInt(process.env.API_PORT ?? "8000", 10),
+  ADMIN_ID: (() => {
+    const raw = process.env.ADMIN_ID;
+    if (!raw) return null;
+    const parsed = parseInt(raw, 10);
+    return Number.isNaN(parsed) ? null : parsed;
+  })(),
+  API_PORT: (() => {
+    const parsed = parseInt(process.env.API_PORT ?? "8000", 10);
+    return Number.isNaN(parsed) ? 8000 : parsed;
+  })(),
   DATABASE_PATH: process.env.DATABASE_PATH ?? "./data/bot.db",
   DATABASE_URL: process.env.DATABASE_URL?.trim() ?? "",
   DEFAULT_API_URL: process.env.DEFAULT_API_URL ?? "http://localhost:8000",
