@@ -472,9 +472,9 @@ export async function closeDb(): Promise<void> {
   }
   if (usageFlushTimer) {
     clearInterval(usageFlushTimer);
-    stopKeepaliveTimer();
     usageFlushTimer = null;
   }
+  stopKeepaliveTimer();
   if (driver) {
     await driver.close();
   }

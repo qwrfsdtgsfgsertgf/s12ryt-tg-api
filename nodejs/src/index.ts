@@ -242,9 +242,9 @@ function setupGracefulShutdown(): void {
     if (shuttingDown) return;
     shuttingDown = true;
     console.log(`\n[shutdown] Received ${signal}, exiting gracefully...`);
-    void shutdownNodeJsPlugins().finally(() => {
+    void shutdownNodeJsPlugins().finally(async () => {
       stopTunnel();
-      closeDb();
+      await closeDb();
       process.exit(0);
     });
   };
