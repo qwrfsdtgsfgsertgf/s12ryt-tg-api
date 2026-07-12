@@ -1403,6 +1403,15 @@ export async function setSetting(key: string, value: string): Promise<void> {
   );
 }
 
+/**
+ * Remove a setting row. No-op if the key does not exist. Used to "clear" a
+ * setting back to its default/fallback behavior (e.g. resetting `api_url`
+ * so tunnel URL or DEFAULT_API_URL takes effect again).
+ */
+export async function deleteSetting(key: string): Promise<void> {
+  await runSql(`DELETE FROM settings WHERE ${quoteIdent("key", drv().dialect)} = ?`, [key]);
+}
+
 // ========================
 // Model Prices CRUD
 // ========================
