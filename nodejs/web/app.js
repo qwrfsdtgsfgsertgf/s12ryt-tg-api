@@ -2933,6 +2933,12 @@
           <div class="form-group">
             <label>API URL</label>
             <input type="url" id="sys-api-url" value="${esc(settings.api_url || "")}" placeholder="http://localhost:8000">
+            ${settings.api_url_source && settings.api_url_source !== "configured" ? `
+            <div style="margin-top:6px;font-size:12px;opacity:0.85;line-height:1.6;">
+              ${settings.api_url_source === "tunnel" ? `⚠️ 目前使用 Cloudflare 快速隧道：<code>${esc(settings.effective_api_url)}</code>（重啟後 URL 會變更，留空儲存可恢復自動）` : ""}
+              ${settings.api_url_source === "tunnel-pending" ? `⏳ Cloudflare 隧道連線中，暫時使用預設：<code>${esc(settings.effective_api_url)}</code>` : ""}
+              ${settings.api_url_source === "default" ? `ℹ️ 未設定自訂 URL，目前使用預設：<code>${esc(settings.effective_api_url)}</code>` : ""}
+            </div>` : ""}
           </div>
           <div class="form-group">
             <label>全域 Provider User-Agent</label>
