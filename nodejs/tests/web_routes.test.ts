@@ -94,6 +94,7 @@ vi.mock("../src/db/database.js", () => ({
   // Settings
   getSetting: vi.fn(() => null),
   setSetting: vi.fn(),
+  deleteSetting: vi.fn(),
   // Cache
   getAllCachedModelNames: vi.fn(() => ["gpt-4o", "claude-3.5-sonnet"]),
   // Cloud DB keepalive
