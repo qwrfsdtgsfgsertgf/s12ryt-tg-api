@@ -486,6 +486,7 @@ export async function closeDb(): Promise<void> {
   allProvidersCache = null;
   apiKeyCache.clear();
   effectiveLimitsCache.clear();
+  settingsCache.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -1391,9 +1392,22 @@ export async function getTotalUsage(): Promise<TotalUsage> {
 // Settings CRUD
 // ========================
 
+/**
+ * In-memory cache for the settings table. Settings are read frequently
+ * (every /url command, every web login link, every API request via UA cache)
+ * but written rarely (admin-only). Cache entries are invalidated by
+ * setSetting / deleteSetting and cleared wholesale by closeDb / importDatabase.
+ */
+const settingsCache = new Map<string, string>();
+
 export async function getSetting(key: string): Promise<string | null> {
+  if (settingsCache.has(key)) {
+    return settingsCache.get(key) ?? null;
+  }
   const row = await queryOne(`SELECT value FROM settings WHERE ${quoteIdent("key", drv().dialect)} = ?`, [key]);
-  return (row?.value as string) ?? null;
+  const value = (row?.value as string) ?? null;
+  settingsCache.set(key, value ?? "");
+  return value;
 }
 
 export async function setSetting(key: string, value: string): Promise<void> {
@@ -1401,6 +1415,7 @@ export async function setSetting(key: string, value: string): Promise<void> {
     buildUpsertSql(drv().dialect, "settings", ["key", "value"], ["key"], ["value"], false),
     [key, value]
   );
+  settingsCache.set(key, value);
 }
 
 /**
@@ -1410,6 +1425,7 @@ export async function setSetting(key: string, value: string): Promise<void> {
  */
 export async function deleteSetting(key: string): Promise<void> {
   await runSql(`DELETE FROM settings WHERE ${quoteIdent("key", drv().dialect)} = ?`, [key]);
+  settingsCache.delete(key);
 }
 
 // ========================
@@ -2628,6 +2644,8 @@ export async function importDatabase(data: BackupData): Promise<void> {
 
   // Flush pending writes before overwriting
   await flushUsageQueue();
+  // Settings may be overwritten by the import — drop cached values.
+  settingsCache.clear();
 
   // Preflight + restore: SQLite uses a shadow-DB preflight + raw sql.js handle;
   // cloud drivers use a transaction-based equivalent.
