@@ -487,6 +487,7 @@ router.post("/api/auth/setup", async (req: Request, res: Response) => {
       res.status(500).json({ error: "初始化成功但自動登入失敗，請手動登入" });
       return;
     }
+    setSessionCookie(res, result.sessionToken);
     res.json({
       sessionToken: result.sessionToken,
       isAdmin: result.isAdmin,
@@ -526,6 +527,7 @@ router.post("/api/auth/login", async (req: Request, res: Response) => {
       return;
     }
 
+    setSessionCookie(res, result.sessionToken);
     res.json({
       sessionToken: result.sessionToken,
       tgUserId: result.tgUserId,
@@ -548,6 +550,7 @@ router.post("/api/auth/login", async (req: Request, res: Response) => {
     return;
   }
 
+  setSessionCookie(res, result.sessionToken);
   res.json({
     sessionToken: result.sessionToken,
     tgUserId: result.tgUserId,
