@@ -247,9 +247,29 @@ function writeApiLog(req: Request, entry: ApiLogPayload): void {
 // ---------------------------------------------------------------------------
 
 import { selectKey, reportSuccess, reportFailure } from "./keySelector.js";
+import { getUserAgentCache, isUserAgentLoaded, markUserAgentLoading, setUserAgentCache, invalidateUserAgentCache } from "./userAgentCache.js";
 
 const PROVIDER_DEFAULT_USER_AGENT_SETTING = "provider_default_user_agent";
 const MAX_USER_AGENT_LENGTH = 256;
+
+/**
+ * Background-load the global UA cache. Fire-and-forget — safe to call
+ * multiple times; no-op if already loaded.
+ * The cache state itself lives in {@link userAgentCache.js} (separate module)
+ * to avoid a circular dependency between server.ts and routes.ts.
+ */
+function loadGlobalUserAgent(): void {
+  if (isUserAgentLoaded()) return;
+  markUserAgentLoading();
+  // Promise.resolve() defensively wraps in case getSetting is mocked as a
+  // sync non-Promise value in tests.
+  void Promise.resolve(getSetting(PROVIDER_DEFAULT_USER_AGENT_SETTING)).then((raw) => {
+    setUserAgentCache(normalizeUserAgent(raw) || null);
+  }).catch(() => {
+    // On DB read failure, allow a future retry.
+    invalidateUserAgentCache();
+  });
+}
 
 type ResolvedProviderConfig = {
   baseUrl: string;
@@ -276,8 +296,8 @@ function normalizeUserAgent(value: unknown): string {
 }
 
 function buildUserAgentHeaders(providerUserAgent: unknown): Record<string, string> | undefined {
-  const userAgent = normalizeUserAgent(providerUserAgent)
-    || normalizeUserAgent(getSetting(PROVIDER_DEFAULT_USER_AGENT_SETTING));
+  const userAgent = normalizeUserAgent(providerUserAgent) || getUserAgentCache();
+  if (!userAgent && !isUserAgentLoaded()) loadGlobalUserAgent();
   return userAgent ? { "User-Agent": userAgent } : undefined;
 }
 

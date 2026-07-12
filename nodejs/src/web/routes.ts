@@ -88,6 +88,7 @@ import {
   rollbackAndRestart,
 } from "../updater.js";
 import { getApiLogs } from "../api/apiLogStore.js";
+import { invalidateUserAgentCache } from "../api/userAgentCache.js";
 import { installNodeJsPluginFromContent, listNodeJsPlugins } from "../plugins/index.js";
 import {
   // providers
@@ -1501,6 +1502,7 @@ router.put("/api/admin/settings", async (req: Request, res: Response) => {
       return;
     }
     await setSetting(PROVIDER_DEFAULT_USER_AGENT_SETTING, sanitizedUserAgent.value);
+    invalidateUserAgentCache();
   }
 
   let kaChanged = false;
